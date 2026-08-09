@@ -1,0 +1,69 @@
+L0 gate — exact count, and the counterfactual that justifies the design
+2026-08-09 · TimeLakeDB at :1963 (local store, plaintext)
+· agent run inside the database's network namespace
+================================================================================
+
+CORPUS
+  bench/gen.py --out bench/corpus/app.log --lines 200000 --rate 10000
+  200,000 JSON lines, 21,950,945 bytes, idx 0..199,999.
+  Millisecond timestamps at a simulated 10,000 lines/s — i.e. TEN LINES
+  PER MILLISECOND, which is the realistic and dangerous case.
+
+GUARDED RUN — resolution = "ms" (the disambiguator active)
+  agent:  {"read":200000,"shipped":200000,"quarantined":0,"rejected_batches":0}
+  gate:   rows 200000 · distinct 200000 · min 0 · max 199999 · EXACT
+    PASS  rows == expected
+    PASS  distinct == expected
+    PASS  min idx == 0
+    PASS  max idx == expected-1
+
+NAIVE RUN — resolution = "ns" (stamper passes through, i.e. what any
+generic shipper does with the source timestamp)
+  agent:  {"read":200000,"shipped":200000,"quarantined":0,"rejected_batches":0}
+  gate:   rows 139175 · distinct 139175 · min 0 · max 199999 · NOT EXACT
+
+  **60,825 lines — 30.4% of the corpus — were destroyed, and every write
+  returned 204 with zero errors reported anywhere.** The agent believed
+  it had shipped all 200,000, and by its own accounting it had.
+
+WHY 30.4% AND NOT MORE
+  The loss rate is a birthday collision against the primary key, which
+  is (tag set + timestamp). This corpus varies two tags — level (4
+  values) and service (3) — giving 12 distinct tag sets per millisecond
+  slot. Ten lines landing in twelve buckets:
+
+      expected survivors = 12 * (1 - (11/12)^10) = 6.96 of 10
+      predicted loss     = 30.4%
+      measured loss      = 30.4%   (60,825 / 200,000)
+
+  The prediction and the measurement agree to the decimal, which is the
+  useful part: the mechanism is understood, not merely observed. It also
+  corrects the estimate in DESIGN.md §1.1 — the "~90%" figure assumes a
+  single tag combination. Loss scales with lines-per-tick divided by tag
+  cardinality, so a service logging at one tag set (the common case for
+  a single-purpose log file) is the ~90% case, and richer tags dilute it.
+  Either way the data is gone and nothing says so.
+
+WHAT THIS PROVES
+  1. The disambiguator works: 200,000 lines sharing 20,000 milliseconds
+     become 200,000 distinct rows, in file order.
+  2. The hazard is real, not theoretical, and it is silent by
+     construction — the loss is invisible from the agent, from the HTTP
+     status, and from the server logs.
+  3. The gate is the right gate. A count-only check would have passed
+     neither run for the wrong reason; checking the index SET is what
+     distinguishes "lost 60,825" from "wrote 60,825 twice".
+
+WORKSPACE
+  cargo test --workspace: 17 passed, 0 failed
+    stamp: 6 (order, replay determinism, out-of-order within window,
+              window eviction counted, tick exhaustion, ns passthrough)
+    lp:    5 (shape, escaping, control chars, refusal, determinism)
+    map:   5 (allowlist, declared types, visibility, empty tags, lossy)
+    +1 seconds-resolution slot check
+
+NOT CLAIMED AT L0
+  Rotation, checkpoint persistence, crash-resume, the disk queue,
+  bisect-on-400, multiline. The seams exist (Stamper::restore and
+  ::checkpoint are written and tested) but the behaviour is L1/L2 and
+  is not asserted here.

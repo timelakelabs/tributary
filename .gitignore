@@ -10,3 +10,4 @@ Cargo.lock.bak
 # local runtime state
 /data/
 *.checkpoint
+/bench/corpus/
