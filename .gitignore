@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# harness output: generated log corpora and run artifacts
+/bench/corpus/
+/bench/state/
+/bench/queue/
+
+# local runtime state
+/data/
+*.checkpoint
