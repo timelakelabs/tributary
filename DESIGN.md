@@ -31,13 +31,23 @@ duplicate is resolved last-write-wins (FR-5). That is exactly right for
 retry safety and exactly wrong for logs:
 
 > A service emitting 10,000 lines/second with millisecond timestamps
-> produces ~10 lines per millisecond. With tags `{host, service, level}`,
-> all ten share a primary key. **Nine are destroyed** — not rejected, not
-> logged, not counted. The write returns 204.
+> produces ~10 lines per millisecond. Lines sharing a millisecond *and* a
+> tag set share a primary key, and all but one are **destroyed** — not
+> rejected, not logged, not counted. The write returns 204.
 
-No error surfaces anywhere. A shipper that does not solve this will lose
-most of a busy service's logs and report complete success. §3 is the
-solution; §6.1 is the test that proves it.
+No error surfaces anywhere. **Measured** (`bench/results/l0-exact-count.log`):
+the same 200,000-line corpus shipped with the disambiguator produced
+200,000 distinct rows; shipped without it, **60,825 lines — 30.4% —
+vanished while the agent reported 200,000 shipped and zero errors.**
+
+The rate is a birthday collision against the key: with ten lines per
+millisecond spread over twelve tag sets, `12·(1−(11/12)¹⁰) = 6.96`
+survive, predicting 30.4% loss against 30.4% measured. So loss scales as
+lines-per-tick over tag cardinality — a single-purpose log file writing
+under one tag set approaches ~90%, and richer tags merely dilute it.
+Either way the data is gone and nothing says so.
+
+§3 is the solution; §6.1 is the test that proves it.
 
 ### 1.2 One malformed line rejects the whole batch
 

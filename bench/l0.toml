@@ -1,0 +1,17 @@
+[output]
+url = "http://localhost:1963"
+database = "logs"
+batch_lines = 5000
+
+[[source]]
+name  = "app"
+path  = "bench/corpus/app.log"
+table = "app_logs"
+parser = "json"
+timestamp = { field = "ts", format = "unix_ms", resolution = "ms" }
+tags = ["level", "service"]
+tags_static = { host = "node1" }
+
+[source.fields]
+message = "string"
+idx     = "integer"
