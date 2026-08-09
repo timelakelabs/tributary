@@ -18,7 +18,7 @@ would produce a roadmap that stalls halfway through a phase.
 
 | Goal | Needs from TimeLakeDB | State there |
 |---|---|---|
-| mTLS | A client-certificate verifier on the listeners | **Designed, not built** — SEC-3 specifies the `RootCertStore` behind the same `ArcSwap`, with dual-CA overlap |
+| Optional (want-mode) mTLS | A client-certificate verifier in *allow-unauthenticated* mode, with the verified identity reaching the query session | **Partly designed** — SEC-3 specifies the `RootCertStore` behind the same `ArcSwap` with dual-CA overlap, but assumes required mTLS; want-mode and the identity plumbing are new |
 | Authenticated identity for SEC-2 labels | Data-plane authentication | Not started — SEC-4 is admin-surface only, and calls this "its own migration" |
 | Faster wire | Flight `DoPut` ingest | Not implemented — recorded as a known gap |
 
@@ -73,12 +73,35 @@ Two burst shapes, and they fail differently:
 recorded ceiling in lines/second — **plus a measured breakdown of where
 time goes**, which is the input L6 is gated on.
 
-### L4 · Identity and mTLS  ⟂ *needs TimeLakeDB client-cert verification*
-Tributary presents a client certificate; TimeLakeDB verifies it. Both
-sides reuse the `timelake-tls` crate, so this inherits validate-
-before-swap loading, the `ArcSwap` resolver consulted per handshake, and
-last-good-on-bad-renewal — including on the client, which matters
-because SEC-3 assumes ~24 h certificates.
+### L4 · Identity and *optional* mTLS  ⟂ *needs TimeLakeDB client-cert verification*
+
+**The server runs in "want" mode, not "require" (decided 2026-08-09).**
+It requests a client certificate, verifies one if presented, and accepts
+the connection either way. Grafana, Telegraf and the bench harness
+connect exactly as they do today, with no configuration change and no
+certificate; Tributary presents one and is identified.
+
+In rustls this is `allow_unauthenticated()` on the client-verifier
+builder, and after the handshake `peer_certificates()` is `Some` for an
+authenticated peer and `None` for an anonymous one — so the server
+learns *who* without ever refusing *whether*.
+
+This is the same posture the project already takes one level down: TLS
+itself is opt-in via `TIMELAKE_TLS_CERT`/`_KEY`, plaintext is the
+default, and the fixtures are unchanged. Optional client auth extends
+that discipline rather than inventing a new one.
+
+Tributary presents the certificate; both sides reuse the `timelake-tls`
+crate, so this inherits validate-before-swap loading, the `ArcSwap`
+resolver consulted per handshake, and last-good-on-bad-renewal —
+including on the client, which matters because SEC-3 assumes ~24 h
+certificates.
+
+**The caveat that keeps this honest:** want-mode mTLS is not, by itself,
+a security control. An attacker simply declines to present a certificate
+and takes the anonymous path. Its value is entirely in what the two
+paths are *allowed to do differently* — which is the next paragraph, and
+which is why this is worth building now rather than later.
 
 Certificates arrive through a `CredentialSource` seam (§4), whose first
 two backends are **files** and **HashiCorp Vault PKI**. Vault is not a
@@ -91,16 +114,38 @@ posture the database already takes on a bad renewal.
 The part worth more than the encryption: **a client certificate is an
 identity.** SECURITY.md records that SEC-2 authorizations are
 "self-asserted claims" — `X-TimeLake-Authorizations` is whatever the
-caller says. A verified client cert is exactly the credential that turns
-those claims into grants, for machine clients, without the full
-data-plane auth migration that would break Telegraf and Grafana. That
-makes mTLS the cheapest available answer to the project's most-cited
-security exposure, and it is worth designing on the TimeLakeDB side with
-that in mind rather than as transport hardening.
+caller says. A verified client certificate is exactly the credential
+that turns those claims into grants, and want-mode is what lets that
+arrive **without a flag day**:
+
+| Connection | Today | With want-mode client auth |
+|---|---|---|
+| Grafana, Telegraf, bench (no cert) | claims trusted as asserted | **unchanged** — nothing breaks |
+| Tributary (verified cert) | claims trusted as asserted | claims **intersected** with what that identity is granted |
+
+So the migration is additive: authenticated clients get real
+authorization immediately, anonymous ones keep today's documented
+behaviour, and the decision to eventually *restrict* what anonymous can
+do becomes a separate, deliberate step that no longer breaks Grafana on
+the way. That is the cheapest available answer to the project's
+most-cited security exposure, and it is why the TimeLakeDB-side issue
+should be written as "optional client-cert verification **with the
+verified identity plumbed into the query session**" rather than as
+transport hardening — the plumbing is the point, the encryption is
+incidental.
+
+An operational corollary worth building at the same time: export
+`timelake_tls_client_authenticated_total` alongside
+`timelake_tls_client_anonymous_total`. The ratio is what tells an
+operator when a deployment has actually finished migrating and it is
+safe to flip a listener to `require` — a decision that should be made
+from a metric rather than a guess.
 
 *Gate:* an AT-7-style drill — rotate both server and client certificates
-under sustained shipping, exact count, zero dropped connections, and a
-rejected renewal keeps the last-good pair serving.
+under sustained shipping, exact count, zero dropped connections, a
+rejected renewal keeps the last-good pair serving, **and Grafana's
+fixture dashboards keep rendering throughout without a client
+certificate** (AT-6 must not regress).
 
 ### L5 · Discovery and cloud
 Endpoints arrive through an `EndpointSource` seam (§4) — static config,
@@ -145,18 +190,83 @@ timestamp at or before `T` is durably stored.* It is the thing a reader
 cannot otherwise know, and it is cheap for Tributary to know because it
 already tracks exactly this to checkpoint safely.
 
-**Definition.** Per stream, the low watermark is the source timestamp of
-the last line whose batch returned `204`, minus a configured lateness
-allowance. The allowance exists because logs are not perfectly ordered —
-a multiline join completes late, and some sources stamp at write time
-rather than event time.
+### 2.1 Structural first, statistical only where it must be
+
+Out-of-orderness has two sources, and conflating them makes the
+watermark far more conservative than it needs to be.
+
+**Between files, it is structurally knowable.** Within one file, lines
+are ordered — offset order is time order, which is the same assumption
+`DESIGN.md` §3.1 already relies on. So per-file progress is *exact*: the
+timestamp of the last line from that file whose batch returned `204`.
+A stream's watermark is then
+
+```
+watermark(stream) = min over open files of acked_ts(file)  −  lateness
+```
+
+The `min` handles file skew — one file at T+5 s and another still at T —
+without any estimation at all. A file discovered but not yet started
+(backfill) holds the watermark at its first timestamp, which is correct
+and occasionally surprising; §2.3 covers what that means for monotonicity.
+
+**Within a file, it is not.** A multiline join that began at T completes
+and is emitted seconds later; some sources stamp at write time rather
+than event time. Only this residue needs estimating, and it is much
+smaller than the naive whole-stream estimate would be.
+
+### 2.2 Observing the lateness (decided 2026-08-09)
+
+The allowance is **observed from the stream**, not configured. For every
+emitted line, lateness is `max_ts_seen_so_far − this_ts`; Tributary keeps
+a rolling high quantile (p99.9 over a bounded window) per stream and uses
+that as the allowance.
+
+Four properties keep it honest:
+
+- **Quantile, not maximum.** One pathological line must not pin the
+  watermark behind it forever. The cost is that a small fraction of lines
+  legitimately arrive below the watermark — which is measured, not
+  hidden (§2.3).
+- **Floor and ceiling, both configured.** A perfectly ordered stream
+  would observe zero lateness and produce a brittle watermark that any
+  jitter violates, so the floor keeps a margin. The ceiling stops a
+  pathological stream from stalling the watermark indefinitely; hitting
+  it is an alarm, because it means the estimate has stopped being useful.
+- **Cold start is conservative, and converges down.** This is the trap
+  worth naming: an agent that restarts with no samples must *not* assume
+  zero lateness, or its first published watermark over-claims
+  completeness precisely when a reader is most likely to be checking
+  after an incident. Tributary starts at the ceiling and tightens as
+  samples accumulate, and the current estimate is persisted in the
+  checkpoint so a restart resumes rather than re-learns.
+- **It adapts.** A deployment that changes its logging (turning on stack
+  traces, say) shifts the distribution, and the window follows it without
+  anyone editing a config file. That is the whole reason to observe
+  rather than declare.
+
+### 2.3 Monotonicity, and what a violation means
+
+The published watermark **never regresses**. A line arriving below it —
+late data that the quantile did not cover, or a backfilled file
+discovered after the fact — is *still written normally*; only the
+completeness claim was optimistic. That event increments
+`tributary_watermark_violations_total`.
+
+This is the distinction that makes the feature trustworthy: a violation
+is a measurable inaccuracy in a claim, **not** lost data. If the counter
+is non-zero and rising, the floor is too tight or the window too short,
+and both are tunable. If it is zero, the completeness claim is one a
+dashboard can actually rely on.
 
 **Two consumers, and the second is the interesting one:**
 
-- *Operational* — `tributary_watermark_seconds` and
-  `tributary_watermark_lag_seconds` per stream, alongside
-  `tributary_checkpoint_lag_bytes`. The alert that matters is a
-  watermark that stops advancing while lines are still being read.
+- *Operational* — `tributary_watermark_seconds`,
+  `tributary_watermark_lag_seconds` and
+  `tributary_watermark_lateness_seconds` (the observed allowance itself)
+  per stream, alongside `tributary_checkpoint_lag_bytes`. The alert that
+  matters is a watermark that stops advancing while lines are still
+  being read; the second is the allowance sitting at its ceiling.
 - *Analytical* — Tributary writes watermarks **into TimeLakeDB** as an
   ordinary table (`tributary_watermarks`: tags `stream`, `host`; field
   `watermark_ns`). A dashboard can then distinguish "this window is
@@ -171,12 +281,12 @@ visible, tunable, and never silent.
 
 ---
 
-## 3. The fast wire: adopt Flight, do not invent a protocol
+## 3. The fast wire: Arrow Flight, not a custom protocol (decided 2026-08-09)
 
-The stated goal is "a custom over-line protocol to send data faster".
-The recommendation is to **not build a custom protocol**, and to
-implement **Arrow Flight `DoPut`** instead — which is already a
-documented gap on the TimeLakeDB side rather than a new surface.
+The original goal was "a custom over-line protocol to send data faster".
+**Decided: no custom protocol.** The fast path is **Arrow Flight
+`DoPut`**, which is already a documented gap on the TimeLakeDB side
+rather than a new surface to invent, secure and version.
 
 **Why line protocol is slow, precisely.** It is text: every float and
 timestamp is encoded to decimal and re-parsed, and — the dominant cost
@@ -294,8 +404,8 @@ certs.
 
 | Tributary phase | TimeLakeDB work | Where it is already specified |
 |---|---|---|
-| L4 | Client-certificate verification on both listeners, `RootCertStore` behind `ArcSwap`, dual-CA overlap | SEC-3, "v2 mTLS" |
-| L4 (stretch) | Map a verified client identity to granted SEC-2 authorizations | SEC-4 "phased"; SECURITY.md exposure 7 |
+| L4 | Client-certificate verification on both listeners in **want mode** (`allow_unauthenticated`), `RootCertStore` behind `ArcSwap`, dual-CA overlap, plus `timelake_tls_client_{authenticated,anonymous}_total` | SEC-3 "v2 mTLS", extended: SEC-3 assumes *required* mTLS |
+| L4 | Intersect `X-TimeLake-Authorizations` with what the verified identity is granted; anonymous connections keep today's behaviour | SEC-4 "phased"; SECURITY.md exposure 7 |
 | L6 | Flight `DoPut` ingest: accept RecordBatches into the write buffer | Known gap in the reference docs |
 | L2 (optional) | Nothing — watermarks are an ordinary table | — |
 
@@ -323,9 +433,14 @@ platform instead of a file.
 
 ## 7. Open questions
 
-1. **Lateness allowance for watermarks** — a fixed configured value, or
-   observed from the stream's actual out-of-orderness? Start fixed;
-   revisit with real corpora at L2.
+1. ~~**Lateness allowance for watermarks**~~ — **decided 2026-08-09:
+   observed from the stream** (§2.2). File skew is handled structurally
+   by the `min` across open files, so only the genuinely unpredictable
+   residue is estimated. Cold start begins at the ceiling and tightens,
+   because the alternative over-claims completeness exactly when someone
+   is checking after an incident. Remaining sub-question for L2, to
+   settle against real corpora rather than argument: the window length
+   and the floor.
 2. **Queue durability on ephemeral nodes** — is node-local disk
    acceptable, or does a spot-instance deployment need the agent to ship
    synchronously with a smaller batch? Measure at L5 before recommending.

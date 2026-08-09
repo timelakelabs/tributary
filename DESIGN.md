@@ -355,6 +355,8 @@ Refusing to become Vector is what keeps this small enough to prove.
 | Tag selection | Config allowlist | Auto-promote parsed keys | Auto-promotion is how time-series databases get destroyed, and here it silently changes dedup |
 | Field types | Declared in config | Inferred from first write | The database's first-writer-wins is permanent (§1.3); order is not a schema |
 | Queue exhaustion | Stop reading, alarm | Drop oldest | Silent loss is the one thing this design exists to prevent |
+| Wire evolution | Arrow Flight `DoPut` (`ROADMAP.md` §3) | A custom binary protocol | Line protocol repeats every tag and field key on every line; Arrow carries them once per batch and sends tag values as dictionary indices — TimeLakeDB's own representation (FR-2). A bespoke protocol could only win by discarding generality, and the generality is what makes Arrow cheap |
+| Watermark lateness | Observed per stream (`ROADMAP.md` §2.2) | A configured constant | File skew is structural (`min` across open files); only the residue needs estimating, and a constant goes stale the moment logging changes |
 
 ---
 
