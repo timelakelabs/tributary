@@ -5,6 +5,7 @@
 //! deliberately still outstanding — it is parser work, independent of
 //! the durability story these gates test.
 
+mod auth;
 mod checkpoint;
 mod config;
 mod lp;
@@ -122,8 +123,27 @@ async fn main() -> anyhow::Result<()> {
         wm.restore(l);
     }
 
+    // The data-plane token (SEC-4), sourced from TRIBUTARY_TOKEN or the
+    // configured token_file — never from the config body. Resolved at the
+    // edge so the shipper is handed an opaque, already-redacted credential.
+    let token = auth::resolve_token("TRIBUTARY_TOKEN", cfg.output.token_file.as_deref())?;
+    let shipper = ship::Shipper::new(
+        &cfg.output.url,
+        &cfg.output.database,
+        cfg.output.gzip,
+        token,
+    )?;
+    // A one-line, secret-free statement of posture: an operator can tell from
+    // the log whether this agent is presenting a credential, without it ever
+    // revealing the credential.
+    tracing::info!(
+        authenticated = shipper.is_authenticated(),
+        url = %cfg.output.url,
+        "shipping to TimeLakeDB"
+    );
+
     let mut pipe = Pipeline {
-        shipper: ship::Shipper::new(&cfg.output.url, &cfg.output.database, cfg.output.gzip)?,
+        shipper,
         inflight: tokio::task::JoinSet::new(),
         max_inflight: cfg.output.max_inflight,
         read_ns: 0,
@@ -297,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
         spilled = pipe.queue.spilled_total,
         drained = pipe.queue.drained_total,
         bisects = pipe.shipper.bisects(),
+        unauthorized = pipe.shipper.unauthorized(),
         queue_bytes = pipe.queue.bytes(),
         multiline_truncated = joiner.truncated,
         read_ms = pipe.read_ns / 1_000_000,
