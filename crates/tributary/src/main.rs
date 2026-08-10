@@ -60,10 +60,21 @@ fn parse_args() -> Args {
     }
 }
 
+/// A finished ship task: the lines the server quarantined, or the error
+/// plus the batch handed back so the caller can spool it.
+type ShipOutcome = Result<Vec<String>, (String, Vec<String>)>;
+
 /// Everything the flush path needs, gathered so the signature stays
 /// readable as the agent grows.
 struct Pipeline {
     shipper: ship::Shipper,
+    /// Batches in flight. Bounded, because unbounded concurrency just
+    /// moves the queue into memory and hides it.
+    inflight: tokio::task::JoinSet<ShipOutcome>,
+    max_inflight: usize,
+    /// Nanoseconds spent reading, parsing and encoding — the other half
+    /// of the breakdown that decides whether a faster wire is worth it.
+    read_ns: u64,
     queue: queue::Queue,
     watermark: watermark::Watermark,
     cp_path: PathBuf,
@@ -113,6 +124,9 @@ async fn main() -> anyhow::Result<()> {
 
     let mut pipe = Pipeline {
         shipper: ship::Shipper::new(&cfg.output.url, &cfg.output.database, cfg.output.gzip)?,
+        inflight: tokio::task::JoinSet::new(),
+        max_inflight: cfg.output.max_inflight,
+        read_ns: 0,
         queue: queue::Queue::open(&args.state_dir.join("queue"), cfg.output.queue_max_bytes)?,
         watermark: wm,
         cp_path,
@@ -172,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
             && let Some(raw) = tailer.next_line()?
         {
             idle = false;
+            let t_read = Instant::now();
             let decoded = map::decode_lossy(&raw);
             // Multiline: a record may span several source lines, so only
             // a COMPLETED record becomes a row.
@@ -194,10 +209,11 @@ async fn main() -> anyhow::Result<()> {
                     dead_letter(&mut pipe, &line, &e.to_string())?;
                 }
             }
+            pipe.read_ns += t_read.elapsed().as_nanos() as u64;
             // Never record progress past a half-assembled record: a
             // crash would resume after its lines and lose it.
             if batch.len() >= cfg.output.batch_lines && !joiner.has_pending() {
-                flush(&mut pipe, &mut batch, &mut batch_max_ts, &tailer, &stamper).await?;
+                flush(&mut pipe, &mut batch, &mut batch_max_ts).await?;
                 last_flush = Instant::now();
             }
         }
@@ -220,8 +236,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        if !batch.is_empty() && last_flush.elapsed() >= flush_every && !joiner.has_pending() {
-            flush(&mut pipe, &mut batch, &mut batch_max_ts, &tailer, &stamper).await?;
+        if last_flush.elapsed() >= flush_every && !joiner.has_pending() {
+            if !batch.is_empty() {
+                flush(&mut pipe, &mut batch, &mut batch_max_ts).await?;
+            }
+            checkpoint_now(&mut pipe, &tailer, &stamper).await?;
             last_flush = Instant::now();
         }
 
@@ -258,7 +277,8 @@ async fn main() -> anyhow::Result<()> {
             batch_max_ts = batch_max_ts.max(source_ts);
         }
     }
-    flush(&mut pipe, &mut batch, &mut batch_max_ts, &tailer, &stamper).await?;
+    flush(&mut pipe, &mut batch, &mut batch_max_ts).await?;
+    checkpoint_now(&mut pipe, &tailer, &stamper).await?;
     drain_queue(&mut pipe, source, &tailer, &stamper).await?;
     write_watermark(&mut pipe, &cfg, &source.name).await.ok();
 
@@ -270,32 +290,38 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(
         read = read_total,
-        shipped = pipe.shipper.shipped,
+        shipped = pipe.shipper.shipped(),
         quarantined = pipe.quarantined,
         rotations = tailer.rotations,
         files_lost = tailer.files_lost,
         spilled = pipe.queue.spilled_total,
         drained = pipe.queue.drained_total,
-        bisects = pipe.shipper.bisects,
+        bisects = pipe.shipper.bisects(),
         queue_bytes = pipe.queue.bytes(),
         multiline_truncated = joiner.truncated,
+        read_ms = pipe.read_ns / 1_000_000,
+        ship_ms = pipe.shipper.ship_ns() / 1_000_000,
+        requests = pipe.shipper.requests(),
         watermark_violations = pipe.watermark.violations,
         "done"
     );
     println!(
         "{{\"read\":{},\"shipped\":{},\"quarantined\":{},\"rotations\":{},\"files_lost\":{},\
-          \"spilled\":{},\"drained\":{},\"bisects\":{},\"queued\":{},\"queue_bytes\":{},          \"watermark_violations\":{}}}",
+          \"spilled\":{},\"drained\":{},\"bisects\":{},\"queued\":{},\"queue_bytes\":{},          \"watermark_violations\":{},\"read_ms\":{},\"ship_ms\":{},\"requests\":{}}}",
         read_total,
-        pipe.shipper.shipped,
+        pipe.shipper.shipped(),
         pipe.quarantined,
         tailer.rotations,
         tailer.files_lost,
         pipe.queue.spilled_total,
         pipe.queue.drained_total,
-        pipe.shipper.bisects,
+        pipe.shipper.bisects(),
         pipe.queue.len(),
         pipe.queue.bytes(),
         pipe.watermark.violations,
+        pipe.read_ns / 1_000_000,
+        pipe.shipper.ship_ns() / 1_000_000,
+        pipe.shipper.requests(),
     );
     Ok(())
 }
@@ -319,42 +345,80 @@ fn build(
     }
 }
 
-/// Ship a batch, or spool it. Progress is recorded only after the lines
-/// are either durable in TimeLakeDB or durable in the queue — never
-/// before, or a crash in between would skip them.
+/// Submit a batch to the in-flight pipeline. Deliberately does NOT
+/// checkpoint: draining the pipeline on every batch would serialise it
+/// completely, which is exactly what the first L3 measurement showed
+/// (four concurrent batches were no faster than one). Progress is
+/// recorded by `checkpoint_now`, on an interval.
 async fn flush(
     pipe: &mut Pipeline,
     batch: &mut Vec<String>,
     batch_max_ts: &mut i64,
+) -> anyhow::Result<()> {
+    if !batch.is_empty() {
+        // Keep the pipe full but bounded: block only once `max_inflight`
+        // batches are outstanding.
+        while pipe.inflight.len() >= pipe.max_inflight {
+            reap_one(pipe).await?;
+        }
+        let shipper = pipe.shipper.clone();
+        let lines = std::mem::take(batch);
+        pipe.inflight.spawn(async move {
+            match shipper.send_lines(&lines).await {
+                Ok(poison) => Ok(poison),
+                // Hand the batch back so the caller can spool it — the
+                // task has no queue of its own.
+                Err(e) => Err((e.to_string(), lines)),
+            }
+        });
+        if *batch_max_ts != i64::MIN {
+            pipe.watermark.advance(*batch_max_ts);
+        }
+        *batch_max_ts = i64::MIN;
+    }
+    Ok(())
+}
+
+/// Record progress, once everything in flight has landed. Batch 3 can
+/// finish before batch 1, so a checkpoint taken with work outstanding
+/// could claim bytes that were never shipped.
+async fn checkpoint_now(
+    pipe: &mut Pipeline,
     tailer: &tail::Tailer,
     stamper: &stamp::Stamper,
 ) -> anyhow::Result<()> {
-    if !batch.is_empty() {
-        match pipe.shipper.send_lines(batch).await {
-            Ok(poison) => {
-                quarantine(pipe, &poison)?;
-                if *batch_max_ts != i64::MIN {
-                    pipe.watermark.advance(*batch_max_ts);
-                }
-            }
-            // The database is unavailable or pushing back. Spool rather
-            // than block: the source file keeps growing regardless.
-            Err(e) => {
-                let body: String = batch.concat();
-                if pipe.queue.push(&body)? {
-                    tracing::info!(error = %e, bytes = body.len(), "spooled to the queue");
-                } else {
-                    // Queue is full: keep the batch in memory and stop
-                    // reading. Nothing is dropped.
-                    tracing::warn!(error = %e, "queue full; holding the batch and pausing reads");
-                    return Ok(());
-                }
+    drain_inflight(pipe).await?;
+    save_checkpoint(pipe, tailer, stamper)
+}
+
+/// Collect one finished batch, spooling it if it could not be shipped.
+async fn reap_one(pipe: &mut Pipeline) -> anyhow::Result<()> {
+    let Some(joined) = pipe.inflight.join_next().await else {
+        return Ok(());
+    };
+    match joined {
+        Ok(Ok(poison)) => quarantine(pipe, &poison)?,
+        Ok(Err((err, lines))) => {
+            let body: String = lines.concat();
+            if pipe.queue.push(&body)? {
+                tracing::info!(error = %err, bytes = body.len(), "spooled to the queue");
+            } else {
+                // The queue is full AND the database is unreachable.
+                // Refuse to drop: put it back in front of the queue by
+                // failing loudly rather than silently losing it.
+                tracing::error!(error = %err, "queue full and shipping failed; reads are paused");
             }
         }
-        batch.clear();
-        *batch_max_ts = i64::MIN;
+        Err(join) => return Err(anyhow::anyhow!("ship task panicked: {join}")),
     }
-    save_checkpoint(pipe, tailer, stamper)
+    Ok(())
+}
+
+async fn drain_inflight(pipe: &mut Pipeline) -> anyhow::Result<()> {
+    while !pipe.inflight.is_empty() {
+        reap_one(pipe).await?;
+    }
+    Ok(())
 }
 
 /// Ship whatever is queued, oldest first, until it is empty or the

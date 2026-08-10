@@ -26,6 +26,11 @@ pub struct Output {
     #[serde(default = "default_queue_bytes")]
     pub queue_max_bytes: u64,
 
+    /// Batches in flight at once. Bounded on purpose: unbounded
+    /// concurrency only moves the queue into memory and hides it.
+    #[serde(default = "default_max_inflight")]
+    pub max_inflight: usize,
+
     /// Bounds on the OBSERVED lateness allowance (ROADMAP section 2.2):
     /// the floor stops a perfectly ordered stream producing a brittle
     /// watermark, the ceiling stops a pathological one stalling it.
@@ -39,6 +44,9 @@ pub struct Output {
     pub watermark_every_secs: u64,
 }
 
+fn default_max_inflight() -> usize {
+    4
+}
 fn default_queue_bytes() -> u64 {
     2 << 30
 }

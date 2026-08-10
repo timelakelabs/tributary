@@ -1,0 +1,19 @@
+[output]
+url = "http://localhost:1963"
+database = "logs"
+batch_lines = 2000
+queue_max_bytes = 536870912
+max_inflight = 8
+
+[[source]]
+name  = "app"
+path  = "/tmp/tributary-corpus/app.log"
+table = "l3_sweep8"
+parser = "json"
+timestamp = { field = "ts", format = "unix_ms", resolution = "ms" }
+tags = ["level", "service"]
+tags_static = { host = "node1" }
+
+[source.fields]
+message = "string"
+idx     = "integer"
