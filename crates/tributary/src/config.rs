@@ -93,6 +93,35 @@ pub struct Source {
     /// SEC-2 row visibility label, attached as the `_visibility` tag.
     #[serde(default)]
     pub visibility: Option<String>,
+
+    /// Join continuation lines into one record (stack traces).
+    #[serde(default)]
+    pub multiline: Option<Multiline>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Multiline {
+    /// A line matching this begins a record; anything else continues the
+    /// one above it.
+    pub starts_with: String,
+    /// Bounds, so an unterminated record cannot pin memory.
+    #[serde(default = "default_ml_lines")]
+    pub max_lines: usize,
+    #[serde(default = "default_ml_bytes")]
+    pub max_bytes: usize,
+    /// Emits the last record in a quiet file, which has no successor.
+    #[serde(default = "default_ml_timeout")]
+    pub timeout_ms: u64,
+}
+
+fn default_ml_lines() -> usize {
+    500
+}
+fn default_ml_bytes() -> usize {
+    64 * 1024
+}
+fn default_ml_timeout() -> u64 {
+    1000
 }
 
 #[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq)]

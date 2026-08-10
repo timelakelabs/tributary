@@ -49,6 +49,13 @@ def main() -> None:
         help="inject an invalid UTF-8 byte sequence at this line index",
     )
     ap.add_argument(
+        "--multiline-every",
+        type=int,
+        default=0,
+        help="append a 3-line stack trace after every Nth record, so a "
+        "record spans several source lines",
+    )
+    ap.add_argument(
         "--malformed-at",
         type=int,
         default=-1,
@@ -83,6 +90,16 @@ def main() -> None:
             if i == args.malformed_at:
                 line = b"this is not json at all {{{"
             f.write(line + b"\n")
+            if args.multiline_every and i % args.multiline_every == 0:
+                # Continuation lines carry no leading brace, so the
+                # agent's start pattern will not match them and they must
+                # be joined onto the record above.
+                for frame in (
+                    b"    at handler(app.rs:42)",
+                    b"    at middleware(mw.rs:17)",
+                    b"    caused by: connection reset",
+                ):
+                    f.write(frame + b"\n")
             written += 1
             if args.realtime and written % rate == 0:
                 target = t0 + written / rate
