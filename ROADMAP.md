@@ -18,8 +18,8 @@ would produce a roadmap that stalls halfway through a phase.
 
 | Goal | Needs from TimeLakeDB | State there |
 |---|---|---|
-| Optional (want-mode) mTLS | A client-certificate verifier in *allow-unauthenticated* mode, with the verified identity reaching the query session | **Partly designed** — SEC-3 specifies the `RootCertStore` behind the same `ArcSwap` with dual-CA overlap, but assumes required mTLS; want-mode and the identity plumbing are new |
-| Authenticated identity for SEC-2 labels | Data-plane authentication | Not started — SEC-4 is admin-surface only, and calls this "its own migration" |
+| Optional (want-mode) mTLS | A client-certificate verifier in *allow-unauthenticated* mode, with the verified identity reaching the query session | **Shipped** (SEC-3 v2) — want-mode client certs, dual-CA overlap, identity plumbed into the query session. Tributary presenting a client certificate is L4. |
+| Authenticated identity for SEC-2 labels | Data-plane authentication | **Shipped both sides.** TimeLakeDB has token auth (`TIMELAKE_DATA_AUTH=off\|optional\|required`, SEC-4 phased); **Tributary presents the token (P0-5, done 2026-08-10)** — `bench/results/p05-data-auth.log`. Token grants intersect a caller's SEC-2 claims, so a token *is* the authenticated identity. |
 | Faster wire | Flight `DoPut` ingest | Not implemented — recorded as a known gap |
 
 Everything else — buffering, watermarks, bursts, rotation, cloud

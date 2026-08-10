@@ -22,6 +22,14 @@ pub struct Output {
     #[serde(default = "default_true")]
     pub gzip: bool,
 
+    /// Path to a file holding the data-plane token (SEC-4). For a
+    /// Kubernetes secret mount or a systemd credential; the
+    /// `TRIBUTARY_TOKEN` environment variable takes precedence over it.
+    /// **There is deliberately no inline token field** — a secret in a
+    /// committed config is a secret leaked (see `auth::resolve_token`).
+    #[serde(default)]
+    pub token_file: Option<std::path::PathBuf>,
+
     /// Spool cap. Reaching it pauses reading and alarms - it never drops.
     #[serde(default = "default_queue_bytes")]
     pub queue_max_bytes: u64,

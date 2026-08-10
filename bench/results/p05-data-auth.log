@@ -1,0 +1,63 @@
+P0-5 — Tributary presents its data-plane token to TimeLakeDB
+2026-08-10 · tributary (release) -> timelakedb-da (TIMELAKE_DATA_AUTH=required)
+================================================================================
+
+THE POINT. TimeLakeDB's data plane now authenticates by token (SEC-4
+phased). A shipper that cannot present one is not deployable against a
+node running required mode. Tributary now sources a bearer token, sends
+it on every write, and — the part that is easy to get wrong — never lets
+it reach a log line.
+
+WHERE THE TOKEN COMES FROM. `TRIBUTARY_TOKEN` (env, 12-factor) or
+`[output].token_file` (a Kubernetes secret mount / systemd credential),
+env winning. Deliberately NOT an inline config field: a secret in a
+committed TOML is a secret leaked. Same split as TimeLakeDB's own
+TIMELAKE_ENCRYPTION_KEY / _KEY_FILE, and the same seam a Vault backend
+(ROADMAP §4) slots into later.
+
+DRILLED END TO END against a real required-mode node
+(bench/drill-p05.sh, run from a container on the node's network):
+
+  10/10 checks passed
+
+  correct token (scope=write, db=logs):
+    - all 20,000 lines land in the table — exact count
+    - agent read exactly the corpus
+    - startup logged authenticated=true (no secret in the line)
+  wrong token (tldb_definitely_not_valid):
+    - zero rows reached the node
+    - the unauthorized counter fired (6 — one per failed batch/retry)
+    - the failure is reported AS AUTH ("TimeLakeDB rejected the token"),
+      not as a generic transport error
+    - the data was SPOOLED to the durable on-disk queue (4 segments),
+      not dropped — a bad token loses nothing, it just stops flowing
+  no token at all:
+    - zero rows reached the node
+    - startup logged authenticated=false
+  redaction:
+    - the token value appears in NONE of the agent's logs
+
+  Reads in required mode need a token too, so the drill's own COUNT(*)
+  verification uses a SEPARATE read-scoped token — which also exercises
+  scope separation: the write token Tributary holds cannot read the
+  database back, exactly as intended for a shipper credential.
+
+REDACTION, TWO LAYERS.
+  - `auth::Secret` wraps the token; its Debug and Display both print a
+    placeholder, so `tracing::error!(?token)` or `{token}` cannot leak
+    it. The bytes are reachable only through `.expose()`, the one
+    conspicuous call site.
+  - The Authorization header is built once and marked
+    `set_sensitive(true)`, so reqwest's own diagnostics keep it out of
+    connection traces — belt and suspenders.
+
+WHY A BAD TOKEN IS NOT FATAL. Tributary's existing contract is "never
+drop": a failed ship spools to the durable queue and retries. A 401 is
+the same — the data is preserved, the agent alarms loudly and keeps
+trying, and fixing the token (and restarting) drains the queue. A
+distinct ShipError::Unauthorized keeps a bad credential from being
+bisected like a poison line or hidden as a transport blip.
+
+BUILD. tributary 51 tests (+6 auth: secret never prints, env-wins,
+file-trimmed, empty-env-falls-through, missing-is-none, empty-file-is-
+loud), clippy clean, fmt clean. reqwest is rustls-tls (no OpenSSL).

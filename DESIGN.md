@@ -256,6 +256,13 @@ table    = "app_logs"
 batch    = { max_bytes = "4MiB", max_age = "1s", gzip = true }
 queue    = { dir = "/var/lib/tributary/queue", max_bytes = "2GiB" }
 
+# The data-plane token (SEC-4), when the node runs TIMELAKE_DATA_AUTH=
+# optional|required. Sourced from the TRIBUTARY_TOKEN environment variable
+# (which wins) or this file — NEVER inline here, because a secret in a
+# committed config is a secret leaked. The token is sent as
+# `Authorization: Bearer <token>` and never reaches a log line.
+token_file = "/etc/tributary/token"    # optional; omit for a mode=off node
+
 [[source]]
 name      = "app"                       # the stream identity (§3.1)
 paths     = ["/var/log/app/*.log"]
