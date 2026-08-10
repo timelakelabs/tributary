@@ -1,0 +1,88 @@
+L1 gate — rotation and crash-resume
+2026-08-10 · TimeLakeDB at :1963 · agent run inside the database's
+network namespace · corpus and checkpoint on a container-local
+filesystem (see THE RIG below — this turned out to matter enormously)
+================================================================================
+
+ROTATION — 120,000 lines, rename-and-recreate every 30,000
+  Four rotations executed while the agent was following the file, each
+  one moving the live inode to a sibling name and creating a new one.
+
+  agent:  read=120000 shipped=120000 quarantined=0 rotations=4 files_lost=0
+  gate:   rows 120000 · distinct 120000 · min 0 · max 119999 · EXACT
+
+  The bytes written between the agent's last read and each rename exist
+  only in the old inode; the drained-before-followed rule is what keeps
+  them, and the exact count is what proves it.
+
+CRASH-RESUME — 600,000 lines, SIGKILL mid-stream
+  Killed with 92,000 of 600,000 rows shipped — a real mid-stream death,
+  not a clean shutdown. Checkpoint at the moment of death:
+
+    {"files":[{"dev":131,"ino":1788852,"offset":9826539}],
+     "last_tick_ns":1786322945807000000,"next_seq":10}
+
+  Note `next_seq: 10` — the kill landed *inside* a millisecond, ten
+  lines into it. Restoring only the offset would have restarted that
+  millisecond's sequence at zero and overwritten those ten rows. This is
+  the exact window DESIGN.md §3.2 exists for, and the checkpoint carries
+  the stamper state precisely so it cannot happen.
+
+  After restart: rows 600000 · distinct 600000 · min 0 · max 599999 · EXACT
+
+  Both halves hold: nothing lost (the restart resumed at the right byte)
+  and nothing duplicated (the replayed lines regenerated identical
+  timestamps and collapsed under last-write-wins instead of doubling).
+
+TWO BUGS THE DRILL FOUND, BOTH REAL
+  1. The agent DIED during rotation. `check_rotation` reopened the path
+     with `?`, and every rotation has a window between the rename and
+     the recreate where the path does not exist. So a routine logrotate
+     run killed the process — exactly when it must not die. It now
+     treats a missing path as "look again next poll"; the drained file
+     is already safe by then.
+  2. SIGTERM was not handled, only ctrl-c. systemd and Kubernetes both
+     stop a process with SIGTERM, so every ordinary restart would have
+     dropped the in-flight batch. Both signals now flush and exit.
+
+  A unit test also caught an ordering bug before the drill ran: rotation
+  was detected *after* the drain check, so the new file's first line was
+  emitted before the old file's tail. Sequence numbers follow emission
+  order, so that mattered.
+
+THE RIG — a Docker Desktop bind mount cannot test rotation at all
+  The first three rotation runs failed at 4,000 / 7,714 / 6,549 rows,
+  logging "file truncated" on what were plainly renames. Instrumenting
+  the check showed why:
+
+      file truncated  len=0  offset=375884  ino=30117822508470618
+
+  An open fd whose file has been renamed reported **length 0** instead
+  of its real size, and the inode numbers were 17-digit synthetic values.
+  On a Docker Desktop host mount the POSIX guarantee the tailer depends
+  on — an open descriptor keeps addressing its file across a rename —
+  does not hold. Moving the corpus to a container-local path made all
+  four rotations work first time.
+
+  This is the same shape as TimeLakeDB's port-forwarding discovery: the
+  measurement rig was lying, and the code was fine. Recorded here so the
+  next person does not spend the same hour. **Rotation drills must not
+  run on a bind mount**; the checkpoint directory is kept off it too,
+  because fsync there is slow enough that the agent falls behind its own
+  source and a slow run looks like data loss.
+
+  The drill also now waits for quiescence — polling until the row count
+  stops advancing — rather than sleeping a fixed interval, for the same
+  reason: a slow run must not be mistaken for a lossy one.
+
+WORKSPACE
+  cargo test --workspace: 27 passed, 0 failed
+    + tail: 7 (growing file, partial line, rename-and-recreate drains
+      first, copy-and-truncate, resume mid-file, resume after a rotation
+      that happened while stopped, vanished file counted)
+    + checkpoint: 3 (round-trip incl. stamper state, no temp litter,
+      lookup by identity)
+
+NOT CLAIMED AT L1
+  The disk queue, backpressure beyond honouring Retry-After,
+  bisect-on-400, multiline, watermarks. All L2.
