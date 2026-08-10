@@ -1,0 +1,83 @@
+L3 gate — concurrency, throughput, and the breakdown L6 is gated on
+2026-08-10 · release build · agent in the database's network namespace
+· 1,000,000 JSON lines per run, batch_lines 2000
+================================================================================
+
+RESULT: 156,218 -> 491,582 lines/s, a 3.1x improvement, and the count is
+still exact at maximum concurrency (rows == distinct == 1,000,000,
+min 0, max 999,999).
+
+TWO SEPARATE WINS, and the first was the surprise
+
+  serial baseline, checkpoint per batch     156,218 lines/s
+  checkpoint moved off the per-batch path   314,624 lines/s   (2.0x)
+  + 8 batches in flight                     491,582 lines/s   (1.6x more)
+
+  The first measurement of the concurrency work showed NO improvement
+  at all — 156k, 155k, 155k, 154k across inflight 1/2/4/8, flat. The
+  cause was a rule I had written for correctness: progress may only be
+  recorded once everything in flight has landed, because batch 3 can
+  finish before batch 1. True, but I was checkpointing after every
+  batch, so the pipeline drained on every batch and never held more
+  than one. The correctness rule was right; applying it 500 times a
+  second was not.
+
+  Moving the checkpoint onto its own interval fixed both problems at
+  once: the pipeline can now actually fill, AND the agent stopped
+  paying an fsync per 2,000 lines. That single change was worth more
+  (2.0x) than all the concurrency (1.6x).
+
+CONCURRENCY SWEEP
+
+  inflight=1   3.18s   314,624 lines/s   read 1032ms   ship 3094ms (summed)
+  inflight=2   2.73s   365,742 lines/s   read 1137ms   ship 4600ms
+  inflight=4   2.17s   460,174 lines/s   read 1155ms   ship 3818ms
+  inflight=8   1.99s   501,329 lines/s   read 1071ms   ship 3351ms
+
+  Returns are clearly diminishing by 8 (1.09x over 4, against 1.26x
+  for 4 over 2). Default stays at 4: past that the agent is buying
+  little and holding more of the database's admission budget, which
+  matters because TimeLakeDB admits a bounded number of concurrent
+  queries and a log agent must not be why someone's dashboard is slow.
+
+THE BREAKDOWN, AND WHAT IT SAYS ABOUT L6 (the Arrow Flight wire)
+
+  At inflight=8: wall 1.99s, of which read/parse/encode is ~1.07s.
+  The agent's own CPU is now 54% of wall clock; the wire is what
+  concurrency hides. Summed across tasks, ship is ~3.2s against ~1.1s
+  of read, so the wire is far more than the 10% floor the roadmap set
+  as the threshold for L6 being worth starting.
+
+  BUT the honest reading is narrower than that. `ship_ms` measures the
+  whole round trip — gzip, network, server-side parse, WAL append,
+  buffer apply — and Arrow Flight would only remove part of it. This
+  measurement says the wire is worth investigating; it does NOT say
+  how much of the wire is encoding. Separating encode from network
+  from server-parse is L6's own first task, and it should happen
+  before any protocol work, not after.
+
+  What can be said with confidence: even a free wire could not exceed
+  ~935k lines/s here, because 1.07s of read/encode would remain. That
+  is the ceiling L6 is bidding against.
+
+A TEST ARTEFACT THAT LOOKED LIKE DATA LOSS
+  Verifying the sweep tables reported 2,000,000 and then 3,000,000 rows
+  against 1,000,000 expected — while `distinct idx` was exactly
+  1,000,000 every time. Not duplication: the sweep reuses table names,
+  and gen.py picks a fresh time base per run, so each rerun wrote the
+  same 1M indices under different timestamps and therefore different
+  primary keys. The exactness run above uses a clean table. Worth
+  remembering that "rows > expected with distinct == expected" means
+  the corpus changed underneath, not that the agent misbehaved.
+
+WORKSPACE
+  45 tests, clippy clean, fmt clean. Shipper is now cloneable with
+  shared atomic counters so batches can be in flight concurrently;
+  reqwest's pool is shared across the clones.
+
+NOT CLAIMED AT L3
+  Adaptive batch sizing. The sweep shows request count is not the
+  constraint at this scale (501 requests for 1M lines, ~6.5ms each),
+  so sizing adaptively would add a control loop with nothing yet to
+  control. Revisit if a real deployment shows batches that are too
+  small under burst.

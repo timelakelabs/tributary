@@ -3,23 +3,38 @@
 //! Response handling follows the documented contract: 204 means
 //! WAL-durable, 400 means a line was rejected and **nothing in the batch
 //! was written**, 429 is explicit backpressure carrying `Retry-After`.
+//!
+//! Cloneable, with shared counters, so several batches can be in flight
+//! at once (L3). `reqwest::Client` is itself a handle around a shared
+//! pool, so cloning is cheap and connection reuse is preserved.
 
 use std::io::Write as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[derive(Default)]
+pub struct Counters {
+    pub shipped: AtomicU64,
+    pub rejected: AtomicU64,
+    pub bisects: AtomicU64,
+    /// Nanoseconds spent waiting on HTTP. Paired with the agent's
+    /// read/encode time, this is the breakdown that decides whether a
+    /// faster wire (Arrow Flight, ROADMAP §3) is worth building.
+    pub ship_ns: AtomicU64,
+    pub requests: AtomicU64,
+}
+
+#[derive(Clone)]
 pub struct Shipper {
     client: reqwest::Client,
-    url: String,
+    url: Arc<String>,
     gzip: bool,
-    pub shipped: u64,
-    pub rejected: u64,
-    pub bisects: u64,
+    pub counters: Arc<Counters>,
 }
 
 #[derive(Debug)]
 pub enum ShipError {
-    /// The server rejected a line; the batch wrote nothing. The caller
-    /// bisects (L2) — for now the batch is reported and quarantined.
     Rejected(String),
     Backpressure(Duration),
     Transport(String),
@@ -40,36 +55,34 @@ impl Shipper {
         Ok(Shipper {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
+                // Enough idle connections for the in-flight pipeline.
+                .pool_max_idle_per_host(16)
                 .build()?,
-            url: format!(
+            url: Arc::new(format!(
                 "{}/api/v3/write_lp?db={}",
                 base_url.trim_end_matches('/'),
                 database
-            ),
+            )),
             gzip,
-            shipped: 0,
-            rejected: 0,
-            bisects: 0,
+            counters: Arc::new(Counters::default()),
         })
     }
 
-    /// Ship a batch, isolating anything the server rejects.
+    /// Ship a batch, isolating anything the server rejects, and
+    /// absorbing backpressure internally so the caller sees a batch
+    /// either dealt with or genuinely undeliverable.
     ///
     /// The batch is atomic — one unparseable line writes zero of five
     /// thousand — so a 400 cannot simply be retried or the agent wedges
     /// on the poison line forever. Bisect instead: halve, ship each
-    /// half, recurse into whichever half still fails. Isolating one bad
-    /// line in 5,000 costs ~13 requests, which is affordable precisely
-    /// because local validation should make it rare.
+    /// half, recurse into whichever half still fails.
     ///
     /// Returns the lines that could not be shipped, for quarantine.
-    /// `Err` is reserved for backpressure and transport failures, where
-    /// the batch has *not* been dealt with and must be retried whole.
-    pub async fn send_lines(&mut self, lines: &[String]) -> Result<Vec<String>, ShipError> {
+    pub async fn send_lines(&self, lines: &[String]) -> Result<Vec<String>, ShipError> {
         let mut poison = Vec::new();
-        // Explicit stack rather than recursion: an async fn cannot
-        // recurse without boxing, and the order chunks are shipped in
-        // does not matter — every line already carries its timestamp.
+        // An explicit stack rather than recursion: an async fn cannot
+        // recurse without boxing, and chunk order does not matter —
+        // every line already carries its own timestamp.
         let mut stack: Vec<&[String]> = vec![lines];
         while let Some(chunk) = stack.pop() {
             if chunk.is_empty() {
@@ -80,14 +93,20 @@ impl Shipper {
                 Ok(()) => {}
                 Err(ShipError::Rejected(msg)) => {
                     if chunk.len() == 1 {
-                        tracing::warn!(error = %msg, line = %chunk[0].trim_end(), "quarantined");
+                        tracing::warn!(error = %msg, "quarantined by the server");
                         poison.push(chunk[0].clone());
                     } else {
                         let mid = chunk.len() / 2;
-                        self.bisects += 1;
+                        self.counters.bisects.fetch_add(1, Ordering::Relaxed);
                         stack.push(&chunk[mid..]);
                         stack.push(&chunk[..mid]);
                     }
+                }
+                Err(ShipError::Backpressure(d)) => {
+                    // Explicit, named backpressure (RR-5): wait exactly
+                    // as long as asked, then retry the same chunk.
+                    tokio::time::sleep(d).await;
+                    stack.push(chunk);
                 }
                 Err(other) => return Err(other),
             }
@@ -95,11 +114,12 @@ impl Shipper {
         Ok(poison)
     }
 
-    pub async fn send(&mut self, body: &str) -> Result<(), ShipError> {
+    pub async fn send(&self, body: &str) -> Result<(), ShipError> {
         if body.is_empty() {
             return Ok(());
         }
-        let mut req = self.client.post(&self.url);
+        let started = std::time::Instant::now();
+        let mut req = self.client.post(self.url.as_str());
         let bytes = if self.gzip {
             let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
             enc.write_all(body.as_bytes())
@@ -118,9 +138,12 @@ impl Shipper {
             .await
             .map_err(|e| ShipError::Transport(e.to_string()))?;
 
-        match res.status().as_u16() {
+        let status = res.status().as_u16();
+        let out = match status {
             204 => {
-                self.shipped += body.lines().count() as u64;
+                self.counters
+                    .shipped
+                    .fetch_add(body.lines().count() as u64, Ordering::Relaxed);
                 Ok(())
             }
             429 => {
@@ -133,14 +156,31 @@ impl Shipper {
                 Err(ShipError::Backpressure(Duration::from_secs(secs)))
             }
             400 => {
-                self.rejected += 1;
-                let msg = res.text().await.unwrap_or_default();
-                Err(ShipError::Rejected(msg))
+                self.counters.rejected.fetch_add(1, Ordering::Relaxed);
+                Err(ShipError::Rejected(res.text().await.unwrap_or_default()))
             }
-            code => {
-                let msg = res.text().await.unwrap_or_default();
-                Err(ShipError::Transport(format!("HTTP {code}: {msg}")))
-            }
-        }
+            code => Err(ShipError::Transport(format!(
+                "HTTP {code}: {}",
+                res.text().await.unwrap_or_default()
+            ))),
+        };
+        self.counters
+            .ship_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.counters.requests.fetch_add(1, Ordering::Relaxed);
+        out
+    }
+
+    pub fn shipped(&self) -> u64 {
+        self.counters.shipped.load(Ordering::Relaxed)
+    }
+    pub fn bisects(&self) -> u64 {
+        self.counters.bisects.load(Ordering::Relaxed)
+    }
+    pub fn ship_ns(&self) -> u64 {
+        self.counters.ship_ns.load(Ordering::Relaxed)
+    }
+    pub fn requests(&self) -> u64 {
+        self.counters.requests.load(Ordering::Relaxed)
     }
 }
