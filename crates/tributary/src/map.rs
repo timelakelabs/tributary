@@ -208,6 +208,7 @@ mod tests {
             ]
             .into(),
             visibility: None,
+            multiline: None,
         }
     }
 

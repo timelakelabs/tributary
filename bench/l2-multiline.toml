@@ -1,0 +1,19 @@
+[output]
+url = "http://localhost:1963"
+database = "logs"
+batch_lines = 2000
+queue_max_bytes = 536870912
+
+[[source]]
+name  = "app"
+path  = "/tmp/tributary-corpus/app.log"
+table = "l2_ml"
+# Multiline belongs with PLAIN text: a JSON log is already one record
+# per line, so joining it would only ever corrupt the JSON.
+parser = "plain"
+timestamp = { format = "unix_ms", resolution = "ms" }
+tags_static = { host = "node1" }
+multiline = { starts_with = '^\{', max_lines = 100, max_bytes = 32768, timeout_ms = 300 }
+
+[source.fields]
+message = "string"

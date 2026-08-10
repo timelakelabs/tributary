@@ -68,3 +68,37 @@ NOT CLAIMED AT L2
   Multiline joins — the one L2 item still outstanding. It is parser
   work, independent of the durability story these gates test, and it is
   called out rather than quietly skipped.
+
+--------------------------------------------------------------------------------
+MULTILINE — added 2026-08-10, completing L2
+
+  160,000 source lines carrying 100,000 records (every 5th record
+  followed by a 3-line stack trace):
+
+    agent: read=100000 quarantined=0 multiline_truncated=0
+    rows:  100000 records · 20000 containing "at handler"
+                           · 20000 containing "caused by"
+
+  Every record arrived once, and every stack trace arrived attached to
+  the record it belonged to rather than as three orphan rows.
+
+  A category error caught while drilling: the first attempt combined
+  multiline with the JSON parser and quarantined 20,000 records. That is
+  correct behaviour — a JSON log is already one record per line, so
+  joining continuation lines onto it can only produce invalid JSON.
+  Multiline belongs with PLAIN text, which is where stack traces live,
+  and the config comment now says so.
+
+  The checkpoint interaction is the part worth knowing: a record spans
+  several source lines while the tailer's offset advances past each of
+  them, so progress is NOT recorded while a record is half-assembled
+  (`Joiner::has_pending`). Checkpointing there would resume after lines
+  that were never shipped. It costs a little rework after a crash and
+  never costs a record.
+
+  Bounds are enforced and counted: a line cap, a byte cap, and a timeout
+  for the last record in a quiet file — which has no successor to close
+  it and would otherwise sit in memory until the process exited.
+
+  +7 multiline tests (join, disabled passthrough, timeout emission, line
+  cap, byte cap, orphaned continuation kept, pending-state tracking).

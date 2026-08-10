@@ -9,6 +9,7 @@ mod checkpoint;
 mod config;
 mod lp;
 mod map;
+mod multiline;
 mod queue;
 mod ship;
 mod stamp;
@@ -119,6 +120,14 @@ async fn main() -> anyhow::Result<()> {
         quarantined: 0,
     };
 
+    let ml = source.multiline.as_ref();
+    let mut joiner = multiline::Joiner::new(
+        ml.map(|m| m.starts_with.as_str()),
+        ml.map(|m| m.max_lines).unwrap_or(500),
+        ml.map(|m| m.max_bytes).unwrap_or(64 * 1024),
+        ml.map(|m| m.timeout_ms).unwrap_or(1000),
+    )?;
+
     let mut tailer = tail::Tailer::resume(std::path::Path::new(&source.path), restored.as_ref())?;
     tracing::info!(
         stream = source.name,
@@ -163,8 +172,13 @@ async fn main() -> anyhow::Result<()> {
             && let Some(raw) = tailer.next_line()?
         {
             idle = false;
+            let decoded = map::decode_lossy(&raw);
+            // Multiline: a record may span several source lines, so only
+            // a COMPLETED record becomes a row.
+            let Some(line) = joiner.push(decoded) else {
+                continue;
+            };
             read_total += 1;
-            let line = map::decode_lossy(&raw);
             match build(source, &line, &mut stamper, &mut pipe.watermark) {
                 Ok(Some((record, source_ts))) => {
                     let mut encoded = String::new();
@@ -180,13 +194,33 @@ async fn main() -> anyhow::Result<()> {
                     dead_letter(&mut pipe, &line, &e.to_string())?;
                 }
             }
-            if batch.len() >= cfg.output.batch_lines {
+            // Never record progress past a half-assembled record: a
+            // crash would resume after its lines and lose it.
+            if batch.len() >= cfg.output.batch_lines && !joiner.has_pending() {
                 flush(&mut pipe, &mut batch, &mut batch_max_ts, &tailer, &stamper).await?;
                 last_flush = Instant::now();
             }
         }
 
-        if !batch.is_empty() && last_flush.elapsed() >= flush_every {
+        // The last record in a quiet file has no successor to close it.
+        if let Some(line) = joiner.expire() {
+            read_total += 1;
+            match build(source, &line, &mut stamper, &mut pipe.watermark) {
+                Ok(Some((record, source_ts))) => {
+                    let mut encoded = String::new();
+                    if record.encode(&mut encoded).is_ok() {
+                        batch.push(encoded);
+                        batch_max_ts = batch_max_ts.max(source_ts);
+                    } else {
+                        dead_letter(&mut pipe, &line, "unencodable")?;
+                    }
+                }
+                Ok(None) => read_total -= 1,
+                Err(e) => dead_letter(&mut pipe, &line, &e.to_string())?,
+            }
+        }
+
+        if !batch.is_empty() && last_flush.elapsed() >= flush_every && !joiner.has_pending() {
             flush(&mut pipe, &mut batch, &mut batch_max_ts, &tailer, &stamper).await?;
             last_flush = Instant::now();
         }
@@ -212,6 +246,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(line) = joiner.drain()
+        && let Ok(Some((mut record, source_ts))) =
+            build(source, &line, &mut stamper, &mut pipe.watermark)
+    {
+        record.ts_ns = record.ts_ns.max(record.ts_ns);
+        let mut encoded = String::new();
+        if record.encode(&mut encoded).is_ok() {
+            read_total += 1;
+            batch.push(encoded);
+            batch_max_ts = batch_max_ts.max(source_ts);
+        }
+    }
     flush(&mut pipe, &mut batch, &mut batch_max_ts, &tailer, &stamper).await?;
     drain_queue(&mut pipe, source, &tailer, &stamper).await?;
     write_watermark(&mut pipe, &cfg, &source.name).await.ok();
@@ -232,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
         drained = pipe.queue.drained_total,
         bisects = pipe.shipper.bisects,
         queue_bytes = pipe.queue.bytes(),
+        multiline_truncated = joiner.truncated,
         watermark_violations = pipe.watermark.violations,
         "done"
     );
