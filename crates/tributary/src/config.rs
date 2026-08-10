@@ -21,6 +21,38 @@ pub struct Output {
     pub batch_lines: usize,
     #[serde(default = "default_true")]
     pub gzip: bool,
+
+    /// Spool cap. Reaching it pauses reading and alarms - it never drops.
+    #[serde(default = "default_queue_bytes")]
+    pub queue_max_bytes: u64,
+
+    /// Bounds on the OBSERVED lateness allowance (ROADMAP section 2.2):
+    /// the floor stops a perfectly ordered stream producing a brittle
+    /// watermark, the ceiling stops a pathological one stalling it.
+    #[serde(default = "default_wm_floor_ms")]
+    pub watermark_floor_ms: u64,
+    #[serde(default = "default_wm_ceiling_ms")]
+    pub watermark_ceiling_ms: u64,
+    #[serde(default = "default_wm_table")]
+    pub watermark_table: String,
+    #[serde(default = "default_wm_every")]
+    pub watermark_every_secs: u64,
+}
+
+fn default_queue_bytes() -> u64 {
+    2 << 30
+}
+fn default_wm_floor_ms() -> u64 {
+    100
+}
+fn default_wm_ceiling_ms() -> u64 {
+    60_000
+}
+fn default_wm_table() -> String {
+    "tributary_watermarks".into()
+}
+fn default_wm_every() -> u64 {
+    10
 }
 
 fn default_db() -> String {
