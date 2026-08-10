@@ -30,6 +30,10 @@ pub struct Checkpoint {
     /// timestamps instead of colliding with itself.
     pub last_tick_ns: Option<i64>,
     pub next_seq: i64,
+    /// The watermark's converged lateness estimate, so a restart resumes
+    /// it instead of falling back to the conservative ceiling.
+    #[serde(default)]
+    pub lateness_ns: Option<i64>,
 }
 
 impl Checkpoint {
@@ -94,6 +98,7 @@ mod tests {
             ],
             last_tick_ns: Some(1_786_280_343_206_000_000),
             next_seq: 37,
+            lateness_ns: Some(250_000_000),
         };
         cp.save(&p).unwrap();
         assert_eq!(Checkpoint::load(&p).unwrap().unwrap(), cp);

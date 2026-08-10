@@ -1,0 +1,70 @@
+L2 gate — outage absorption, poison isolation, watermarks
+2026-08-10 · TimeLakeDB at :1963 · agent on the compose network so
+stopping the database does not also destroy the agent's networking
+================================================================================
+
+OUTAGE — 900,000 lines tailed LIVE (generated at 10,000/s over 90 s),
+TimeLakeDB stopped for 60 s mid-stream
+
+  queue depth at recovery: 20 segments (~240 KB each), 21 spool events
+  after recovery:          0 segments — fully drained
+  gate: rows 900000 · distinct 900000 · min 0 · max 899999 · EXACT
+
+  The database was unreachable for a full minute while the source file
+  kept growing at 10,000 lines/s. Nothing was lost, nothing duplicated,
+  and the agent did not hammer a server that was not there — it spooled,
+  waited, and drained FIFO on recovery.
+
+POISON — 20,000 lines containing an unparseable line and an invalid
+UTF-8 sequence
+
+  agent: read=20000 shipped=19999 quarantined=2 bisects=0
+  rows:  19998  (= 20000 - 2 bad lines, exactly)
+
+  Note bisects=0. Both bad lines were caught by LOCAL validation before
+  anything was sent, so the server never returned a 400 and the batch
+  never had to be split. That is DESIGN.md §4.3 working as intended:
+  bisect is the safety net, not the mechanism. The one-line discrepancy
+  between shipped=19999 and rows=19998 is the watermark row, which is
+  written through the same shipper.
+
+  (Without atomic-batch handling of any kind, those two lines would have
+  cost all 20,000 — the batch writes nothing if any line fails to parse.)
+
+WATERMARKS — published into TimeLakeDB as ordinary rows
+
+  SELECT stream, COUNT(*), MAX(watermark_ns), MAX(lateness_ns), MAX(violations)
+    -> app · 8 rows · lateness 100000000 (100 ms) · violations 0
+
+  The observed estimate converged to the configured FLOOR, which is the
+  correct answer for this corpus: the generator emits in timestamp order,
+  so real lateness is zero and the floor is what stops a brittle
+  watermark that any jitter would violate. Zero violations means the
+  completeness claim held for every one of the 900,000 lines.
+
+  Cold start behaved as designed — the first claims lag by the full
+  ceiling and tighten as samples arrive, so a restart never over-claims
+  completeness at the moment someone is checking after an incident.
+
+A GAP THE DRILL EXPOSED, FIXED HERE
+  Lines quarantined at the MAP stage (unparseable, un-coercible) only
+  incremented a counter; they never reached the dead-letter file, which
+  was written solely by bisect. So an operator would see "2 quarantined"
+  and have no way to learn WHAT was dropped. Every drop now records the
+  line and the reason — the difference between a metric and a diagnosis.
+
+WORKSPACE
+  cargo test --workspace: 38 passed, 0 failed
+    + queue: 5 (FIFO, adoption of a previous run's segments, refuse-not-
+      drop when full, resume hysteresis, no temp litter)
+    + watermark: 6 (cold start at the ceiling, tightening, late tails
+      widening it, one pathological line not pinning it, monotonicity
+      with counted violations, restore clamped to range)
+
+  One off-by-one caught by its own test: the resume threshold used
+  `bytes < max/2`, so a queue drained to exactly half stayed paused.
+
+NOT CLAIMED AT L2
+  Multiline joins — the one L2 item still outstanding. It is parser
+  work, independent of the durability story these gates test, and it is
+  called out rather than quietly skipped.

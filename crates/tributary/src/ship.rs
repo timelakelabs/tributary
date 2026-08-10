@@ -13,6 +13,7 @@ pub struct Shipper {
     gzip: bool,
     pub shipped: u64,
     pub rejected: u64,
+    pub bisects: u64,
 }
 
 #[derive(Debug)]
@@ -48,7 +49,50 @@ impl Shipper {
             gzip,
             shipped: 0,
             rejected: 0,
+            bisects: 0,
         })
+    }
+
+    /// Ship a batch, isolating anything the server rejects.
+    ///
+    /// The batch is atomic — one unparseable line writes zero of five
+    /// thousand — so a 400 cannot simply be retried or the agent wedges
+    /// on the poison line forever. Bisect instead: halve, ship each
+    /// half, recurse into whichever half still fails. Isolating one bad
+    /// line in 5,000 costs ~13 requests, which is affordable precisely
+    /// because local validation should make it rare.
+    ///
+    /// Returns the lines that could not be shipped, for quarantine.
+    /// `Err` is reserved for backpressure and transport failures, where
+    /// the batch has *not* been dealt with and must be retried whole.
+    pub async fn send_lines(&mut self, lines: &[String]) -> Result<Vec<String>, ShipError> {
+        let mut poison = Vec::new();
+        // Explicit stack rather than recursion: an async fn cannot
+        // recurse without boxing, and the order chunks are shipped in
+        // does not matter — every line already carries its timestamp.
+        let mut stack: Vec<&[String]> = vec![lines];
+        while let Some(chunk) = stack.pop() {
+            if chunk.is_empty() {
+                continue;
+            }
+            let body: String = chunk.concat();
+            match self.send(&body).await {
+                Ok(()) => {}
+                Err(ShipError::Rejected(msg)) => {
+                    if chunk.len() == 1 {
+                        tracing::warn!(error = %msg, line = %chunk[0].trim_end(), "quarantined");
+                        poison.push(chunk[0].clone());
+                    } else {
+                        let mid = chunk.len() / 2;
+                        self.bisects += 1;
+                        stack.push(&chunk[mid..]);
+                        stack.push(&chunk[..mid]);
+                    }
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        Ok(poison)
     }
 
     pub async fn send(&mut self, body: &str) -> Result<(), ShipError> {
