@@ -1,0 +1,108 @@
+name: ci
+
+# Tributary ships data into TimeLakeDB, so the gates are the same ones that
+# repo enforces: formatting, clippy with warnings denied, and the whole test
+# suite. Nothing here needs a service — the shipper's tests drive the tail,
+# queue, watermark and auth logic directly, and the end-to-end proof against
+# a live node is the drill in `bench/` rather than a CI job.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  rust:
+    name: fmt · clippy · tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  conformance:
+    name: catchment · conformance (tier 1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mint a cross-repo token
+        uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ vars.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/Catchment
+          token: ${{ steps.app.outputs.token }}
+          path: .catchment
+
+      # TimeLakeDB is checked out for its compose topologies only — the
+      # image comes from the registry below. Shallow, because nothing here
+      # reads its history.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/TimeLakeDB
+          token: ${{ steps.app.outputs.token }}
+          path: .timelakedb
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The database is a FIXTURE in this repository, not the thing under
+      # test, so it arrives pre-built. Compiling DataFusion on every
+      # Tributary pull request would make this gate unaffordable and it
+      # would get removed, which costs more than the small staleness of
+      # tracking main. Retagged to the name compose expects so the run
+      # can proceed with --no-build.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch the TimeLakeDB fixture image
+        run: |
+          img="ghcr.io/${{ github.repository_owner }}/timelakedb:main"
+          docker pull "$img"
+          docker tag  "$img" bench-timelakedb-timelakedb:latest
+          docker image inspect "$img" --format 'fixture: {{.Id}} built {{.Created}}'
+
+      # TODO (Catchment C1): the log-path scenarios need the agent itself
+      # in a container, and this repo has no Dockerfile yet. Until it does,
+      # tier 1 here runs the database-side scenarios only — which still
+      # catches a Tributary change that breaks the write contract, but does
+      # not yet exercise the shipper. Adding that Dockerfile is the first
+      # task of C1.
+      - name: Conformance
+        working-directory: .catchment
+        env:
+          CATCHMENT_TIMELAKE_DIR: ${{ github.workspace }}/.timelakedb
+          CATCHMENT_TRIBUTARY_DIR: ${{ github.workspace }}
+        run: |
+          python -m catchment doctor
+          python -m catchment ci --tier 1 --up --no-build
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ github.run_id }}
+          path: .catchment/results/
+          retention-days: 30
