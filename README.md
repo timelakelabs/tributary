@@ -1,14 +1,32 @@
 # Tributary
 
-A log-file agent for [TimeLakeDB](https://github.com/TimeLakeLabs/TimeLakeDB).
+[![ci](https://github.com/timelakedb/Tributary/actions/workflows/ci.yml/badge.svg)](https://github.com/timelakedb/Tributary/actions/workflows/ci.yml)
+
+A log-file agent for [TimeLakeDB](https://github.com/timelakedb/TimeLakeDB).
 
 A tributary feeds a lake. This one tails log files and writes them into
 TimeLakeDB over line protocol — the same wire Telegraf already uses for
 metrics, so one host ships both through one endpoint and one data model.
 
-**Status: design.** Nothing is built yet. Read
-[`DESIGN.md`](DESIGN.md) — it is the specification, and §1 explains why
-this is a purpose-built agent rather than a Vector configuration.
+**Status: phases L0–L3 shipped, plus data-plane authentication.** Tailing,
+rotation and crash-resume, the durable queue with poison isolation and
+observed watermarks, throughput, and presenting a bearer token to
+TimeLakeDB without ever logging it. Every phase is gated by a recorded run
+rather than by unit tests alone — see `bench/results/`:
+
+| Phase | What it proved | Evidence |
+|---|---|---|
+| L0 | Exact count on a static file; the millisecond disambiguator is real | `bench/results/l0-exact-count.log` |
+| L1 | Rotation and crash-resume, both exact | `bench/results/l1-rotation-resume.log` |
+| L2 | Outage absorption, poison isolation, watermarks, multiline joins | `bench/results/l2-queue-bisect-watermark.log` |
+| L3 | 156k → 492k lines/s (the checkpoint was the bottleneck) | `bench/results/l3-throughput.log` |
+| P0-5 | Presents the data-plane token; never logs it; spools rather than drops on 401 | `bench/results/p05-data-auth.log` |
+
+Next is L4 (client certificates), L5 (discovery and cloud metadata) and
+L6 (the Flight `DoPut` wire, gated on TimeLakeDB growing it) — see
+[`ROADMAP.md`](ROADMAP.md). [`DESIGN.md`](DESIGN.md) remains the
+specification, and its §1 explains why this is a purpose-built agent
+rather than a Vector configuration.
 
 ## The short version of why it exists
 
