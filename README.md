@@ -1,8 +1,8 @@
 # Tributary
 
-[![ci](https://github.com/timelakedb/Tributary/actions/workflows/ci.yml/badge.svg)](https://github.com/timelakedb/Tributary/actions/workflows/ci.yml)
+[![ci](https://github.com/timelakelabs/tributary/actions/workflows/ci.yml/badge.svg)](https://github.com/timelakelabs/tributary/actions/workflows/ci.yml)
 
-A log-file agent for [TimeLakeDB](https://github.com/timelakedb/TimeLakeDB).
+A log-file agent for [TimeLakeDB](https://github.com/timelakelabs/timelakedb).
 
 A tributary feeds a lake. This one tails log files and writes them into
 TimeLakeDB over line protocol — the same wire Telegraf already uses for
