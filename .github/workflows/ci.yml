@@ -94,12 +94,23 @@ jobs:
           docker tag  "$img" bench-timelakedb-timelakedb:latest
           docker image inspect "$img" --format 'fixture: {{.Id}} built {{.Created}}'
 
-      # TODO (Catchment C1): the log-path scenarios need the agent itself
-      # in a container, and this repo has no Dockerfile yet. Until it does,
-      # tier 1 here runs the database-side scenarios only — which still
-      # catches a Tributary change that breaks the write contract, but does
-      # not yet exercise the shipper. Adding that Dockerfile is the first
-      # task of C1.
+      # The agent under test, built from THIS checkout — Catchment C1's
+      # tier 1 drives it as a container (stacks/tributary-agent.yml), and
+      # in this repository the agent is the whole point of the gate.
+      # Pre-built because compose builds a missing image during `up`,
+      # which would put a cold, uncached Rust build inside the stack's
+      # bring-up timeout on a two-core runner. Tagged with the name
+      # compose would have chosen, so --no-build reuses it.
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the agent image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: bench-timelakedb-tributary:latest
+          cache-from: type=gha,scope=tributary
+          cache-to: type=gha,scope=tributary,mode=max
+
       - name: Conformance
         working-directory: .catchment
         env:
