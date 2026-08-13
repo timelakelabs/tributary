@@ -1,0 +1,8 @@
+# Build context hygiene: the release binary is built inside the image, and
+# shipping a host target/ dir (or the corpus) makes the context enormous
+# and the build non-reproducible.
+target/
+bench/corpus/
+bench/state/
+bench/results/
+.git/
