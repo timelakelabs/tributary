@@ -5,10 +5,20 @@ name: ci
 # suite. Nothing here needs a service — the shipper's tests drive the tail,
 # queue, watermark and auth logic directly, and the end-to-end proof against
 # a live node is the drill in `bench/` rather than a CI job.
+# Markdown does not gate this workflow: the Rust jobs plus a conformance run
+# that pulls the fixture image are minutes-expensive, and no test here reads a
+# .md file. A docs-only commit therefore gets no run of its own — the last
+# green run still describes the last commit that could change behaviour.
 on:
   push:
     branches: [master, main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
