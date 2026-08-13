@@ -194,6 +194,15 @@ before anything else touches them. This is not a nicety: §1.2 means one
 invalid byte would otherwise reject the entire batch at the transport
 layer, and no amount of downstream care recovers from that.
 
+Lossy decode is the right default for an *undeclared* source, and the
+wrong fate for a file genuinely written in another character set — a
+Shift-JIS or Windows-1252 log would arrive with every non-ASCII character
+replaced. The requirement to do better is **FR-10** in TimeLakeDB's
+`REQUIREMENTS.md` (added 2026-08-12): a source may declare its encoding,
+declared sources transcode losslessly or quarantine the offending line,
+and only undeclared sources take this lossy path — with replacements
+counted, never silent.
+
 Parsers: `json`, `logfmt`, `regex` (named captures), `plain` (the whole
 line becomes `message`). Multiline joins are configured by a start
 pattern, with a size cap and a flush timeout so an unterminated stack
