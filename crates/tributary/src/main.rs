@@ -8,6 +8,7 @@
 mod auth;
 mod checkpoint;
 mod config;
+mod credential;
 mod lp;
 mod map;
 mod multiline;
@@ -127,17 +128,55 @@ async fn main() -> anyhow::Result<()> {
     // configured token_file — never from the config body. Resolved at the
     // edge so the shipper is handed an opaque, already-redacted credential.
     let token = auth::resolve_token("TRIBUTARY_TOKEN", cfg.output.token_file.as_deref())?;
+
+    // L4 transport: private trust anchors and/or a client certificate. Both
+    // halves are optional and independent, so an unconfigured agent takes
+    // exactly the path it took before this existed.
+    let tls = match &cfg.output.tls {
+        None => None,
+        Some(t) => {
+            let roots = match &t.ca_file {
+                Some(p) => credential::load_ca_bundle(p)
+                    .map_err(|e| anyhow::anyhow!("[output.tls].ca_file {}: {e}", p.display()))?,
+                None => Vec::new(),
+            };
+            let identity = match (&t.cert_file, &t.key_file) {
+                (Some(c), Some(k)) => Some(
+                    credential::RotatingIdentity::load(Box::new(credential::FileCredentials::new(
+                        c, k,
+                    )))
+                    .map_err(|e| anyhow::anyhow!("[output.tls] client certificate: {e}"))?,
+                ),
+                // `Tls::validate` already refused the half-configured cases.
+                _ => None,
+            };
+            match identity {
+                Some(identity) => Some(std::sync::Arc::new(ship::TlsRuntime { roots, identity })),
+                None if roots.is_empty() => None,
+                // CA-only: trust a private issuer without presenting an
+                // identity, which is what Telegraf's TLS config does.
+                None => Some(std::sync::Arc::new(ship::TlsRuntime {
+                    roots,
+                    identity: credential::RotatingIdentity::none(),
+                })),
+            }
+        }
+    };
+
     let shipper = ship::Shipper::new(
         &cfg.output.url,
         &cfg.output.database,
         cfg.output.gzip,
         token,
+        tls,
     )?;
     // A one-line, secret-free statement of posture: an operator can tell from
     // the log whether this agent is presenting a credential, without it ever
-    // revealing the credential.
+    // revealing the credential. The client-certificate CN is not a secret —
+    // it is the identity the server will read out of the chain.
     tracing::info!(
         authenticated = shipper.is_authenticated(),
+        client_identity = shipper.client_identity().unwrap_or_else(|| "none".into()),
         url = %cfg.output.url,
         "shipping to TimeLakeDB"
     );
@@ -178,6 +217,24 @@ async fn main() -> anyhow::Result<()> {
     let mut last_flush = Instant::now();
     let mut last_wm_write = Instant::now();
     let flush_every = Duration::from_millis(500);
+    // L4 certificate rotation, checked on the same loop as everything else
+    // rather than on its own task: the check is a stat when nothing changed,
+    // and keeping it here means rotation cannot race the shutdown path.
+    let mut last_rpo_report = Instant::now();
+    // 0 means off. Without this it would mean "every loop iteration", which
+    // is a very effective way to make an operator turn the log off entirely.
+    let rpo_every = match cfg.output.rpo_report_secs {
+        0 => Duration::from_secs(u64::MAX),
+        n => Duration::from_secs(n),
+    };
+    let mut last_cert_check = Instant::now();
+    let cert_refresh_every = Duration::from_secs(
+        cfg.output
+            .tls
+            .as_ref()
+            .map(|t| t.refresh_secs)
+            .unwrap_or(u64::MAX),
+    );
 
     let shutdown = async {
         #[cfg(unix)]
@@ -271,6 +328,55 @@ async fn main() -> anyhow::Result<()> {
             last_wm_write = Instant::now();
         }
 
+        // P1-7: what would be lost if this node vanished right now.
+        //
+        // Not a health check — a statement of exposure. Everything the
+        // server has not acked lives only on this node: the batch being
+        // assembled, the batches in flight, whatever the queue is holding,
+        // and the source bytes not yet read. If the node COMES BACK these
+        // are all recoverable (L1: the checkpoint resumes exactly, losing
+        // and duplicating nothing). If the node is GONE — a spot eviction,
+        // a terminated container with an emptyDir — they are gone with it,
+        // including the log files themselves. That is the trade the queue
+        // makes, and this line is how an operator sees the size of it
+        // instead of deriving it from the config.
+        if last_rpo_report.elapsed() >= rpo_every {
+            tracing::info!(
+                pending_lines = batch.len(),
+                inflight_batches = pipe.inflight.len(),
+                queue_segments = pipe.queue.len(),
+                queue_bytes = pipe.queue.bytes(),
+                unread_bytes = tailer.unread_bytes(),
+                "at risk if this node is lost now"
+            );
+            last_rpo_report = Instant::now();
+        }
+
+        // L4: adopt a renewed client certificate without a restart. SEC-3
+        // assumes ~24 h certificates, so a renewal lands while this loop is
+        // running. A REFUSED renewal is logged loudly and the last-good pair
+        // keeps shipping — it is never allowed to fail the agent, because a
+        // bad file on disk must not take down a working shipper.
+        if last_cert_check.elapsed() >= cert_refresh_every {
+            match pipe.shipper.rotate_credentials() {
+                Ok(true) => tracing::info!(
+                    identity = pipe
+                        .shipper
+                        .client_identity()
+                        .unwrap_or_else(|| "none".into()),
+                    expires_in_secs = pipe.shipper.credential_expires_in_secs().unwrap_or(0),
+                    "adopted a renewed client certificate"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::error!(
+                    error = %e,
+                    refused_total = pipe.shipper.credential_reloads_refused(),
+                    "client certificate renewal REJECTED — still presenting the last-good pair"
+                ),
+            }
+            last_cert_check = Instant::now();
+        }
+
         if idle {
             if args.once && pipe.queue.is_empty() {
                 break;
@@ -324,6 +430,17 @@ async fn main() -> anyhow::Result<()> {
         ship_ms = pipe.shipper.ship_ns() / 1_000_000,
         requests = pipe.shipper.requests(),
         watermark_violations = pipe.watermark.violations,
+        // L4: a refused renewal is not a shipping failure, so it would
+        // otherwise leave no trace in the summary. `cert_healthy=false` says
+        // the agent is running on a last-good certificate that stopped being
+        // renewed — the state that ends in a handshake failure days later.
+        cert_healthy = pipe.shipper.credential_healthy(),
+        cert_renewals_refused = pipe.shipper.credential_reloads_refused(),
+        cert_expires_in_secs = pipe.shipper.credential_expires_in_secs().unwrap_or(-1),
+        // P1-7: the exposure at exit. On a clean shutdown these are zero; a
+        // non-zero queue here is precisely what a node loss would have cost.
+        at_risk_queue_bytes = pipe.queue.bytes(),
+        at_risk_unread_bytes = tailer.unread_bytes(),
         "done"
     );
     println!(

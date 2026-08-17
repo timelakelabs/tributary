@@ -73,7 +73,46 @@ Two burst shapes, and they fail differently:
 recorded ceiling in lines/second — **plus a measured breakdown of where
 time goes**, which is the input L6 is gated on.
 
-### L4 · Identity and *optional* mTLS  ⟂ *needs TimeLakeDB client-cert verification*
+### L4 · Identity and *optional* mTLS — **SHIPPED 2026-08-17**
+
+**Gate met**, `bench/results/l4-mtls-rotation.log` — 10/10 against a live
+TLS node: the agent ships presenting `CN=tributary-node-1`, both the server
+and the client certificate rotate under sustained shipping, a rejected
+renewal keeps the last-good pair shipping, an anonymous caller is served
+throughout (AT-6 not regressed), and 15,000 written lines read back exactly
+15,000.
+
+What landed: `[output.tls]` with `ca_file` / `cert_file` / `key_file` /
+`refresh_secs` (`src/config.rs`), a `CredentialSource` seam whose files
+backend is `src/credential.rs`, and rotation wired through `src/ship.rs`.
+The discipline is the server's, deliberately: validate before swap, refuse
+an expired or inconsistent pair, keep the last-good identity on a bad
+renewal, adopt atomically. The two repositories cannot share
+`timelake-tls` itself — nothing is published and Tributary is its own
+workspace — so they share the rules and the dependency versions instead;
+`credential.rs` mirrors `load_pair` check for check.
+
+Deviations from the sketch below, both deliberate: the seam returns
+validated PEM rather than a rustls `CertifiedKey`, because reqwest wants
+PEM; and `refresh_before()` is not implemented yet, because the files
+backend does not *request* a renewal — something else writes the file and
+the agent notices — so the cadence is `refresh_secs`. It arrives with the
+Vault backend that actually needs it.
+
+**Known limitation, TimeLakeDB-side.** The certificate is verified at the
+TLS layer, but its CN reaches no HTTP handler: TimeLakeDB extracts the peer
+identity only on the Flight listener, and records `/api/sql` identity as
+NOT DONE (a custom `Accept` is needed, because axum-server owns that accept
+loop). Tributary writes over HTTP, so today the certificate buys
+handshake-level verification, **not** identity-based authorization on the
+write path — no SEC-2 grant intersection, no per-identity attribution.
+That is consistent with the "not, by itself, a security control" caveat
+below, and it is the piece to close before L4's identity half means what
+its name suggests.
+
+<details>
+<summary>The original L4 plan, kept for the reasoning</summary>
+
 
 **The server runs in "want" mode, not "require" (decided 2026-08-09).**
 It requests a client certificate, verifies one if presented, and accepts
@@ -146,6 +185,11 @@ under sustained shipping, exact count, zero dropped connections, a
 rejected renewal keeps the last-good pair serving, **and Grafana's
 fixture dashboards keep rendering throughout without a client
 certificate** (AT-6 must not regress).
+**Met 2026-08-17** — `bench/drill-l4.sh`, evidence in
+`bench/results/l4-mtls-rotation.log`.
+
+</details>
+
 
 ### L5 · Discovery and cloud
 Endpoints arrive through an `EndpointSource` seam (§4) — static config,
@@ -173,6 +217,12 @@ Then "cloud support", decomposed, because it is four unrelated things:
    replication*: on a spot instance it buys minutes, not guarantees.
    The mitigation is a shorter checkpoint interval and a smaller queue,
    documented as a trade rather than implied to be safe.
+   **Quantified 2026-08-17 (P1-7)**, and the mitigation turned out to be
+   stated slightly wrong: the checkpoint interval governs *duplicates on
+   restart*, not loss on node death. What bounds the loss is
+   `batch_lines * (1 + max_inflight)` — the unacked window — plus the queue
+   while the server is refusing writes. See §5 open question 2 and
+   `bench/results/p17-queue-rpo.log`.
 
 *Gate:* a kind/k3s cluster, a DaemonSet, pods that log through rotation
 and eviction, exact count across a node drain.
@@ -441,9 +491,18 @@ platform instead of a file.
    is checking after an incident. Remaining sub-question for L2, to
    settle against real corpora rather than argument: the window length
    and the floor.
-2. **Queue durability on ephemeral nodes** — is node-local disk
-   acceptable, or does a spot-instance deployment need the agent to ship
-   synchronously with a smaller batch? Measure at L5 before recommending.
+2. ~~**Queue durability on ephemeral nodes**~~ — **ANSWERED 2026-08-17**
+   (P1-7), measured rather than argued: `bench/results/p17-queue-rpo.log`.
+   On a durable disk a process restart loses nothing (L1's property,
+   re-verified). On node loss the RPO is bounded by
+   `batch_lines * (1 + max_inflight)`, plus the queue if the server was
+   refusing writes — at the shipped defaults, 25,000 lines. A smaller batch
+   does help: 50x lower bound and 10x lower observed peak. It does **not**
+   need to be synchronous. The agent now prints its live exposure every
+   `rpo_report_secs`, so the trade is chosen rather than discovered.
+   Worth recording: the first measurement said the opposite, because a
+   single `kill -9` samples the flush sawtooth and says as much about
+   timing as about configuration. See the log.
 3. **One Tributary per node or per pod** — DaemonSet is the default, but
    a sidecar gives per-tenant identity under mTLS. Decide with L4's
    identity model, not before.
