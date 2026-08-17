@@ -1,0 +1,41 @@
+# L4: shipping over TLS with a client certificate.
+#
+# The two halves of [output.tls] are independent:
+#
+#   ca_file              trust the server's issuer. Needed for any private
+#                        CA; on its own this is plain HTTPS, which is what
+#                        Telegraf's shipped TLS config does.
+#   cert_file + key_file present an identity. Both or neither.
+#
+# TimeLakeDB runs client-certificate verification in WANT mode: presenting a
+# certificate is optional, and a caller without one is served exactly as
+# before. So this file is additive — remove [output.tls] and the agent
+# behaves as it did before L4.
+
+[output]
+url = "https://localhost:2963"
+database = "logs"
+batch_lines = 2000
+max_inflight = 8
+
+[output.tls]
+ca_file   = "/certs/ca.crt"
+cert_file = "/certs/client-tributary-node-1.crt"
+key_file  = "/certs/client-tributary-node-1.key"
+# How often to look for a renewed certificate. SEC-3 assumes ~24 h
+# certificates, so a renewal lands while the agent is running and has to be
+# adopted without a restart. A renewal that fails validation is refused and
+# the last-good pair keeps shipping.
+refresh_secs = 30
+
+[[source]]
+name  = "app"
+path  = "/tmp/tributary-corpus/app.log"
+table = "l4_lines"
+parser = "json"
+timestamp = { field = "ts", format = "unix_ms", resolution = "ms" }
+tags = ["level", "service"]
+
+[source.fields]
+message = "string"
+idx     = "integer"

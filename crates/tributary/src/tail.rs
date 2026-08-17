@@ -31,6 +31,17 @@ pub struct Open {
 }
 
 impl Open {
+    /// Current size of the file THIS handle refers to. Statted through the
+    /// open descriptor rather than the path, so it stays correct for a file
+    /// that has been rotated out from under its name and is still draining.
+    fn size(&self) -> u64 {
+        self.reader
+            .get_ref()
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(self.offset)
+    }
+
     fn at(path: &Path, offset: u64) -> std::io::Result<Open> {
         let file = std::fs::File::open(path)?;
         let md = file.metadata()?;
@@ -253,6 +264,22 @@ impl Tailer {
             });
         }
         v
+    }
+
+    /// Bytes written to the sources but not yet read, across the current
+    /// file and anything still draining after a rotation.
+    ///
+    /// Part of the P1-7 exposure picture: on a node that comes back, these
+    /// are simply read later and nothing is lost. On a node that VANISHES,
+    /// the log files go with it, so unread bytes are lost as surely as
+    /// queued ones — which is the term people forget when they reason about
+    /// the queue alone.
+    pub fn unread_bytes(&self) -> u64 {
+        self.draining
+            .iter()
+            .chain(self.current.iter())
+            .map(|o| o.size().saturating_sub(o.offset))
+            .sum()
     }
 }
 

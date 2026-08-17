@@ -22,3 +22,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
 anyhow = "1"
 regex = "1"
+# L4 client certificates. `arc-swap` holds the live HTTP client so a rotated
+# identity is adopted atomically without a lock on the shipping path;
+# `rustls-pemfile` and `x509-parser` implement the validate-before-swap gate.
+# Versions match TimeLakeDB's `timelake-tls`, which this mirrors — the two
+# repositories cannot share the crate itself (nothing is published yet), so
+# they share the discipline and the dependency versions instead.
+arc-swap = "1"
+rustls-pemfile = "2"
+x509-parser = "0.17"
