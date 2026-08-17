@@ -1,0 +1,104 @@
+L4 gate — identity and mTLS under rotation
+==========================================
+
+Run:      2026-08-17
+Drill:    bench/drill-l4.sh
+Server:   TimeLakeDB deploy/compose/timelakedb-tls.yml (SEC-3 want mode,
+          TIMELAKE_TLS_CLIENT_CA=/certs/ca.crt), TLS 1.3 on :1963
+Client:   tributary release build, [output.tls] with ca_file + cert_file +
+          key_file, refresh_secs = 2
+Certs:    TimeLakeDB deploy/compose/tls-drill/gen-certs.sh — borrowed, not
+          forked. `initial` for the CA + server pair, `client
+          tributary-node-1` for the agent's identity, `renewal` for the
+          server rotation, `client` again for the client rotation.
+Where:    a debian:trixie-slim container on the compose network. Windows
+          curl (schannel) cannot drive a private-CA mTLS handshake, and the
+          published port is not the path under test.
+
+The gate, from ROADMAP.md §1 L4:
+
+  "rotate both server and client certificates under sustained shipping,
+   exact count, zero dropped connections, a rejected renewal keeps the
+   last-good pair serving, and Grafana's fixture dashboards keep rendering
+   throughout without a client certificate (AT-6 must not regress)"
+
+Result
+------
+
+=== L4 drill: identity and mTLS under rotation ===
+--- A. shipping over HTTPS with a client certificate ---
+  ok    the agent shipped over mTLS (got 10000 of 10000)
+  agent startup line:
+    INFO tributary: shipping to TimeLakeDB authenticated=false
+    client_identity="tributary-node-1" url=https://timelakedb-tls:1963
+  ok    the agent reported its client identity
+--- E(1). an anonymous caller is served (want mode, pre-rotation) ---
+  ok    anonymous read served before rotation
+--- B. rotating the SERVER certificate under load ---
+  ok    server still serving after its certificate rotated
+--- C. rotating the CLIENT certificate under load ---
+  ok    the agent adopted a renewed client certificate
+  ok    shipping continued across the client rotation
+--- D. a REJECTED client renewal keeps the last-good pair shipping ---
+  ok    the refused renewal was logged, not swallowed
+--- final: exact count, and want mode intact ---
+  wrote 15000 lines, read back 15000
+  ok    exact count (no loss, no duplication)
+  ok    anonymous read still served after rotation (AT-6 not regressed)
+  ok    no ship was refused as unauthorized
+
+passed 10, failed 0
+L4 GATE MET
+
+What the run proves, line by line
+---------------------------------
+
+* **The identity reaches the wire.** The agent presents
+  `CN=tributary-node-1`, the server verifies it against the drill CA, and
+  15,000 lines land. Before this the same config over `https://` with a
+  private CA failed as an opaque transport error, because there was no way
+  to add a trust anchor.
+* **Both certificates rotate under load.** The server pair is replaced with
+  `gen-certs.sh renewal` (picked up by the server's own 2 s mtime watcher —
+  nothing restarted, no `/admin/tls/reload` call needed), and the client
+  pair with `gen-certs.sh client tributary-node-1` — same CN, new
+  certificate, which is what a real renewal looks like. Shipping continues
+  across both.
+* **A rejected renewal does not take the agent down.** A corrupt certificate
+  written over the live one is refused by the validate-before-swap gate; the
+  agent logs `client certificate renewal REJECTED — still presenting the
+  last-good pair` and keeps shipping on the previous identity. The summary
+  line carries `cert_healthy=false` so the state is visible rather than
+  inferred.
+* **Want mode has not become required mode.** An anonymous caller — no
+  client certificate, Grafana's exact position — is served before, during
+  and after the rotations. AT-6 has not regressed.
+* **Exact count.** 15,000 written, 15,000 read back, spanning both
+  rotations and the rejected renewal.
+
+Two drill bugs found and fixed while getting here, recorded because the
+first version of each looked green enough to believe:
+
+1. The client rotation phase never actually minted a new certificate — it
+   emitted corpus and then asserted an adoption that could not have
+   happened. It failed honestly, which is the only reason it was noticed.
+2. The count assertion read 30,000 for 15,000 written. The corpus is
+   deterministic, so a re-run against the same table wrote rows with
+   identical keys, and cross-file duplicates collapse only at compaction —
+   so the drill was measuring its own history. Each run now writes to a
+   fresh table.
+
+Known limitation (not a drill failure)
+--------------------------------------
+
+The certificate is verified at the TLS layer, but its CN reaches no HTTP
+handler. TimeLakeDB extracts the peer identity only on the Flight listener
+(`crates/flight/src/lib.rs`); `/api/sql` and the write endpoints do not, and
+TimeLakeDB's own CLAUDE.md records this as NOT DONE ("axum-server owns that
+accept loop → needs a custom Accept"). Tributary writes over HTTP, so today
+the certificate buys handshake-level verification, not identity-based
+authorization on the write path — no SEC-2 grant intersection, no
+per-identity attribution. That is a TimeLakeDB-side gap, and it is the
+reason `authenticated=false` above is about the data-plane *token*, not the
+certificate. L4's own text already says want-mode mTLS "is not, by itself, a
+security control"; this records precisely where the boundary currently sits.

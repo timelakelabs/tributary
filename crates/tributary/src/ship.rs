@@ -30,7 +30,16 @@ pub struct Counters {
 
 #[derive(Clone)]
 pub struct Shipper {
-    client: reqwest::Client,
+    /// The live client, behind an `ArcSwap` because an L4 rotation rebuilds
+    /// it: reqwest bakes the client identity in at build time, so adopting a
+    /// renewed certificate means a new `Client`, not a mutated one. Swapping
+    /// a whole client is also why an in-flight batch never sees a
+    /// half-applied rotation — it finished with the client it started on,
+    /// and reqwest's pool keeps that connection alive until it drains.
+    client: Arc<arc_swap::ArcSwap<reqwest::Client>>,
+    /// How to rebuild the client when the identity rotates. `None` when no
+    /// client certificate is configured, which is the unchanged path.
+    tls: Option<Arc<TlsRuntime>>,
     url: Arc<String>,
     gzip: bool,
     /// Pre-built `Authorization: Bearer <token>` header, marked sensitive so
@@ -68,12 +77,44 @@ impl std::fmt::Display for ShipError {
     }
 }
 
+/// What a rotation needs to rebuild the client: the trust anchors (which do
+/// not rotate here — the server's CA bundle is read once at startup) and the
+/// rotating client identity.
+pub struct TlsRuntime {
+    pub roots: Vec<reqwest::Certificate>,
+    pub identity: Arc<crate::credential::RotatingIdentity>,
+}
+
+/// Build a client, optionally with private trust anchors and a client
+/// identity. One function so the startup path and every rotation produce
+/// clients configured identically — a rotation that quietly dropped, say,
+/// the timeout would be a very hard bug to see.
+fn build_client(
+    roots: &[reqwest::Certificate],
+    identity: Option<reqwest::Identity>,
+) -> anyhow::Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        // Enough idle connections for the in-flight pipeline.
+        .pool_max_idle_per_host(16);
+    for root in roots {
+        b = b.add_root_certificate(root.clone());
+    }
+    if let Some(id) = identity {
+        b = b.identity(id);
+    }
+    Ok(b.build()?)
+}
+
 impl Shipper {
+    /// `tls` is `None` for plain HTTP or the public trust store — the path
+    /// every pre-L4 deployment takes, unchanged.
     pub fn new(
         base_url: &str,
         database: &str,
         gzip: bool,
         token: Option<crate::auth::Secret>,
+        tls: Option<Arc<TlsRuntime>>,
     ) -> anyhow::Result<Shipper> {
         // Build the header once. `set_sensitive(true)` tells reqwest to keep
         // it out of its own Debug/trace output — belt to the Secret's
@@ -90,12 +131,20 @@ impl Shipper {
             }
             None => None,
         };
+        let client = match &tls {
+            None => build_client(&[], None)?,
+            Some(rt) => {
+                let id = match rt.identity.current() {
+                    Some(i) => Some(i.reqwest_identity()?),
+                    None => None,
+                };
+                build_client(&rt.roots, id)?
+            }
+        };
+
         Ok(Shipper {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                // Enough idle connections for the in-flight pipeline.
-                .pool_max_idle_per_host(16)
-                .build()?,
+            client: Arc::new(arc_swap::ArcSwap::from_pointee(client)),
+            tls,
             url: Arc::new(format!(
                 "{}/api/v3/write_lp?db={}",
                 base_url.trim_end_matches('/'),
@@ -110,6 +159,65 @@ impl Shipper {
     /// Whether this shipper carries a credential (for a startup log line).
     pub fn is_authenticated(&self) -> bool {
         self.auth.is_some()
+    }
+
+    /// The client certificate's subject CN, if one is configured — the
+    /// identity the server reads out of a verified chain.
+    pub fn client_identity(&self) -> Option<String> {
+        self.tls
+            .as_ref()
+            .and_then(|rt| rt.identity.current())
+            .and_then(|i| i.common_name.clone())
+    }
+
+    /// Seconds until the client certificate expires, if one is configured.
+    /// The alarm an operator watches: a renewal that silently stops landing
+    /// shows up here long before the handshake starts failing.
+    pub fn credential_expires_in_secs(&self) -> Option<i64> {
+        self.tls
+            .as_ref()
+            .and_then(|rt| rt.identity.expires_in_secs())
+    }
+
+    /// False once a renewal has been refused, until one succeeds. True when
+    /// no certificate is configured — nothing to be unhealthy about.
+    pub fn credential_healthy(&self) -> bool {
+        self.tls
+            .as_ref()
+            .map(|rt| rt.identity.last_reload_ok())
+            .unwrap_or(true)
+    }
+
+    pub fn credential_reloads_refused(&self) -> u64 {
+        self.tls
+            .as_ref()
+            .map(|rt| rt.identity.reloads_refused())
+            .unwrap_or(0)
+    }
+
+    /// Check for a renewed client certificate and, if one validates, rebuild
+    /// the client so subsequent batches present it.
+    ///
+    /// Returns `Ok(true)` when a rotation was adopted. A refused renewal is
+    /// returned as an error for the caller to log — never propagated as a
+    /// shipping failure, because the last-good identity is still working and
+    /// a bad renewal must not stop a healthy agent.
+    pub fn rotate_credentials(&self) -> anyhow::Result<bool> {
+        let Some(rt) = &self.tls else {
+            return Ok(false);
+        };
+        if !rt.identity.reload()? {
+            return Ok(false);
+        }
+        // Validated already — this only fails if reqwest disagrees with the
+        // gate, which would be a bug in the gate rather than a bad file.
+        let id = rt
+            .identity
+            .current()
+            .map(|i| i.reqwest_identity())
+            .transpose()?;
+        self.client.store(Arc::new(build_client(&rt.roots, id)?));
+        Ok(true)
     }
 
     /// Ship a batch, isolating anything the server rejects, and
@@ -163,7 +271,11 @@ impl Shipper {
             return Ok(());
         }
         let started = std::time::Instant::now();
-        let mut req = self.client.post(self.url.as_str());
+        // One load per request: the batch runs to completion on the client
+        // it started with, so a rotation landing mid-flight cannot change
+        // the identity underneath an open connection.
+        let client = self.client.load();
+        let mut req = client.post(self.url.as_str());
         if let Some(h) = &self.auth {
             req = req.header(reqwest::header::AUTHORIZATION, h.clone());
         }
@@ -241,5 +353,48 @@ impl Shipper {
     }
     pub fn unauthorized(&self) -> u64 {
         self.counters.unauthorized.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The unchanged path: no TLS configuration at all. An agent that never
+    /// heard of L4 must build exactly as before and report no identity.
+    #[test]
+    fn a_shipper_without_tls_presents_no_identity() {
+        let s = Shipper::new("http://localhost:1963", "logs", true, None, None).unwrap();
+        assert!(!s.is_authenticated());
+        assert_eq!(s.client_identity(), None);
+        assert_eq!(s.credential_expires_in_secs(), None);
+        assert_eq!(s.credential_reloads_refused(), 0);
+        // Rotation is a no-op rather than an error when nothing is configured.
+        assert!(!s.rotate_credentials().unwrap());
+    }
+
+    /// CA-only: trust a private issuer without presenting a client
+    /// certificate. This is Telegraf's shape, and it must not be mistaken
+    /// for an identity.
+    #[test]
+    fn a_ca_only_shipper_trusts_without_identifying() {
+        let rt = Arc::new(TlsRuntime {
+            roots: Vec::new(),
+            identity: crate::credential::RotatingIdentity::none(),
+        });
+        let s = Shipper::new("https://localhost:2963", "logs", true, None, Some(rt)).unwrap();
+        assert_eq!(s.client_identity(), None, "CA-only carries no identity");
+        assert!(!s.rotate_credentials().unwrap(), "nothing to rotate");
+    }
+
+    /// The URL is built once and carries the database, so a rotation cannot
+    /// change where a batch is going.
+    #[test]
+    fn the_write_url_targets_the_configured_database() {
+        let s = Shipper::new("http://localhost:1963/", "mydb", false, None, None).unwrap();
+        assert_eq!(
+            s.url.as_str(),
+            "http://localhost:1963/api/v3/write_lp?db=mydb"
+        );
     }
 }
