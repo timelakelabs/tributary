@@ -165,6 +165,47 @@ adds a `seq` **tag** instead. That widens the primary key and creates a
 near-unique dictionary column — a real cost, chosen deliberately, and
 only for sources that need it.
 
+### 3.3 What the queue does and does not promise (RPO)
+
+The disk queue is **node-local durability, not replication**. Two failure
+models follow from that, and conflating them is how people end up
+surprised:
+
+| the node… | what is lost | why |
+|---|---|---|
+| **comes back** (process crash, restart, redeploy on the same disk) | **nothing** | the checkpoint and the queue are still on disk; the agent resumes at the exact offset, losing and duplicating nothing (§3.2, L1) |
+| **is gone** (spot eviction, an evicted pod with an `emptyDir`) | everything not yet acked | the batch being assembled, the batches in flight, the queue, **and the log files themselves** |
+
+The second row's bound is the RPO, and it is set by configuration:
+
+```
+RPO ≤ batch_lines × (1 + max_inflight)      + queue contents
+      └─ the unacked window ─┘                └─ only while the server
+                                                 is refusing writes ─┘
+```
+
+At the shipped defaults (`batch_lines = 5000`, `max_inflight = 4`) that is
+25,000 lines — 25 s at 1,000 lines/s, 2.5 s at 10,000. Halving either knob
+halves the ceiling, at a throughput cost L3 measures separately.
+
+Two things this is careful about. The **unread source bytes** count: on a
+node that vanishes the log file dies with it, so data the agent had not yet
+read is as lost as data it had queued — which is the term people forget when
+they reason about the queue alone. And the **checkpoint interval governs
+duplicates, not loss**: a longer interval means a restart re-reads more, not
+that a dead node loses more.
+
+Because none of this is visible from the config alone, the agent reports its
+own exposure every `rpo_report_secs` (default 60):
+
+```
+INFO tributary: at risk if this node is lost now pending_lines=800
+     inflight_batches=0 queue_segments=0 queue_bytes=0 unread_bytes=0
+```
+
+Measured, not asserted: `bench/drill-p17.sh`, evidence in
+`bench/results/p17-queue-rpo.log`.
+
 ---
 
 ## 4. Pipeline

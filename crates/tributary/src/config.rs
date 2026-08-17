@@ -50,6 +50,82 @@ pub struct Output {
     pub watermark_table: String,
     #[serde(default = "default_wm_every")]
     pub watermark_every_secs: u64,
+
+    /// Transport security (L4). Absent means plain HTTP or the public
+    /// trust store, exactly as before — this is additive.
+    #[serde(default)]
+    pub tls: Option<Tls>,
+
+    /// How often to log the "at risk if this node is lost now" line (P1-7).
+    /// This is the deployment's live RPO: everything the server has not
+    /// acked lives only on this node. `0` turns the line off.
+    #[serde(default = "default_rpo_report_secs")]
+    pub rpo_report_secs: u64,
+}
+
+fn default_rpo_report_secs() -> u64 {
+    60
+}
+
+/// TLS for the connection to TimeLakeDB (L4).
+///
+/// The two halves are independent on purpose, because they answer
+/// different questions and deployments genuinely need them apart:
+///
+/// * `ca_file` — whose server certificate do we trust? Needed whenever the
+///   server presents a private CA's certificate. Telegraf's shipped TLS
+///   config does exactly this and nothing more.
+/// * `cert_file` + `key_file` — who are we? The client certificate the
+///   server verifies in want mode. Both or neither; one alone is a
+///   configuration mistake worth refusing at startup rather than
+///   discovering as a handshake failure.
+#[derive(Debug, Deserialize)]
+pub struct Tls {
+    /// PEM CA bundle used to verify the server. A bundle, not one
+    /// certificate: dual-CA overlap is how the server rotates its trust
+    /// anchors, and a client that accepts only one breaks mid-rotation.
+    #[serde(default)]
+    pub ca_file: Option<std::path::PathBuf>,
+
+    /// The client certificate chain, PEM.
+    #[serde(default)]
+    pub cert_file: Option<std::path::PathBuf>,
+
+    /// Its private key, PEM. Never inline, for the same reason there is no
+    /// inline token field.
+    #[serde(default)]
+    pub key_file: Option<std::path::PathBuf>,
+
+    /// How often to check whether the certificate on disk changed. SEC-3
+    /// assumes ~24 h certificates, so a renewal lands while the agent is
+    /// shipping and has to be picked up without a restart.
+    #[serde(default = "default_cert_refresh_secs")]
+    pub refresh_secs: u64,
+}
+
+fn default_cert_refresh_secs() -> u64 {
+    30
+}
+
+impl Tls {
+    /// Both-or-neither, checked at load so a half-configured identity fails
+    /// with a sentence instead of a TLS error 20 minutes later.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match (&self.cert_file, &self.key_file) {
+            (Some(_), None) => anyhow::bail!(
+                "[output.tls] has cert_file but no key_file — a client certificate needs both"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "[output.tls] has key_file but no cert_file — a client certificate needs both"
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether a client identity is configured at all.
+    pub fn has_identity(&self) -> bool {
+        self.cert_file.is_some() && self.key_file.is_some()
+    }
 }
 
 fn default_max_inflight() -> usize {
@@ -183,6 +259,18 @@ impl Config {
         let cfg: Config = toml::from_str(&text)?;
         if cfg.sources.is_empty() {
             anyhow::bail!("no [[source]] configured");
+        }
+        if let Some(tls) = &cfg.output.tls {
+            tls.validate()?;
+            // A client certificate over plain HTTP is never presented — the
+            // handshake it belongs to does not happen. Refusing here turns a
+            // silent downgrade to anonymous into a startup error.
+            if tls.has_identity() && cfg.output.url.starts_with("http://") {
+                anyhow::bail!(
+                    "[output.tls] configures a client certificate but [output].url is http:// — \
+                     the certificate would never be presented. Use https://."
+                );
+            }
         }
         for s in &cfg.sources {
             if crate::stamp::Resolution::parse(&s.resolution_str()).is_none() {
