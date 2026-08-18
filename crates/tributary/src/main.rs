@@ -9,6 +9,7 @@ mod auth;
 mod checkpoint;
 mod config;
 mod credential;
+mod logfile;
 mod lp;
 mod map;
 mod multiline;
@@ -88,14 +89,31 @@ struct Pipeline {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
+    // The config is read BEFORE the subscriber is installed, because it is
+    // what decides where the log goes. Nothing between here and `.init()`
+    // logs; a config error surfaces on stderr through anyhow, which is
+    // where someone running this by hand is already looking.
     let args = parse_args();
     let cfg = Config::load(&args.config)?;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    match &cfg.log {
+        // Unchanged path: stdout, captured and rotated by systemd or Docker.
+        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        Some(l) => {
+            let (size, every, keep) = l.parsed()?;
+            let sink = logfile::LogSink(logfile::RotatingLog::open(&l.file, size, every, keep)?);
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                // No ANSI in a file: escape codes make a log grep-hostile,
+                // and it was exactly this that made the P1-7 drill's own
+                // parsing silently find nothing.
+                .with_ansi(false)
+                .with_writer(sink)
+                .init();
+        }
+    }
+
     std::fs::create_dir_all(&args.state_dir)?;
 
     let source = cfg

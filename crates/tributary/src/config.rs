@@ -13,6 +13,9 @@ pub struct Config {
     /// T-1 self-telemetry. Absent = no listener.
     #[serde(default)]
     pub telemetry: Option<Telemetry>,
+    /// The agent's own log file. Absent = stdout only.
+    #[serde(default)]
+    pub log: Option<Log>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +71,58 @@ pub struct Output {
 
 fn default_rpo_report_secs() -> u64 {
     60
+}
+
+/// The agent's OWN diagnostic log. Absent means stdout only, exactly as
+/// before — right under systemd or Docker, where stdout is captured and
+/// rotated for you. Set it for a bare-process deployment, where stdout
+/// redirected to a file otherwise grows until the disk fills.
+///
+/// This sink owns the file: do not also point logrotate at the same path.
+#[derive(Debug, Deserialize)]
+pub struct Log {
+    pub file: std::path::PathBuf,
+    /// Rotate once the live file passes this. `"100MiB"`, `"512KB"`, or a
+    /// bare byte count. Note `KiB` (1024) and `KB` (1000) are both accepted
+    /// and are different numbers.
+    #[serde(default)]
+    pub rotate_size: Option<String>,
+    /// Rotate this long after the current file was opened: `"1d"`, `"12h"`,
+    /// `"30m"`. Elapsed since open, not aligned to midnight.
+    #[serde(default)]
+    pub rotate_every: Option<String>,
+    /// Rotated files to keep. Omit to keep everything, which is the safe
+    /// default for anything someone may need after an incident.
+    #[serde(default)]
+    pub keep: Option<usize>,
+}
+
+impl Log {
+    /// Parse the human-readable fields, refusing junk at startup rather
+    /// than silently never rotating.
+    pub fn parsed(
+        &self,
+    ) -> anyhow::Result<(Option<u64>, Option<std::time::Duration>, Option<usize>)> {
+        let size = match &self.rotate_size {
+            Some(s) => Some(crate::logfile::parse_size(s).ok_or_else(|| {
+                anyhow::anyhow!("[log].rotate_size {s:?} is not a size like 100MiB")
+            })?),
+            None => None,
+        };
+        let every = match &self.rotate_every {
+            Some(s) => Some(crate::logfile::parse_duration(s).ok_or_else(|| {
+                anyhow::anyhow!("[log].rotate_every {s:?} is not a duration like 1d")
+            })?),
+            None => None,
+        };
+        if size.is_none() && every.is_none() {
+            anyhow::bail!(
+                "[log] sets neither rotate_size nor rotate_every — the file would grow \
+                 without bound, which is the thing this section exists to prevent"
+            );
+        }
+        Ok((size, every, self.keep))
+    }
 }
 
 /// Self-telemetry (T-1). Absent means no listener at all — the same

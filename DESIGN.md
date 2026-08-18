@@ -318,6 +318,22 @@ token_file = "/etc/tributary/token"    # optional; omit for a mode=off node
 # only on this node. 0 turns it off.
 rpo_report_secs = 60
 
+# The agent's OWN log, not the files it tails. Absent = stdout only,
+# which is right under systemd or Docker where stdout is captured and
+# rotated for you. Set it for a bare-process deployment, where stdout
+# redirected to a file grows until the disk fills.
+#
+# Rotation fires on EITHER trigger, whichever comes first. Elapsed since
+# the file was opened, not aligned to midnight. `keep` omitted retains
+# every rotated file, which is the safe default for anything someone may
+# need after an incident. This sink owns the file: do not also point
+# logrotate at the same path.
+[log]
+file         = "/var/log/tributary/agent.log"
+rotate_size  = "100MiB"        # KiB is 1024, KB is 1000 — both accepted
+rotate_every = "1d"
+keep         = 7
+
 # Self-telemetry (T-1). Absent = no listener at all, so an agent that
 # never configured this behaves exactly as it did before the endpoint
 # existed. 127.0.0.1 is the safe start; a DaemonSet scraped across the pod
