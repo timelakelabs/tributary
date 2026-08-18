@@ -10,9 +10,13 @@ metrics, so one host ships both through one endpoint and one data model.
 
 **Status: phases L0–L4 shipped, plus data-plane authentication.** Tailing,
 rotation and crash-resume, the durable queue with poison isolation and
-observed watermarks, throughput, and presenting a bearer token to
-TimeLakeDB without ever logging it. Every phase is gated by a recorded run
-rather than by unit tests alone — see `bench/results/`:
+observed watermarks, throughput, presenting a bearer token to TimeLakeDB
+without ever logging it, and — since L4 — presenting a **client
+certificate** that rotates under load without dropping a line. The queue's
+**RPO is measured rather than asserted** (P1-7): zero for a restart on a
+surviving disk, and a bounded, configurable window when the node itself is
+lost. Every phase is gated by a recorded run rather than by unit tests
+alone — see `bench/results/`:
 
 | Phase | What it proved | Evidence |
 |---|---|---|
