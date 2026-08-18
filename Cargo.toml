@@ -29,5 +29,13 @@ regex = "1"
 # repositories cannot share the crate itself (nothing is published yet), so
 # they share the discipline and the dependency versions instead.
 arc-swap = "1"
+# T-1 self-telemetry. hyper, hyper-util, http-body-util and bytes are
+# already compiled into this binary by reqwest, so serving /metrics and
+# /healthz costs no new crates — only a direct declaration of what is
+# already there. Two routes with no extractors do not need a framework.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 rustls-pemfile = "2"
 x509-parser = "0.17"

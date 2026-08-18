@@ -1,6 +1,6 @@
 # Tributary — Roadmap
 
-**Status:** v1 · updated 2026-08-17 (L0–L4 shipped) · companion to `DESIGN.md`
+**Status:** v1 · updated 2026-08-18 (L0–L4, P0-5, P1-7, T-1 shipped) · companion to `DESIGN.md`
 (section references below point there).
 
 Phases are gated the way TimeLakeDB's are: **no phase is done on unit

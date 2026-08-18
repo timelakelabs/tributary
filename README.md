@@ -8,7 +8,7 @@ A tributary feeds a lake. This one tails log files and writes them into
 TimeLakeDB over line protocol — the same wire Telegraf already uses for
 metrics, so one host ships both through one endpoint and one data model.
 
-**Status: phases L0–L4 shipped, plus data-plane authentication.** Tailing,
+**Status: phases L0–L4 shipped, plus data-plane authentication and self-telemetry.** Tailing,
 rotation and crash-resume, the durable queue with poison isolation and
 observed watermarks, throughput, presenting a bearer token to TimeLakeDB
 without ever logging it, and — since L4 — presenting a **client
@@ -27,6 +27,7 @@ alone — see `bench/results/`:
 | P0-5 | Presents the data-plane token; never logs it; spools rather than drops on 401 | `bench/results/p05-data-auth.log` |
 | L4 | mTLS: presents a client certificate; both certificates rotate under load; a rejected renewal keeps the last-good pair; anonymous callers still served | `bench/results/l4-mtls-rotation.log` |
 | P1-7 | The queue's RPO, measured: 0 on a surviving disk, `batch_lines × (1 + max_inflight)` on node loss | `bench/results/p17-queue-rpo.log` |
+| T-1 | `/metrics` and `/healthz`: 26 series, and a database outage leaves liveness green so nothing restarts the agent out from under its queue | `bench/results/t1-self-telemetry.log` |
 
 Next is L5 (discovery and cloud metadata) and L6 (the Flight `DoPut`
 wire, gated on TimeLakeDB growing it) — see

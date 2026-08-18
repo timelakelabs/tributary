@@ -10,6 +10,9 @@ pub struct Config {
     pub output: Output,
     #[serde(rename = "source")]
     pub sources: Vec<Source>,
+    /// T-1 self-telemetry. Absent = no listener.
+    #[serde(default)]
+    pub telemetry: Option<Telemetry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +68,22 @@ pub struct Output {
 
 fn default_rpo_report_secs() -> u64 {
     60
+}
+
+/// Self-telemetry (T-1). Absent means no listener at all — the same
+/// additive posture as `[output.tls]`: an agent that never configured this
+/// behaves exactly as it did before the endpoint existed, and no port is
+/// opened that the operator did not ask for.
+#[derive(Debug, Deserialize)]
+pub struct Telemetry {
+    /// Where to serve `GET /metrics` and `GET /healthz`.
+    ///
+    /// `127.0.0.1:9109` is the safe starting point. A Prometheus running
+    /// elsewhere — a DaemonSet being scraped across the pod network — needs
+    /// `0.0.0.0:9109`, and that is a deliberate choice rather than a
+    /// default, because the endpoint carries no authentication and reports
+    /// file paths and volumes.
+    pub addr: String,
 }
 
 /// TLS for the connection to TimeLakeDB (L4).
