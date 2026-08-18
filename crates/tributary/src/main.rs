@@ -13,9 +13,11 @@ mod lp;
 mod map;
 mod multiline;
 mod queue;
+mod server;
 mod ship;
 mod stamp;
 mod tail;
+mod telemetry;
 mod watermark;
 
 use std::path::PathBuf;
@@ -181,6 +183,20 @@ async fn main() -> anyhow::Result<()> {
         "shipping to TimeLakeDB"
     );
 
+    // T-1: self-telemetry. The shipper's counters are shared directly
+    // (they are already behind an Arc for the in-flight batches); the rest
+    // of the picture is published into this snapshot once per loop pass.
+    let tel = telemetry::Telemetry::new(shipper.counters.clone());
+    if let Some(t) = &cfg.telemetry {
+        let addr: std::net::SocketAddr = t.addr.parse().map_err(|_| {
+            anyhow::anyhow!("[telemetry].addr {:?} is not a host:port address", t.addr)
+        })?;
+        // A bind failure fails startup rather than logging and continuing:
+        // an operator who configured telemetry and silently did not get it
+        // finds out from an empty dashboard days later.
+        server::serve(addr, std::sync::Arc::clone(&tel)).await?;
+    }
+
     let mut pipe = Pipeline {
         shipper,
         inflight: tokio::task::JoinSet::new(),
@@ -326,6 +342,40 @@ async fn main() -> anyhow::Result<()> {
         if last_wm_write.elapsed() >= Duration::from_secs(cfg.output.watermark_every_secs) {
             write_watermark(&mut pipe, &cfg, &source.name).await?;
             last_wm_write = Instant::now();
+        }
+
+        // T-1: publish the snapshot a scrape reads. Once per pass, relaxed
+        // stores only — the HTTP handler never touches the structures the
+        // shipping path owns, so a scrape cannot stall a batch.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            tel.tick();
+            tel.lines_read.store(read_total, Relaxed);
+            tel.quarantined.store(pipe.quarantined, Relaxed);
+            tel.queue_bytes.store(pipe.queue.bytes(), Relaxed);
+            tel.queue_segments.store(pipe.queue.len() as u64, Relaxed);
+            tel.queue_full.store(pipe.queue.full, Relaxed);
+            tel.spilled_total.store(pipe.queue.spilled_total, Relaxed);
+            tel.drained_total.store(pipe.queue.drained_total, Relaxed);
+            tel.pending_lines.store(batch.len() as u64, Relaxed);
+            tel.inflight_batches
+                .store(pipe.inflight.len() as u64, Relaxed);
+            tel.unread_bytes.store(tailer.unread_bytes(), Relaxed);
+            tel.files_open.store(tailer.marks().len() as u64, Relaxed);
+            tel.files_lost.store(tailer.files_lost, Relaxed);
+            tel.rotations.store(tailer.rotations, Relaxed);
+            tel.watermark_violations
+                .store(pipe.watermark.violations, Relaxed);
+            tel.out_of_window.store(stamper.out_of_window, Relaxed);
+            tel.read_ns.store(pipe.read_ns, Relaxed);
+            tel.cert_expires_in_secs.store(
+                pipe.shipper.credential_expires_in_secs().unwrap_or(-1),
+                Relaxed,
+            );
+            tel.cert_healthy
+                .store(pipe.shipper.credential_healthy(), Relaxed);
+            tel.cert_renewals_refused
+                .store(pipe.shipper.credential_reloads_refused(), Relaxed);
         }
 
         // P1-7: what would be lost if this node vanished right now.
