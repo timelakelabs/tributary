@@ -1,6 +1,6 @@
 # Tributary — Design
 
-**Status:** Draft v1 · 2026-08-09 · a log-file agent for
+**Status:** v1 · updated 2026-08-17 (L0–L4 shipped) · a log-file agent for
 [TimeLakeDB](https://github.com/timelakelabs/timelakedb).
 
 A tributary feeds a lake. This one tails log files and writes them into
@@ -165,7 +165,7 @@ adds a `seq` **tag** instead. That widens the primary key and creates a
 near-unique dictionary column — a real cost, chosen deliberately, and
 only for sources that need it.
 
-### 3.3 What the queue does and does not promise (RPO)
+### 3.4 What the queue does and does not promise (RPO)
 
 The disk queue is **node-local durability, not replication**. Two failure
 models follow from that, and conflating them is how people end up
@@ -313,6 +313,26 @@ queue    = { dir = "/var/lib/tributary/queue", max_bytes = "2GiB" }
 # `Authorization: Bearer <token>` and never reaches a log line.
 token_file = "/etc/tributary/token"    # optional; omit for a mode=off node
 
+# How often to log the "at risk if this node is lost now" line (§3.4). This
+# is the deployment's live RPO: everything the server has not acked lives
+# only on this node. 0 turns it off.
+rpo_report_secs = 60
+
+# Transport security (L4). Both halves are independent and both optional:
+# `ca_file` alone is plain HTTPS against a private issuer (what Telegraf
+# does); cert_file + key_file present an identity, and it is both or
+# neither. TimeLakeDB verifies a presented certificate in WANT mode, so a
+# client without one is served exactly as before — this section is
+# additive, and removing it restores pre-L4 behaviour.
+[output.tls]
+ca_file      = "/etc/tributary/certs/ca.crt"
+cert_file    = "/etc/tributary/certs/client.crt"
+key_file     = "/etc/tributary/certs/client.key"
+# SEC-3 assumes ~24 h certificates, so a renewal lands while the agent is
+# shipping. It is picked up without a restart; one that fails validation is
+# refused and the last-good pair keeps shipping.
+refresh_secs = 30
+
 [[source]]
 name      = "app"                       # the stream identity (§3.1)
 paths     = ["/var/log/app/*.log"]
@@ -375,6 +395,18 @@ does not go in the README.
 `_bisects_total`, `_queue_bytes`, `_checkpoint_lag_bytes`,
 `_files_open`, `_files_lost_total`, `_pk_disambiguated_total`.
 
+Two more the agent reports today as log lines rather than a metrics
+endpoint, because it has no `/metrics` surface yet (that is T-1):
+
+- **the exposure line** (§3.4) — `pending_lines`, `inflight_batches`,
+  `queue_segments`, `queue_bytes`, `unread_bytes`, every
+  `rpo_report_secs`. This is the live RPO.
+- **certificate health** (§5 `[output.tls]`) — `cert_healthy`,
+  `cert_renewals_refused` and `cert_expires_in_secs` on the summary line.
+  `tributary_credential_expiry_seconds` is the thing to page on once
+  there is somewhere to export it: a renewal that silently stops landing
+  shows up there long before the handshake starts failing.
+
 `lines_read` minus `lines_shipped` minus `lines_quarantined` should be
 the queue depth. If it is not, something is being lost, and the metric
 set is designed so that arithmetic is checkable from the outside.
@@ -383,12 +415,25 @@ set is designed so that arithmetic is checkable from the outside.
 
 ## 7. Milestones
 
-| M | Deliverable | Gate |
-|---|---|---|
-| **L0** | Publish `timelake-ingest`; workload generator; tail → map → ship | Exact count on a static file |
-| **L1** | Rotation, checkpoints with `seq`, crash-resume, quarantine | Exact count under rotation and `SIGKILL` |
-| **L2** | Disk queue, backpressure, multiline, bisect | Exact count across a 60 s outage |
-| **L3** | Full-scale run, memory bound, container image, docs site | The whole §6.1 table green, recorded |
+Every phase is gated by a recorded run, never by unit tests alone. The
+evidence lives in `bench/results/`.
+
+| M | Deliverable | Gate | State |
+|---|---|---|---|
+| **L0** | Publish `timelake-ingest`; workload generator; tail → map → ship | Exact count on a static file | **shipped** — `l0-exact-count.log` |
+| **L1** | Rotation, checkpoints with `seq`, crash-resume, quarantine | Exact count under rotation and `SIGKILL` | **shipped** — `l1-rotation-resume.log` |
+| **L2** | Disk queue, backpressure, multiline, bisect | Exact count across a 60 s outage | **shipped** — `l2-queue-bisect-watermark.log` |
+| **L3** | Full-scale run, memory bound, container image, docs site | The whole §6.1 table green, recorded | **shipped** — `l3-throughput.log` |
+| **L4** | Client certificates (§5 `[output.tls]`), rotation with validate-before-swap | Rotate both certificates under sustained shipping: exact count, a rejected renewal keeps the last-good pair, an anonymous caller still served | **shipped** — `l4-mtls-rotation.log`, 10/10 |
+| **L5** | Discovery and cloud metadata; a DaemonSet | Exact count across a node drain | planned |
+| **L6** | Flight `DoPut` | Gated on L3's measurement showing line protocol is the bottleneck | planned |
+
+Two items outside the L-phases:
+
+| | Deliverable | Gate | State |
+|---|---|---|---|
+| **P0-5** | Present the data-plane token | Never logged; spools rather than drops on 401 | **shipped** — `p05-data-auth.log` |
+| **P1-7** | State the queue's RPO (§3.4) | Measured under both failure models, not asserted | **shipped** — `p17-queue-rpo.log` |
 
 L0 starts with the **workload generator**, not the tailer. It is the
 piece that makes every later claim checkable, and the piece most likely

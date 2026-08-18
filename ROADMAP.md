@@ -1,6 +1,6 @@
 # Tributary — Roadmap
 
-**Status:** Draft v1 · 2026-08-09 · companion to `DESIGN.md`
+**Status:** v1 · updated 2026-08-17 (L0–L4 shipped) · companion to `DESIGN.md`
 (section references below point there).
 
 Phases are gated the way TimeLakeDB's are: **no phase is done on unit
@@ -398,7 +398,7 @@ trait EndpointSource {
 
 | Seam | v1 | Then | Later |
 |---|---|---|---|
-| `CredentialSource` | files on disk | **Vault PKI** | SPIFFE / K8s projected tokens, cloud IAM |
+| `CredentialSource` | files on disk — **shipped 2026-08-17** (`src/credential.rs`) | **Vault PKI** | SPIFFE / K8s projected tokens, cloud IAM |
 | `EndpointSource` | static config | **Consul** (health-filtered) | DNS/SRV, K8s service |
 
 ### 4.1 Vault, concretely
@@ -467,7 +467,7 @@ it unblocks both L4 and the most-cited security exposure in the project.
 ## 6. Sequencing
 
 ```
-L0 ── L1 ── L2 ── L3 ──┬── L4(mTLS)* ── L5(cloud)
+L0 ── L1 ── L2 ── L3 ──┬── L4(mTLS)✓ ── L5(cloud)
                        └── L6(Flight)*   ← only if L3's measurement says so
 
 * blocked on TimeLakeDB work; file those issues at L2 so they are ready
