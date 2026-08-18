@@ -19,6 +19,10 @@ time.workspace = true
 anyhow.workspace = true
 regex.workspace = true
 arc-swap.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
 rustls-pemfile.workspace = true
 x509-parser.workspace = true
 

@@ -1,6 +1,6 @@
 # Tributary — Design
 
-**Status:** v1 · updated 2026-08-17 (L0–L4 shipped) · a log-file agent for
+**Status:** v1 · updated 2026-08-18 (L0–L4, P0-5, P1-7, T-1 shipped) · a log-file agent for
 [TimeLakeDB](https://github.com/timelakelabs/timelakedb).
 
 A tributary feeds a lake. This one tails log files and writes them into
@@ -318,6 +318,14 @@ token_file = "/etc/tributary/token"    # optional; omit for a mode=off node
 # only on this node. 0 turns it off.
 rpo_report_secs = 60
 
+# Self-telemetry (T-1). Absent = no listener at all, so an agent that
+# never configured this behaves exactly as it did before the endpoint
+# existed. 127.0.0.1 is the safe start; a DaemonSet scraped across the pod
+# network needs 0.0.0.0, and that is a deliberate choice because the
+# endpoint carries no authentication and reports file paths and volumes.
+[telemetry]
+addr = "127.0.0.1:9109"        # GET /metrics, GET /healthz
+
 # Transport security (L4). Both halves are independent and both optional:
 # `ca_file` alone is plain HTTPS against a private issuer (what Telegraf
 # does); cert_file + key_file present an identity, and it is both or
@@ -395,17 +403,37 @@ does not go in the README.
 `_bisects_total`, `_queue_bytes`, `_checkpoint_lag_bytes`,
 `_files_open`, `_files_lost_total`, `_pk_disambiguated_total`.
 
-Two more the agent reports today as log lines rather than a metrics
-endpoint, because it has no `/metrics` surface yet (that is T-1):
+**Shipped as T-1** (2026-08-18): `GET /metrics` and `GET /healthz`, served
+when `[telemetry]` is configured (§5). 26 series, including the P1-7
+exposure (`at_risk_lines`, `inflight_batches`, `unread_bytes`) and the L4
+credential (`credential_expiry_seconds`, `_healthy`,
+`_renewals_refused`). Evidence: `bench/results/t1-self-telemetry.log`.
 
-- **the exposure line** (§3.4) — `pending_lines`, `inflight_batches`,
-  `queue_segments`, `queue_bytes`, `unread_bytes`, every
-  `rpo_report_secs`. This is the live RPO.
-- **certificate health** (§5 `[output.tls]`) — `cert_healthy`,
-  `cert_renewals_refused` and `cert_expires_in_secs` on the summary line.
-  `tributary_credential_expiry_seconds` is the thing to page on once
-  there is somewhere to export it: a renewal that silently stops landing
-  shows up there long before the handshake starts failing.
+`tributary_credential_expiry_seconds` is the series to page on: a renewal
+that silently stops landing shows up there long before the handshake
+starts failing. It reports **-1 when no certificate is configured**,
+deliberately distinct from 0, so an agent that never had one does not look
+like one whose certificate just expired.
+
+#### What `/healthz` means — and what it deliberately does not
+
+It reports **liveness**: is the main loop still turning? That is the one
+question a restart can answer. It does **not** go red when TimeLakeDB is
+unreachable.
+
+That is the important decision here, not an oversight. A shipper whose
+liveness probe fails on database trouble gets killed by its orchestrator
+exactly when the queue is doing its job — and the restart discards the
+batch being assembled and every batch in flight, which §3.4 measures as
+the whole of the node-loss RPO. The monitoring turns a recoverable outage
+into data loss.
+
+So an outage surfaces as `status: degraded` and `shipping: false` in the
+body, and as `queue_bytes` climbing while `lines_shipped_total` stays
+flat — where an operator and an alert can see it, while the process is
+left alone. Use `shipping` for a *readiness* probe if you want
+traffic-shaping behaviour; do not wire it to liveness. The only thing that
+returns 503 is a main loop that has not turned for 60 seconds.
 
 `lines_read` minus `lines_shipped` minus `lines_quarantined` should be
 the queue depth. If it is not, something is being lost, and the metric
@@ -434,6 +462,7 @@ Two items outside the L-phases:
 |---|---|---|---|
 | **P0-5** | Present the data-plane token | Never logged; spools rather than drops on 401 | **shipped** — `p05-data-auth.log` |
 | **P1-7** | State the queue's RPO (§3.4) | Measured under both failure models, not asserted | **shipped** — `p17-queue-rpo.log` |
+| **T-1** | Self-telemetry: `/metrics`, `/healthz` (§6.2) | Counters move under load; the §6.2 arithmetic checks out from a live scrape; a real outage leaves liveness green | **shipped** — `t1-self-telemetry.log`, 16/16 |
 
 L0 starts with the **workload generator**, not the tailer. It is the
 piece that makes every later claim checkable, and the piece most likely

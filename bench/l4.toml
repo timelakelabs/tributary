@@ -12,6 +12,13 @@
 # before. So this file is additive — remove [output.tls] and the agent
 # behaves as it did before L4.
 
+# Self-telemetry (T-1): GET /metrics and GET /healthz. Absent means no
+# listener at all. 127.0.0.1 is the safe start; a DaemonSet scraped across
+# the pod network needs 0.0.0.0, which is a deliberate choice because the
+# endpoint carries no authentication.
+[telemetry]
+addr = "127.0.0.1:9109"
+
 [output]
 url = "https://localhost:2963"
 database = "logs"

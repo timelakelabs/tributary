@@ -1,0 +1,118 @@
+T-1 — self-telemetry: /metrics and /healthz
+===========================================
+
+Run:    2026-08-18
+Drill:  bench/drill-t1.sh
+Server: TimeLakeDB deploy/compose/timelakedb.yml (plaintext, single node)
+Agent:  tributary release build, `[telemetry] addr = "127.0.0.1:9109"`
+Where:  a debian:trixie-slim container on the compose network, with the
+        Docker socket mounted so the drill can stage a real outage
+
+T-1 was the sole remaining v0.2-pilot gap: "unwatchable shippers don't
+survive ops review; every competitor has it; prerequisite for the L5
+DaemonSet".
+
+Result
+------
+
+=== T-1: self-telemetry ===
+--- A. the endpoints answer ---
+  ok    /metrics is served
+  ok    /healthz is served
+  ok    unknown paths 404
+  ok    content-type is the Prometheus one
+  ok    exposition parses as Prometheus text
+--- B. the counters move while data flows ---
+    read=5000 shipped=5000
+  ok    lines_read advanced
+  ok    lines_shipped advanced
+  ok    requests_total advanced
+  ok    uptime is nonzero
+--- C. the DESIGN 6.2 invariant, checked from outside ---
+    read=8000 shipped=8000 quarantined=0 at_risk=0  ->  0 vs 0
+  ok    read - shipped - quarantined == at_risk
+--- D. a REAL outage must NOT fail liveness ---
+    stopped timelakedb
+    /healthz -> HTTP 200 status=degraded live=true shipping=false
+                queue_bytes=199780
+  ok    healthz still returns 200 during an outage
+  ok    healthz reports live
+  ok    healthz reports degraded, not ok
+  ok    the agent is still running
+  ok    metrics still served while degraded
+    restarted timelakedb
+  ok    the queue drained after recovery
+
+passed 16, failed 0
+T-1 GATE MET
+
+Why section D is the one that matters
+-------------------------------------
+
+A liveness probe that fails when the database is unreachable gets the
+agent killed by its orchestrator at exactly the moment the queue is doing
+its job — and the restart discards the batch being assembled and every
+batch in flight, which P1-7 measured as the whole of the node-loss RPO. A
+recoverable outage becomes data loss because of the monitoring.
+
+So `/healthz` reports **liveness only**: is the main loop still turning?
+That is the one question a restart can answer. An outage surfaces as
+`status: degraded` and `shipping: false` in the body, and as
+`tributary_queue_bytes` climbing with `tributary_lines_shipped_total` flat
+in the metrics — where an operator and an alert can see it, while the
+process is left alone. Use `shipping` for a *readiness* probe if you want
+traffic-shaping; do not wire it to liveness.
+
+The drill proves the distinction rather than asserting it: it stops the
+database container through the Docker socket, confirms 200/live/degraded
+with 199,780 bytes spooled, then restarts it and waits for the queue to
+drain to zero.
+
+An earlier version of this drill left the stop optional and, with the
+variable unset, silently checked a *healthy* agent — 12/12 green while
+testing nothing. That is recorded because a green drill that exercises
+nothing is the failure mode this whole bench directory exists to avoid.
+
+The accounting invariant, checked from outside
+----------------------------------------------
+
+`DESIGN.md` §6.2 has always claimed the metric set is designed so that
+
+    lines_read - lines_shipped - lines_quarantined == what is still held
+
+is checkable externally. Section C now checks it against a live scrape
+rather than trusting the claim. It also has a unit test
+(`telemetry.rs::the_set_supports_the_accounting_invariant`) so the
+property survives a refactor that drops one of the three terms.
+
+What is exported
+----------------
+
+26 series, named as §6.2 specified them years before the endpoint existed.
+The pipeline (read / shipped / quarantined / rejected / bisects / requests
+/ unauthorized, plus the ship-vs-read seconds split that decides whether
+L6's faster wire is worth building), the queue (bytes, segments, full,
+spilled, drained), the P1-7 exposure (at_risk_lines, inflight_batches,
+unread_bytes), the sources (files_open, files_lost, rotations,
+pk_disambiguated, watermark_violations), and the L4 credential
+(expiry_seconds, healthy, renewals_refused).
+
+`tributary_credential_expiry_seconds` is the series to page on: it reports
+-1 when no certificate is configured, deliberately distinct from 0, so an
+agent that never had a certificate does not look like one whose
+certificate just expired.
+
+Cost
+----
+
+No new dependencies. hyper, hyper-util, http-body-util and bytes were
+already compiled into the binary by reqwest, so serving two routes needed
+only a direct declaration of what was already there — which matters for an
+agent whose argument is that it is small enough to run on every node.
+
+`[telemetry]` absent means no listener at all, the same additive posture
+as `[output.tls]`: an agent that never configured it behaves exactly as it
+did before, and no port is opened that nobody asked for. The example binds
+127.0.0.1; a DaemonSet being scraped across the pod network needs
+0.0.0.0, and that is a deliberate choice because the endpoint carries no
+authentication and reports file paths and volumes.
