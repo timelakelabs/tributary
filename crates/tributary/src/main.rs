@@ -492,6 +492,7 @@ async fn main() -> anyhow::Result<()> {
         drained = pipe.queue.drained_total,
         bisects = pipe.shipper.bisects(),
         unauthorized = pipe.shipper.unauthorized(),
+        transport_rebuilds = pipe.shipper.transport_rebuilds(),
         queue_bytes = pipe.queue.bytes(),
         multiline_truncated = joiner.truncated,
         read_ms = pipe.read_ns / 1_000_000,
