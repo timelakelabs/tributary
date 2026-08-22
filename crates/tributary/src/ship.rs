@@ -26,6 +26,16 @@ pub struct Counters {
     /// Ships refused with 401/403. Non-zero means the token is wrong,
     /// missing, or unscoped for this database — visible, not inferred.
     pub unauthorized: AtomicU64,
+    /// Consecutive transport-class failures. Reset by any response from a
+    /// node that has a write path; drives the pool-rebuild backstop.
+    pub transport_streak: AtomicU64,
+    /// Times the client was rebuilt to shed its connection pool. Non-zero
+    /// means the shipper decided its pooled connections could not be
+    /// trusted — after a 501, or after enough consecutive transport
+    /// failures. The counter exists because the failure it guards against
+    /// is otherwise invisible: an agent retrying a wrong-but-answering
+    /// peer looks, from every other number, like an ordinary outage.
+    pub transport_rebuilds: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -59,6 +69,18 @@ pub enum ShipError {
     /// only a corrected `TRIBUTARY_TOKEN`/`token_file` will. The data is
     /// still spooled, never dropped.
     Unauthorized(String),
+    /// The peer answered 501: it is a TimeLakeDB node with no write path —
+    /// a querier, or whatever else inherited the address this shipper's
+    /// pool is pinned to. Distinct from `Transport` because retrying the
+    /// SAME CONNECTION cannot fix it, and that is exactly what a pooled
+    /// retry does: DNS is consulted only on dial, and a connection that
+    /// keeps answering HTTP is never redialed. Found live (C4,
+    /// 2026-08-22): a reshape gave the router's old IP to a recreated
+    /// querier, and four agents retried it at ~5 requests/second for half
+    /// an hour, silently, while the real router sat healthy one address
+    /// over. Raising this has already dropped the pool; the retry the
+    /// caller schedules will dial — and resolve — fresh.
+    WrongNode(String),
     Transport(String),
 }
 
@@ -71,6 +93,11 @@ impl std::fmt::Display for ShipError {
                 f,
                 "TimeLakeDB rejected the token ({m}) — check TRIBUTARY_TOKEN or \
                  [output].token_file, and that it is scoped to write this database"
+            ),
+            ShipError::WrongNode(m) => write!(
+                f,
+                "the peer holds no write path ({m}) — its connection pool was \
+                 dropped so the next attempt dials and resolves fresh"
             ),
             ShipError::Transport(m) => write!(f, "transport: {m}"),
         }
@@ -220,6 +247,87 @@ impl Shipper {
         Ok(true)
     }
 
+    /// How many consecutive transport failures trigger a pool rebuild.
+    ///
+    /// Small on purpose. A rebuild is cheap — constructing a `reqwest`
+    /// client is configuration, not I/O — and during a genuine outage the
+    /// fresh pool's dials fail exactly like the old pool's did, so the
+    /// only cost of rebuilding too eagerly is a warn line. The cost of
+    /// rebuilding too late is the C4 wedge: a pool pinned to a peer that
+    /// answers wrongly forever.
+    const REBUILD_AFTER: u64 = 3;
+
+    /// Drop the connection pool by swapping in a freshly built client.
+    ///
+    /// The one thing a shipper can do about a pool pinned to the wrong
+    /// peer: hyper consults DNS only when it dials, and it only dials
+    /// when it has no healthy pooled connection to reuse. Rebuilding
+    /// reuses the `ArcSwap` machinery L4 rotation already established —
+    /// in-flight batches finish on the client they started with.
+    ///
+    /// A rebuild that itself fails (an identity file gone missing at the
+    /// wrong moment) keeps the old client: a poisoned pool that might
+    /// recover beats no client at all, and the error is logged rather
+    /// than allowed to turn a retry path into a crash.
+    fn rebuild_transport(&self, why: &str) {
+        let built = match &self.tls {
+            None => build_client(&[], None),
+            Some(rt) => rt
+                .identity
+                .current()
+                .map(|i| i.reqwest_identity())
+                .transpose()
+                .map_err(anyhow::Error::from)
+                .and_then(|id| build_client(&rt.roots, id)),
+        };
+        match built {
+            Ok(c) => {
+                self.client.store(Arc::new(c));
+                // A fresh pool is a fresh start; the streak that earned the
+                // rebuild should not immediately earn another.
+                self.counters.transport_streak.store(0, Ordering::Relaxed);
+                let n = self
+                    .counters
+                    .transport_rebuilds
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                tracing::warn!(
+                    rebuilds_total = n,
+                    why,
+                    "dropped the connection pool; the next attempt dials and \
+                     resolves fresh"
+                );
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                why,
+                "could not rebuild the HTTP client; keeping the existing pool"
+            ),
+        }
+    }
+
+    /// A response arrived from a node that has a write path — whatever the
+    /// status, the pool is pointed somewhere sane.
+    fn note_write_path_answered(&self) {
+        self.counters.transport_streak.store(0, Ordering::Relaxed);
+    }
+
+    /// A transport-class failure: no response, or a response that proves
+    /// nothing about the peer being the right one. Every
+    /// `REBUILD_AFTER`-th consecutive failure sheds the pool — the
+    /// backstop for inheritors that answer 404, hang, or speak something
+    /// other than HTTP, where no 501 ever names the problem.
+    fn note_transport_failure(&self, what: &str) {
+        let streak = self
+            .counters
+            .transport_streak
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if streak.is_multiple_of(Self::REBUILD_AFTER) {
+            self.rebuild_transport(what);
+        }
+    }
+
     /// Ship a batch, isolating anything the server rejects, and
     /// absorbing backpressure internally so the caller sees a batch
     /// either dealt with or genuinely undeliverable.
@@ -290,22 +398,33 @@ impl Shipper {
             body.as_bytes().to_vec()
         };
 
-        let res = req
+        let res = match req
             .header("content-type", "text/plain; charset=utf-8")
             .body(bytes)
             .send()
             .await
-            .map_err(|e| ShipError::Transport(e.to_string()))?;
+        {
+            Ok(res) => res,
+            Err(e) => {
+                self.note_transport_failure("request failed on the wire");
+                return Err(ShipError::Transport(e.to_string()));
+            }
+        };
 
         let status = res.status().as_u16();
+        // Any status below except the two transport-shaped ones came from
+        // a node that has a write path, so the pool is pointed somewhere
+        // sane and the failure streak resets.
         let out = match status {
             204 => {
+                self.note_write_path_answered();
                 self.counters
                     .shipped
                     .fetch_add(body.lines().count() as u64, Ordering::Relaxed);
                 Ok(())
             }
             429 => {
+                self.note_write_path_answered();
                 let secs = res
                     .headers()
                     .get("retry-after")
@@ -315,22 +434,42 @@ impl Shipper {
                 Err(ShipError::Backpressure(Duration::from_secs(secs)))
             }
             400 => {
+                self.note_write_path_answered();
                 self.counters.rejected.fetch_add(1, Ordering::Relaxed);
                 Err(ShipError::Rejected(res.text().await.unwrap_or_default()))
             }
             401 | 403 => {
                 // The server's body carries a code/reason but never the
                 // token, so it is safe to surface.
+                self.note_write_path_answered();
                 self.counters.unauthorized.fetch_add(1, Ordering::Relaxed);
                 Err(ShipError::Unauthorized(format!(
                     "HTTP {status}: {}",
                     res.text().await.unwrap_or_default()
                 )))
             }
-            code => Err(ShipError::Transport(format!(
-                "HTTP {code}: {}",
-                res.text().await.unwrap_or_default()
-            ))),
+            501 => {
+                // The peer says so itself: "this node holds no write
+                // path". A querier — or whatever inherited the address the
+                // pool is pinned to. Retrying the same connection is the
+                // one move guaranteed not to help, so drop the pool NOW
+                // rather than after a streak: this response is not
+                // ambiguous the way a 404 or a hang is.
+                let msg = res.text().await.unwrap_or_default();
+                self.rebuild_transport("the peer answered 501: no write path");
+                Err(ShipError::WrongNode(format!("HTTP 501: {msg}")))
+            }
+            code => {
+                // Includes an inheritor that answers 404 or some other
+                // service's error page: a response proving nothing about
+                // the peer being the right one counts toward the same
+                // streak as no response at all.
+                self.note_transport_failure("unrecognized response status");
+                Err(ShipError::Transport(format!(
+                    "HTTP {code}: {}",
+                    res.text().await.unwrap_or_default()
+                )))
+            }
         };
         self.counters
             .ship_ns
@@ -353,6 +492,9 @@ impl Shipper {
     }
     pub fn unauthorized(&self) -> u64 {
         self.counters.unauthorized.load(Ordering::Relaxed)
+    }
+    pub fn transport_rebuilds(&self) -> u64 {
+        self.counters.transport_rebuilds.load(Ordering::Relaxed)
     }
 }
 
@@ -395,6 +537,149 @@ mod tests {
         assert_eq!(
             s.url.as_str(),
             "http://localhost:1963/api/v3/write_lp?db=mydb"
+        );
+    }
+
+    // ---- the wrong-node / poisoned-pool behavior ----------------------
+    //
+    // These run against a real TCP listener rather than a mocked client,
+    // because the property under test lives BELOW the status code: after
+    // a 501 the next attempt must arrive on a NEW CONNECTION. The C4
+    // wedge (FINDING_agent_pools_a_reused_ip.md in the TimeLakeDB repo)
+    // was precisely a shipper whose statuses were all handled and whose
+    // connection never changed.
+
+    use std::io::Read as _;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A scripted HTTP peer: answers the given statuses in order, over as
+    /// many keep-alive connections as the client cares to open, and counts
+    /// the connections. When the script runs dry it keeps answering the
+    /// final status.
+    fn scripted_peer(statuses: Vec<u16>) -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&conns);
+        let served = Arc::new(AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { return };
+                seen.fetch_add(1, Ordering::Relaxed);
+                let statuses = statuses.clone();
+                let served = Arc::clone(&served);
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 65536];
+                    let mut pending: Vec<u8> = Vec::new();
+                    loop {
+                        // Read until a full request (headers + body) is in.
+                        let (mut header_end, mut content_len) = (None, 0usize);
+                        loop {
+                            if header_end.is_none()
+                                && let Some(i) = pending.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                header_end = Some(i + 4);
+                                let head = String::from_utf8_lossy(&pending[..i]).to_lowercase();
+                                content_len = head
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("content-length:"))
+                                    .and_then(|v| v.trim().parse().ok())
+                                    .unwrap_or(0);
+                            }
+                            if let Some(h) = header_end
+                                && pending.len() >= h + content_len
+                            {
+                                pending.drain(..h + content_len);
+                                break;
+                            }
+                            match sock.read(&mut buf) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => pending.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        let i = served.fetch_add(1, Ordering::Relaxed);
+                        let code = *statuses.get(i).or(statuses.last()).unwrap();
+                        let resp = if code == 204 {
+                            "HTTP/1.1 204 No Content\r\n\r\n".to_string()
+                        } else {
+                            let body = "no write path here";
+                            format!(
+                                "HTTP/1.1 {code} X\r\ncontent-length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                        };
+                        if sock.write_all(resp.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), conns)
+    }
+
+    /// The wedge, refused: a peer that answers every write with 501 must
+    /// see a NEW connection per attempt, because each 501 drops the pool.
+    /// Under the pre-fix behavior this test observes exactly one
+    /// connection however many times the shipper retries — which is the
+    /// C4 wedge in miniature, and how this test was verified red.
+    #[tokio::test]
+    async fn a_501_answering_peer_is_redialed_not_retried() {
+        let (url, conns) = scripted_peer(vec![501, 501, 501]);
+        let s = Shipper::new(&url, "logs", false, None, None).unwrap();
+        for _ in 0..3 {
+            match s.send("t v=1i 1").await {
+                Err(ShipError::WrongNode(m)) => {
+                    assert!(m.contains("501"), "got: {m}")
+                }
+                other => panic!("expected WrongNode, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            conns.load(Ordering::Relaxed),
+            3,
+            "each 501 must drop the pool, so each attempt dials fresh"
+        );
+        assert_eq!(s.transport_rebuilds(), 3);
+    }
+
+    /// The backstop: an inheritor that answers something other than 501 —
+    /// a 404-serving web app on the reused address, say — earns a rebuild
+    /// on every third consecutive failure, without any status naming the
+    /// problem.
+    #[tokio::test]
+    async fn consecutive_unrecognized_answers_shed_the_pool() {
+        let (url, conns) = scripted_peer(vec![404; 6]);
+        let s = Shipper::new(&url, "logs", false, None, None).unwrap();
+        for _ in 0..6 {
+            match s.send("t v=1i 1").await {
+                Err(ShipError::Transport(_)) => {}
+                other => panic!("expected Transport, got {other:?}"),
+            }
+        }
+        assert_eq!(s.transport_rebuilds(), 2, "rebuild on the 3rd and 6th");
+        // The first rebuild (after send 3) forces send 4 onto a fresh
+        // dial: two connections. The second rebuild lands on the LAST
+        // send, so its fresh dial is never taken — a third connection
+        // would mean the pool was shed at the wrong time.
+        assert_eq!(conns.load(Ordering::Relaxed), 2);
+    }
+
+    /// An answer from a node with a write path resets the streak: two
+    /// failures, an acked write, two more failures — never three in a
+    /// row, so the pool is never shed. Without the reset, intermittent
+    /// flakes would churn perfectly good connections.
+    #[tokio::test]
+    async fn a_write_path_answer_resets_the_streak() {
+        let (url, _conns) = scripted_peer(vec![404, 404, 204, 404, 404, 204]);
+        let s = Shipper::new(&url, "logs", false, None, None).unwrap();
+        for _ in 0..6 {
+            let _ = s.send("t v=1i 1").await;
+        }
+        assert_eq!(
+            s.transport_rebuilds(),
+            0,
+            "the streak never reached three consecutive failures"
         );
     }
 }

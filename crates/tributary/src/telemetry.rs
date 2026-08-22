@@ -174,6 +174,15 @@ impl Telemetry {
             self.ship.unauthorized.load(Ordering::Relaxed).to_string(),
         );
         m(
+            "tributary_transport_rebuilds_total",
+            "counter",
+            "Times the shipper dropped its connection pool and rebuilt the client: after a 501 (the peer has no write path) or after consecutive transport failures. Non-zero means the pool was pinned to a peer it should not trust — most commonly an address reused by a recreated container or pod.",
+            self.ship
+                .transport_rebuilds
+                .load(Ordering::Relaxed)
+                .to_string(),
+        );
+        m(
             "tributary_ship_seconds_total",
             "counter",
             "Seconds spent waiting on HTTP, cumulative.",
