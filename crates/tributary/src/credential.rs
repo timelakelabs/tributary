@@ -220,7 +220,16 @@ pub fn load_pair(cert_path: &Path, key_path: &Path) -> Result<Identity, Credenti
     reqwest::Client::builder()
         .identity(probe)
         .build()
-        .map_err(|e| CredentialError::Invalid(format!("certificate and key do not match: {e}")))?;
+        .map_err(|e| {
+            let mut chain = format!("{e}");
+            let mut src = std::error::Error::source(&e);
+            while let Some(s) = src {
+                chain.push_str(" :: ");
+                chain.push_str(&s.to_string());
+                src = s.source();
+            }
+            CredentialError::Invalid(format!("certificate and key do not match: {chain}"))
+        })?;
 
     Ok(identity)
 }
@@ -376,6 +385,7 @@ mod tests {
         let key = dir.join(format!("{cn}.key"));
         let csr = dir.join(format!("{cn}.csr"));
         let crt = dir.join(format!("{cn}.crt"));
+        let ext = dir.join(format!("{cn}.ext"));
 
         let run = |args: &[&str]| -> bool {
             std::process::Command::new("openssl")
@@ -387,6 +397,24 @@ mod tests {
                 .unwrap_or(false)
         };
         if !run(&["version"]) {
+            return None;
+        }
+        // Force the leaf to X.509 v3. `openssl x509 -req` with no extensions
+        // emits a v1 certificate on openssl 3.0.x, and rustls/webpki reject v1
+        // outright (UnsupportedCertVersion) — which surfaced as the misleading
+        // "certificate and key do not match" this test used to trip on. openssl
+        // 3.5.x emits v3, so it passed locally and failed on ubuntu-latest's
+        // older openssl. Any extension promotes the cert to v3; basicConstraints
+        // is the honest one for a leaf.
+        if std::fs::write(
+            &ext,
+            "[v3]
+basicConstraints=CA:FALSE
+subjectKeyIdentifier=hash
+",
+        )
+        .is_err()
+        {
             return None;
         }
         let ok = run(&[
@@ -428,6 +456,10 @@ mod tests {
             "-CAkey",
             ca_key.to_str()?,
             "-CAcreateserial",
+            "-extfile",
+            ext.to_str()?,
+            "-extensions",
+            "v3",
             "-out",
             crt.to_str()?,
             "-days",
