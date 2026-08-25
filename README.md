@@ -35,6 +35,43 @@ wire, gated on TimeLakeDB growing it) — see
 specification, and its §1 explains why this is a purpose-built agent
 rather than a Vector configuration.
 
+## Install (Linux packages)
+
+Each release attaches a `.deb` and an `.rpm` built from that tag.
+
+```bash
+VER=0.2.0
+
+# Debian / Ubuntu
+curl -LO https://github.com/timelakelabs/tributary/releases/latest/download/tributary_${VER}_amd64.deb
+sudo apt install ./tributary_${VER}_amd64.deb
+
+# RHEL / Rocky / Alma / Amazon Linux 2023
+curl -LO https://github.com/timelakelabs/tributary/releases/latest/download/tributary-${VER}-1.x86_64.rpm
+sudo dnf install ./tributary-${VER}-1.x86_64.rpm
+```
+
+The package installs the agent, a hardened systemd unit, and
+`/etc/tributary/{config.toml,tributary.env}`. **It does not start anything** —
+the shipped `config.toml` has no `[[source]]`, so the agent refuses to start
+until you point it at your server and your log files:
+
+```bash
+# 1. the pipeline: set output.url and add one [[source]] per file
+sudoedit /etc/tributary/config.toml
+# 2. if TimeLakeDB runs with data-plane auth, set TRIBUTARY_TOKEN in:
+sudoedit /etc/tributary/tributary.env
+# 3. let the unprivileged agent read your logs, then start it
+sudo usermod -aG adm tributary          # Debian/Ubuntu; grant read another way elsewhere
+sudo systemctl enable --now tributary
+```
+
+Check it, if you kept `[telemetry]` on: `curl http://127.0.0.1:9109/healthz`.
+
+Requires glibc 2.31+ (Debian 11+, Ubuntu 20.04+, RHEL/Rocky 9+, AL2023);
+verified on Debian 12, Ubuntu 22.04, Rocky 9 and Amazon Linux 2023. See
+[`packaging/`](packaging/README.md) to build them yourself.
+
 ## The short version of why it exists
 
 Three properties of TimeLakeDB's write contract turn a naive log shipper
