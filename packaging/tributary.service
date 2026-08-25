@@ -1,0 +1,59 @@
+[Unit]
+Description=Tributary — log-file shipping agent for TimeLakeDB
+Documentation=https://github.com/timelakelabs/tributary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tributary
+Group=tributary
+EnvironmentFile=/etc/tributary/tributary.env
+ExecStart=/usr/bin/tributary --config /etc/tributary/config.toml --state-dir /var/lib/tributary
+Restart=on-failure
+RestartSec=5s
+
+# The durable queue, the per-source checkpoints and the dead-letter file all
+# live here. systemd creates and owns it (0750, tributary:tributary), so the
+# spool exists on a fresh install even if the package's own mkdir was
+# overridden — and losing it means losing accepted-but-unshipped lines.
+StateDirectory=tributary
+StateDirectoryMode=0750
+
+# Hardening. This agent's whole job is to READ operator-chosen log files and
+# WRITE only its own queue, so the write side is locked down hard while reads
+# stay open. ProtectSystem=strict makes the entire filesystem read-only except
+# ReadWritePaths — reading is still allowed everywhere, which is exactly what a
+# tail agent needs. ProtectHome is read-only (not true) so logs under /home or
+# /srv can still be tailed if that is where an application writes them.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/lib/tributary
+# If you point [log].file at a path in config.toml, or move --state-dir, add
+# that path here with a drop-in (`systemctl edit tributary`) — otherwise the
+# write is refused by ProtectSystem=strict.
+
+# One open descriptor per tailed file plus the shipping sockets; the stock
+# 1024 is low for a host with many log sources.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

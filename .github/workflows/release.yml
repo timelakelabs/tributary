@@ -1,0 +1,94 @@
+# Release: build the Linux packages for a tag and attach them to the Release.
+#
+# Triggered by a version tag, never by a push to a branch. `ci.yml` proves the
+# tree; this workflow's job is only to turn a proven tree into artifacts
+# somebody can install, so it deliberately does NOT re-run the test suite —
+# the tag is expected to point at a commit whose `ci.yml` run was green, and
+# duplicating billed private-repo minutes per tag would make cutting a release
+# something people avoid doing.
+#
+# What it produces, attached to the GitHub Release:
+#   tributary_<version>_amd64.deb      apt / dpkg
+#   tributary-<version>.x86_64.rpm     dnf / yum / rpm
+#   SHA256SUMS
+#
+# The build itself is `packaging/build.sh`, which runs entirely in containers.
+# The runner therefore needs Docker and nothing else — no Rust toolchain, no
+# nfpm, no rpmbuild — and a laptop reproduces the artifact with the same
+# command. It also means the glibc floor is a property of the build image
+# (Debian 11, glibc 2.31), not of whatever the hosted runner happens to ship
+# this month; see the comment at the top of build.sh for why that matters.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Lets a failed release be re-run, or a package be built off a branch for
+  # inspection, without cutting a tag to find out.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 0.1.0-alpha). Defaults to the latest tag.'
+        required: false
+        type: string
+
+# A release must never be cancelled by a later push. Grouped per ref so two
+# tags can build at once, but neither interrupts the other.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  packages:
+    name: build · deb + rpm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # build.sh derives the version from `git describe`, which needs the
+          # tags — a shallow clone has none of them.
+          fetch-depth: 0
+
+      - name: Build packages
+        run: |
+          chmod +x packaging/build.sh
+          packaging/build.sh ${{ inputs.version }}
+
+      # Installing the artifact is the only check that matters here, and it is
+      # cheap: four containers, no compilation. A package that builds but will
+      # not install is exactly the failure a release pipeline exists to catch
+      # before a user does, and the two formats fail differently.
+      - name: Verify the packages install and run
+        run: |
+          chmod +x packaging/verify.sh
+          packaging/verify.sh
+
+      - name: Attach to the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.rpm
+            dist/SHA256SUMS
+          # A tag ending in a pre-release identifier is marked as such, so
+          # `v0.1.0-alpha` does not present itself as the stable release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      # Kept for a workflow_dispatch run, where there is no Release to attach
+      # to and the artifacts would otherwise be discarded with the runner.
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: tributary-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/SHA256SUMS
+          retention-days: 14

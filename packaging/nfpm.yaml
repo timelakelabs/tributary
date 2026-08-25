@@ -1,0 +1,114 @@
+# One spec, both formats. `nfpm pkg -p deb` and `-p rpm` read this same file,
+# which is the point: a .deb and an .rpm built from separate metadata drift
+# apart, and the drift is always found by the user whose distro got the
+# less-tested one.
+#
+# Build with packaging/build.sh — it produces the binary against an old glibc
+# and then calls nfpm twice.
+
+name: tributary
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+version_schema: semver
+section: utils
+priority: optional
+maintainer: TimeLake Labs <noreply@timelakelabs.dev>
+description: |
+  Log-file shipping agent for TimeLakeDB.
+  Tributary tails log files, maps them onto records, and ships them to a
+  TimeLakeDB server over line protocol — with a durable on-disk queue that
+  absorbs an outage and watermarks that let it prove what arrived. Files
+  only, on purpose; Telegraf stays the breadth answer.
+vendor: TimeLake Labs
+homepage: https://github.com/timelakelabs/tributary
+license: Apache-2.0
+
+# The binary is built against an old glibc on purpose (see build.sh), but a
+# floor stated here turns "too old" into a refused install with a clear
+# message instead of a runtime symbol-lookup crash. The two package managers
+# spell the C library differently, which is exactly the kind of divergence a
+# single spec with overrides keeps honest.
+#
+# The useradd dependency is not theoretical: Amazon Linux 2023 ships WITHOUT
+# shadow-utils, so preinstall.sh dies with "Error in PREIN scriptlet" and the
+# whole install rolls back. Declaring it makes dnf pull shadow-utils in before
+# the scriptlet runs. (Learned on the TimeLakeDB package; inherited here.)
+overrides:
+  deb:
+    depends:
+      - libc6 (>= ${PKG_GLIBC_MIN})
+      - passwd
+  rpm:
+    depends:
+      - glibc >= ${PKG_GLIBC_MIN}
+      - shadow-utils
+
+contents:
+  - src: dist/tributary
+    dst: /usr/bin/tributary
+    file_info:
+      mode: 0755
+
+  - src: packaging/tributary.service
+    dst: /usr/lib/systemd/system/tributary.service
+    file_info:
+      mode: 0644
+
+  # The pipeline config: where to ship, what to tail, self-telemetry. Treated
+  # as a conffile (dpkg) / %config(noreplace) (rpm), so the operator's edits
+  # survive an upgrade and a new default lands beside it as .dpkg-dist /
+  # .rpmnew. Ships as a template with NO [[source]], so the agent refuses to
+  # start until it is edited — see the file itself.
+  - src: packaging/config.toml
+    dst: /etc/tributary/config.toml
+    type: config|noreplace
+    file_info:
+      mode: 0640
+      owner: root
+      group: tributary
+
+  # Token and log level, read by systemd as an EnvironmentFile. Kept apart
+  # from config.toml because it holds a SECRET (the data-plane token): 0640
+  # root:tributary, never world-readable, never in the pipeline config.
+  - src: packaging/tributary.env
+    dst: /etc/tributary/tributary.env
+    type: config|noreplace
+    file_info:
+      mode: 0640
+      owner: root
+      group: tributary
+
+  - dst: /etc/tributary
+    type: dir
+    file_info:
+      mode: 0750
+      owner: root
+      group: tributary
+
+  # NOTE: /var/lib/tributary is deliberately NOT listed here. A package-owned
+  # directory is removed by dpkg/rpm when the package leaves and the directory
+  # is empty — and that directory is the durable QUEUE. Letting `apt remove`
+  # delete it drops log lines that were accepted, spooled, and not yet shipped
+  # — the exact silent loss this agent exists to prevent. postinstall.sh
+  # creates it and systemd's StateDirectory= re-creates it, so it is present
+  # from first install without being owned by the package manager. (The
+  # TimeLakeDB package hit this same trap with its data directory.)
+
+  # Plain files, NOT `type: doc` — nfpm has no such content type and silently
+  # drops any entry that declares one.
+  - src: README.md
+    dst: /usr/share/doc/tributary/README.md
+  - src: LICENSE
+    dst: /usr/share/doc/tributary/LICENSE
+
+scripts:
+  preinstall: packaging/scripts/preinstall.sh
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+  postremove: packaging/scripts/postremove.sh
+
+deb:
+  compression: xz
+rpm:
+  compression: xz

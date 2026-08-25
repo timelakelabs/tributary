@@ -11,3 +11,6 @@ Cargo.lock.bak
 /data/
 *.checkpoint
 /bench/corpus/
+
+# release build artifacts (packaging/build.sh)
+dist/
