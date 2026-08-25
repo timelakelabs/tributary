@@ -1,0 +1,60 @@
+# Tributary configuration — the pipeline: where to ship, what to tail, and
+# optional self-telemetry. Your edits survive a package upgrade.
+#
+# As shipped this file has NO [[source]], so the agent refuses to start with
+# "no [[source]] configured". That is deliberate: point it at your server and
+# your log files first, then start it with `systemctl enable --now tributary`.
+
+# -- Where to ship ----------------------------------------------------------
+[output]
+# The TimeLakeDB server. http on a segment you trust; https everywhere else.
+url = "http://127.0.0.1:1963"
+# The target database.
+database = "logs"
+# Lines per shipped batch. Bigger amortizes the round trip; smaller bounds the
+# at-risk window if the host dies mid-batch.
+batch_lines = 2000
+gzip = true
+# Durable on-disk queue cap (bytes). When the server is unreachable, lines
+# spool under --state-dir up to this size before the oldest are dropped and
+# counted. 512 MiB here.
+queue_max_bytes = 536870912
+# The data-plane token (SEC-4) is NOT written here — a secret in a config is a
+# secret leaked. Set TRIBUTARY_TOKEN in /etc/tributary/tributary.env, or point
+# token_file at a file readable only by the tributary user. TRIBUTARY_TOKEN
+# wins if both are set.
+#token_file = "/etc/tributary/token"
+
+# -- Shipping over TLS (optional) -------------------------------------------
+# ca_file trusts the server's issuer (plain HTTPS). cert_file + key_file
+# present a client identity (L4 mTLS) — both or neither. The pair is re-read
+# every refresh_secs, so a rotation is adopted without a restart.
+#[output.tls]
+#ca_file      = "/etc/tributary/tls/ca.crt"
+#cert_file    = "/etc/tributary/tls/client.crt"
+#key_file     = "/etc/tributary/tls/client.key"
+#refresh_secs = 30
+
+# -- Self-telemetry (optional) ----------------------------------------------
+# GET /metrics and GET /healthz. Absent means no listener at all. Loopback is
+# the safe start; the endpoint carries no authentication, so exposing it (for
+# a scraper on another host) is a deliberate choice, not a default.
+[telemetry]
+addr = "127.0.0.1:9109"
+
+# -- What to tail -----------------------------------------------------------
+# One [[source]] per log file. Uncomment and edit. IMPORTANT: the `tributary`
+# user must be able to READ these paths — on Debian/Ubuntu that usually means
+# `usermod -aG adm tributary`; elsewhere, grant read another way. See
+# /usr/share/doc/tributary/README.md.
+#[[source]]
+#name        = "syslog"
+#path        = "/var/log/syslog"
+#table       = "syslog"
+#parser      = "json"        # or a "regex" parser with a pattern
+#timestamp   = { field = "ts", format = "unix_ms", resolution = "ms" }
+#tags        = ["level", "service"]
+#tags_static = { host = "REPLACE-ME" }
+#
+#[source.fields]
+#message = "string"
