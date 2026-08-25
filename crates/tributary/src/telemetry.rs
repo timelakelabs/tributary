@@ -52,6 +52,10 @@ pub struct Telemetry {
     pub rotations: AtomicU64,
     pub watermark_violations: AtomicU64,
     pub out_of_window: AtomicU64,
+    /// OTLP receiver (#12): log records accepted, and records dropped
+    /// (un-coercible field, or a stamper that refused the timestamp).
+    pub otlp_received: AtomicU64,
+    pub otlp_rejected: AtomicU64,
     pub read_ns: AtomicU64,
 
     /// L4 client certificate. `expiry` is seconds from now; `-1` means no
@@ -87,6 +91,8 @@ impl Telemetry {
             rotations: AtomicU64::new(0),
             watermark_violations: AtomicU64::new(0),
             out_of_window: AtomicU64::new(0),
+            otlp_received: AtomicU64::new(0),
+            otlp_rejected: AtomicU64::new(0),
             read_ns: AtomicU64::new(0),
             cert_expires_in_secs: AtomicI64::new(-1),
             cert_healthy: AtomicBool::new(true),
@@ -285,6 +291,20 @@ impl Telemetry {
             "counter",
             "Records that arrived older than the published watermark.",
             g(&self.watermark_violations).to_string(),
+        );
+
+        // -- OTLP receiver (#12) ---------------------------------------
+        m(
+            "tributary_otlp_records_received_total",
+            "counter",
+            "OTLP log records accepted by the receiver and queued for shipping.",
+            g(&self.otlp_received).to_string(),
+        );
+        m(
+            "tributary_otlp_records_rejected_total",
+            "counter",
+            "OTLP log records dropped before the queue: an undeclared/un-coercible field, or a timestamp the stamper refused.",
+            g(&self.otlp_rejected).to_string(),
         );
 
         // -- L4 credential ---------------------------------------------

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub output: Output,
-    #[serde(rename = "source")]
+    #[serde(rename = "source", default)]
     pub sources: Vec<Source>,
     /// T-1 self-telemetry. Absent = no listener.
     #[serde(default)]
@@ -16,6 +16,10 @@ pub struct Config {
     /// The agent's own log file. Absent = stdout only.
     #[serde(default)]
     pub log: Option<Log>,
+    /// OTLP logs receiver (#12). Absent = no receiver, exactly the pull-only
+    /// agent as before. Present = a push endpoint on its own port.
+    #[serde(default)]
+    pub otlp: Option<Otlp>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -331,8 +335,19 @@ impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Config> {
         let text = std::fs::read_to_string(path)?;
         let cfg: Config = toml::from_str(&text)?;
-        if cfg.sources.is_empty() {
-            anyhow::bail!("no [[source]] configured");
+        if cfg.sources.is_empty() && cfg.otlp.is_none() {
+            anyhow::bail!("nothing to do: configure at least one [[source]] or an [otlp] receiver");
+        }
+        if let Some(o) = &cfg.otlp {
+            if o.listen.trim().is_empty() {
+                anyhow::bail!("[otlp].listen is required (host:port to receive on)");
+            }
+            if o.table.trim().is_empty() {
+                anyhow::bail!("[otlp].table is required");
+            }
+            if o.name.trim().is_empty() {
+                anyhow::bail!("[otlp].name is required (it becomes the `stream` tag)");
+            }
         }
         if let Some(tls) = &cfg.output.tls {
             tls.validate()?;
@@ -365,5 +380,99 @@ impl Source {
     }
     pub fn resolution(&self) -> crate::stamp::Resolution {
         crate::stamp::Resolution::parse(&self.timestamp.resolution).expect("validated at load")
+    }
+}
+
+/// OTLP logs receiver (#12). A push source: an OpenTelemetry producer or
+/// Collector `POST`s to `listen`, and each log record maps onto a record on
+/// the SAME map -> queue -> ship path a file tail uses. The tag `allowlist`
+/// is the whole cardinality defence (FR-2): a resource attribute becomes a
+/// tag only if named here, never by arriving.
+#[derive(Debug, Deserialize, Clone)]
+pub struct Otlp {
+    /// host:port to receive OTLP/HTTP on (the OTLP default is 4318).
+    pub listen: String,
+    /// Stream identity — becomes the `stream` tag, like a source's name.
+    pub name: String,
+    pub table: String,
+    /// The tag ALLOWLIST over resource/scope/log attributes (plus `body`,
+    /// `severity_text`, `scope.name`). Never "every attribute": OTLP resource
+    /// attributes are unbounded, and each becoming a tag rebuilds the FR-2
+    /// failure this project exists to avoid.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub tags_static: BTreeMap<String, String>,
+    /// Declared field types (usually `body = "string"`). Same rule as a
+    /// source: an undeclared key is dropped, not guessed.
+    #[serde(default)]
+    pub fields: BTreeMap<String, FieldType>,
+    #[serde(default)]
+    pub visibility: Option<String>,
+}
+
+impl Otlp {
+    /// A synthetic [`Source`] so the receiver reuses `map::build_record` and
+    /// inherits the same allowlist and declared-field rules. OTLP timestamps
+    /// are nanosecond (`time_unix_nano`), so the stamper runs at ns.
+    pub fn as_source(&self) -> Source {
+        Source {
+            name: self.name.clone(),
+            path: String::new(),
+            table: self.table.clone(),
+            parser: Parser::Plain,
+            timestamp: Timestamp {
+                field: None,
+                format: default_format(),
+                resolution: "ns".into(),
+            },
+            tags: self.tags.clone(),
+            tags_static: self.tags_static.clone(),
+            fields: self.fields.clone(),
+            visibility: self.visibility.clone(),
+            multiline: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_str(toml: &str) -> anyhow::Result<Config> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.toml");
+        std::fs::write(&path, toml).unwrap();
+        Config::load(&path)
+    }
+
+    #[test]
+    fn an_otlp_only_config_is_valid_without_a_source() {
+        let cfg = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [otlp]\nlisten = \"0.0.0.0:4318\"\nname = \"otlp\"\ntable = \"logs\"\n",
+        )
+        .expect("an OTLP-only agent is a valid configuration");
+        assert!(cfg.sources.is_empty());
+        assert_eq!(cfg.otlp.unwrap().table, "logs");
+    }
+
+    #[test]
+    fn otlp_without_listen_is_refused() {
+        let err = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [otlp]\nlisten = \"\"\nname = \"otlp\"\ntable = \"logs\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("listen"), "got: {err}");
+    }
+
+    #[test]
+    fn nothing_configured_is_refused() {
+        let err = load_str("[output]\nurl = \"http://localhost:1963\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("source") || err.to_string().contains("otlp"),
+            "got: {err}"
+        );
     }
 }

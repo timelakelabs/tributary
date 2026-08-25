@@ -4,7 +4,8 @@
 
 A log-file agent for [TimeLakeDB](https://github.com/timelakelabs/timelakedb).
 
-A tributary feeds a lake. This one tails log files and writes them into
+A tributary feeds a lake. This one tails log files — and receives
+OpenTelemetry (OTLP) logs pushed to it — and writes them into
 TimeLakeDB over line protocol — the same wire Telegraf already uses for
 metrics, so one host ships both through one endpoint and one data model.
 
@@ -67,6 +68,36 @@ sudo systemctl enable --now tributary
 ```
 
 Check it, if you kept `[telemetry]` on: `curl http://127.0.0.1:9109/healthz`.
+
+### Receiving OTLP logs (push)
+
+Beyond tailing files, Tributary can be an OpenTelemetry logs **receiver**:
+point an OTLP/HTTP exporter (an SDK, or the OTel Collector) at it and each
+log record lands on the same durable queue → ship path a file tail uses,
+**acknowledged only once it is durably queued** — so a Collector never
+believes it delivered something a restart then dropped.
+
+```toml
+[otlp]
+listen = "0.0.0.0:4318"   # OTLP/HTTP; the receiver is POST /v1/logs
+name   = "otel"           # becomes the `stream` tag
+table  = "logs"
+# tags is an ALLOWLIST over resource/scope/log attributes (plus body,
+# severity_text, scope.name). An attribute becomes a tag ONLY if named here,
+# so unbounded ones (k8s.pod.uid, a trace id per record) never explode the
+# series. A dictionary-vs-plain distinction does not survive OTLP, so a
+# string is a tag by default.
+tags   = ["service.name", "k8s.namespace.name", "severity_text"]
+
+[otlp.fields]
+body = "string"           # the log message; declared types only, as for a source
+```
+
+A config may carry an `[otlp]` receiver, one or more `[[source]]` file
+tails, or both. The receiver maps resource/scope/log attributes through the
+allowlist, the log body to a field, and the record's `time_unix_nano` to the
+timestamp — then hands the record to the same map → queue → ship path, so
+auth, TLS, watermarks and disk buffering are inherited, not reimplemented.
 
 Requires glibc 2.31+ (Debian 11+, Ubuntu 20.04+, RHEL/Rocky 9+, AL2023);
 verified on Debian 12, Ubuntu 22.04, Rocky 9 and Amazon Linux 2023. See

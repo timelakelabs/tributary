@@ -139,6 +139,20 @@ pub fn map_line(src: &Source, line: &str) -> Result<(Record, i64), MapError> {
             .unwrap_or(0),
     };
 
+    build_record(src, &parsed, source_ts_ns)
+}
+
+/// Build a record from an already-parsed key→value map and a source
+/// timestamp: the tag allowlist, static tags, stream identity and
+/// visibility, then the declared fields with their coercion. Shared by
+/// [`map_line`] (file tails) and the OTLP receiver (#12), so a pushed
+/// OpenTelemetry log inherits the SAME allowlist — the FR-2 cardinality
+/// guard — and the same "declared types only" field rule as a tailed line.
+pub(crate) fn build_record(
+    src: &Source,
+    parsed: &BTreeMap<String, serde_json::Value>,
+    source_ts_ns: i64,
+) -> Result<(Record, i64), MapError> {
     // Tags: the allowlist, plus statics, plus the stream identity.
     let mut tags: Vec<(String, String)> = vec![("stream".into(), src.name.clone())];
     for (k, v) in &src.tags_static {
