@@ -109,7 +109,9 @@ pub fn map_line(src: &Source, line: &str) -> Result<(Record, i64), MapError> {
     }
 
     let parsed: BTreeMap<String, serde_json::Value> = match src.parser {
-        Parser::Json => {
+        // DockerJson is JSON here: the reassembled envelope's keys
+        // (log/stream/time) are the parsed map. Reassembly is upstream.
+        Parser::Json | Parser::DockerJson => {
             serde_json::from_str(line).map_err(|e| MapError::Unparseable(e.to_string()))?
         }
         Parser::Plain => {
@@ -224,6 +226,43 @@ mod tests {
             visibility: None,
             multiline: None,
         }
+    }
+
+    #[test]
+    fn a_docker_json_envelope_maps_through_the_full_path() {
+        use crate::config::{FieldType, Timestamp};
+        // A reassembled docker envelope (docker.rs strips the terminating
+        // newline and tests that; here we prove the map half: log -> field,
+        // stream -> tag, RFC3339 time -> ns).
+        let envelope = serde_json::json!(
+            {"log": "disk full", "stream": "stderr", "time": "2024-01-01T00:00:00Z"}
+        )
+        .to_string();
+        let src = Source {
+            name: "web".into(),
+            path: "/x".into(),
+            table: "container_logs".into(),
+            parser: Parser::DockerJson,
+            timestamp: Timestamp {
+                field: Some("time".into()),
+                format: "rfc3339".into(),
+                resolution: "ns".into(),
+            },
+            tags: vec!["stream".into()],
+            tags_static: Default::default(),
+            fields: [("log".to_string(), FieldType::String)].into(),
+            visibility: None,
+            multiline: None,
+        };
+        let (rec, ts) = map_line(&src, &envelope).unwrap();
+        assert_eq!(rec.table, "container_logs");
+        assert_eq!(
+            rec.fields,
+            vec![("log".into(), Value::Str("disk full".into()))]
+        );
+        // stdout/stderr rides the `stream` tag (last-wins over the source name).
+        assert!(rec.tags.iter().any(|(k, v)| k == "stream" && v == "stderr"));
+        assert_eq!(ts, 1_704_067_200_000_000_000); // 2024-01-01T00:00:00Z in ns
     }
 
     #[test]

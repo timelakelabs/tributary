@@ -9,6 +9,7 @@ mod auth;
 mod checkpoint;
 mod config;
 mod credential;
+mod docker;
 mod logfile;
 mod lp;
 mod map;
@@ -21,6 +22,48 @@ mod stamp;
 mod tail;
 mod telemetry;
 mod watermark;
+
+/// The per-line framer: multiline joins for stack traces, or docker json-file
+/// reassembly for the 16 KB splits. One per source; both emit complete "lines"
+/// for the map path and both gate the checkpoint through `has_pending`, so the
+/// tail loop treats them the same.
+enum Framer {
+    Multiline(multiline::Joiner),
+    Docker(docker::Reassembler),
+}
+
+impl Framer {
+    fn push(&mut self, line: &str) -> Result<Option<String>, docker::DockerError> {
+        match self {
+            Framer::Multiline(j) => Ok(j.push(line.to_string())),
+            Framer::Docker(r) => r.push(line),
+        }
+    }
+    fn expire(&mut self) -> Option<String> {
+        match self {
+            Framer::Multiline(j) => j.expire(),
+            Framer::Docker(r) => r.expire(),
+        }
+    }
+    fn drain(&mut self) -> Option<String> {
+        match self {
+            Framer::Multiline(j) => j.drain(),
+            Framer::Docker(r) => r.drain(),
+        }
+    }
+    fn has_pending(&self) -> bool {
+        match self {
+            Framer::Multiline(j) => j.has_pending(),
+            Framer::Docker(r) => r.has_pending(),
+        }
+    }
+    fn truncated(&self) -> u64 {
+        match self {
+            Framer::Multiline(j) => j.truncated,
+            Framer::Docker(r) => r.truncated,
+        }
+    }
+}
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -207,13 +250,20 @@ async fn main() -> anyhow::Result<()> {
         quarantined: 0,
     };
 
-    let ml = source.multiline.as_ref();
-    let mut joiner = multiline::Joiner::new(
-        ml.map(|m| m.starts_with.as_str()),
-        ml.map(|m| m.max_lines).unwrap_or(500),
-        ml.map(|m| m.max_bytes).unwrap_or(64 * 1024),
-        ml.map(|m| m.timeout_ms).unwrap_or(1000),
-    )?;
+    let mut framer = match source.parser {
+        // A docker json-file line is >16 KB by design (that is the split it
+        // reassembles), so allow a generous single message before the cap.
+        config::Parser::DockerJson => Framer::Docker(docker::Reassembler::new(1 << 20, 1000)),
+        _ => {
+            let ml = source.multiline.as_ref();
+            Framer::Multiline(multiline::Joiner::new(
+                ml.map(|m| m.starts_with.as_str()),
+                ml.map(|m| m.max_lines).unwrap_or(500),
+                ml.map(|m| m.max_bytes).unwrap_or(64 * 1024),
+                ml.map(|m| m.timeout_ms).unwrap_or(1000),
+            )?)
+        }
+    };
 
     let mut tailer = tail::Tailer::resume(std::path::Path::new(&source.path), restored.as_ref())?;
     tracing::info!(
@@ -281,8 +331,13 @@ async fn main() -> anyhow::Result<()> {
             let decoded = map::decode_lossy(&raw);
             // Multiline: a record may span several source lines, so only
             // a COMPLETED record becomes a row.
-            let Some(line) = joiner.push(decoded) else {
-                continue;
+            let line = match framer.push(&decoded) {
+                Ok(Some(line)) => line,
+                Ok(None) => continue,
+                Err(e) => {
+                    dead_letter(&mut pipe, &decoded, &e.to_string())?;
+                    continue;
+                }
             };
             read_total += 1;
             match build(source, &line, &mut stamper, &mut pipe.watermark) {
@@ -303,14 +358,14 @@ async fn main() -> anyhow::Result<()> {
             pipe.read_ns += t_read.elapsed().as_nanos() as u64;
             // Never record progress past a half-assembled record: a
             // crash would resume after its lines and lose it.
-            if batch.len() >= cfg.output.batch_lines && !joiner.has_pending() {
+            if batch.len() >= cfg.output.batch_lines && !framer.has_pending() {
                 flush(&mut pipe, &mut batch, &mut batch_max_ts).await?;
                 last_flush = Instant::now();
             }
         }
 
         // The last record in a quiet file has no successor to close it.
-        if let Some(line) = joiner.expire() {
+        if let Some(line) = framer.expire() {
             read_total += 1;
             match build(source, &line, &mut stamper, &mut pipe.watermark) {
                 Ok(Some((record, source_ts))) => {
@@ -327,7 +382,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        if last_flush.elapsed() >= flush_every && !joiner.has_pending() {
+        if last_flush.elapsed() >= flush_every && !framer.has_pending() {
             if !batch.is_empty() {
                 flush(&mut pipe, &mut batch, &mut batch_max_ts).await?;
             }
@@ -439,16 +494,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some(line) = joiner.drain()
-        && let Ok(Some((mut record, source_ts))) =
+    while let Some(line) = framer.drain() {
+        if let Ok(Some((mut record, source_ts))) =
             build(source, &line, &mut stamper, &mut pipe.watermark)
-    {
-        record.ts_ns = record.ts_ns.max(record.ts_ns);
-        let mut encoded = String::new();
-        if record.encode(&mut encoded).is_ok() {
-            read_total += 1;
-            batch.push(encoded);
-            batch_max_ts = batch_max_ts.max(source_ts);
+        {
+            record.ts_ns = record.ts_ns.max(record.ts_ns);
+            let mut encoded = String::new();
+            if record.encode(&mut encoded).is_ok() {
+                read_total += 1;
+                batch.push(encoded);
+                batch_max_ts = batch_max_ts.max(source_ts);
+            }
         }
     }
     flush(&mut pipe, &mut batch, &mut batch_max_ts).await?;
@@ -474,7 +530,7 @@ async fn main() -> anyhow::Result<()> {
         unauthorized = pipe.shipper.unauthorized(),
         transport_rebuilds = pipe.shipper.transport_rebuilds(),
         queue_bytes = pipe.queue.bytes(),
-        multiline_truncated = joiner.truncated,
+        multiline_truncated = framer.truncated(),
         read_ms = pipe.read_ns / 1_000_000,
         ship_ms = pipe.shipper.ship_ns() / 1_000_000,
         requests = pipe.shipper.requests(),

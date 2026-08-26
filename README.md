@@ -103,6 +103,36 @@ Requires glibc 2.31+ (Debian 11+, Ubuntu 20.04+, RHEL/Rocky 9+, AL2023);
 verified on Debian 12, Ubuntu 22.04, Rocky 9 and Amazon Linux 2023. See
 [`packaging/`](packaging/README.md) to build them yourself.
 
+### Docker json-file logs
+
+A source can read Docker's `json-file` driver directly — the
+`/var/lib/docker/containers/<id>/<id>-json.log` files — with
+`parser = "docker_json"`:
+
+```toml
+[[source]]
+name   = "web"
+path   = "/var/lib/docker/containers/<id>/<id>-json.log"
+table  = "container_logs"
+parser = "docker_json"
+timestamp   = { field = "time", format = "rfc3339" }
+fields      = { log = "string" }        # the message
+tags        = ["stream"]                # keep stdout vs stderr
+tags_static = { container = "web" }
+```
+
+It decodes the `{"log","stream","time"}` envelope and — the part a naive
+reader gets wrong — **reassembles the 16 KB frame splits**: Docker breaks a
+log line longer than 16 KB across several JSON objects, and only the last
+ends in a newline, so joining them back is the difference between one record
+and a shredded one. stdout and stderr are reassembled separately.
+
+**One caveat, stated plainly:** Tributary already emits a `stream` tag equal
+to the source `name` (its stream identity). Allowlist docker's own `stream`
+(stdout/stderr) and it takes that tag over — last write wins. Give the
+container its identity through `tags_static`, as above, and let `stream`
+carry stdout/stderr.
+
 ## The short version of why it exists
 
 Three properties of TimeLakeDB's write contract turn a naive log shipper

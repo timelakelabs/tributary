@@ -300,6 +300,11 @@ pub enum Parser {
     Json,
     #[default]
     Plain,
+    /// Docker's json-file driver: `{"log","stream","time"}` per line,
+    /// with >16 KB lines split across frames. Reassembled upstream, then
+    /// parsed as JSON — see [`crate::docker`].
+    #[serde(rename = "docker_json")]
+    DockerJson,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
@@ -362,6 +367,12 @@ impl Config {
             }
         }
         for s in &cfg.sources {
+            if s.parser == Parser::DockerJson && s.multiline.is_some() {
+                anyhow::bail!(
+                    "source '{}': parser = \"docker_json\" cannot also set \n                     [source.multiline] — the docker reassembler owns framing",
+                    s.name
+                );
+            }
             if crate::stamp::Resolution::parse(&s.resolution_str()).is_none() {
                 anyhow::bail!(
                     "source '{}': resolution {:?} is not s|ms|us|ns",
