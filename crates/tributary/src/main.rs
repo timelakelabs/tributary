@@ -10,6 +10,8 @@ mod checkpoint;
 mod config;
 mod credential;
 mod docker;
+#[cfg(feature = "journald")]
+mod journald;
 mod logfile;
 mod lp;
 mod map;
@@ -217,6 +219,14 @@ async fn main() -> anyhow::Result<()> {
         // an operator who configured telemetry and silently did not get it
         // finds out from an empty dashboard days later.
         server::serve(addr, std::sync::Arc::clone(&tel)).await?;
+    }
+
+    // #23: a journald source reads the journal via the sd-journal cursor, not
+    // a file — its own pull loop, reusing this shipper and the same
+    // queue/stamper/checkpoint machinery. Returns instead of falling into the
+    // file-tail setup below.
+    if source.parser == config::Parser::Journald {
+        return run_journald_source(source, shipper, &args, &cfg).await;
     }
 
     // #12: run the OTLP receiver alongside the file tail when configured. Its
@@ -643,6 +653,57 @@ pub(crate) fn build_shipper(output: &config::Output) -> anyhow::Result<ship::Shi
     ship::Shipper::new(&output.url, &output.database, output.gzip, token, tls)
 }
 
+/// Run a journald source (#23): reader + the shared ship path, raced against
+/// shutdown. Behind the feature so the default binary links no libsystemd; the
+/// `not` arm is unreachable at runtime (Config::load refuses journald without
+/// the feature) but is needed to compile.
+#[allow(unused_variables)]
+async fn run_journald_source(
+    source: &config::Source,
+    shipper: ship::Shipper,
+    args: &Args,
+    cfg: &Config,
+) -> anyhow::Result<()> {
+    #[cfg(feature = "journald")]
+    {
+        let reader = journald::RealJournal::open()?;
+        tracing::info!(
+            stream = source.name,
+            follow = !args.once,
+            "journald source started"
+        );
+        let run = journald::run_journald(
+            reader,
+            source,
+            shipper,
+            &args.state_dir,
+            cfg.output.queue_max_bytes,
+            cfg.output.batch_lines,
+            args.once,
+        );
+        let shutdown = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+            }
+            #[cfg(not(unix))]
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        tokio::select! {
+            r = run => r,
+            _ = shutdown => { tracing::info!("shutdown"); Ok(()) }
+        }
+    }
+    #[cfg(not(feature = "journald"))]
+    {
+        anyhow::bail!(
+            "journald source configured but this binary was built without the `journald` feature"
+        )
+    }
+}
+
 fn build(
     source: &config::Source,
     line: &str,
@@ -814,6 +875,7 @@ fn save_checkpoint(
         last_tick_ns,
         next_seq,
         lateness_ns: Some(pipe.watermark.lateness_ns()),
+        cursor: None,
     }
     .save(&pipe.cp_path)
 }
