@@ -770,43 +770,84 @@ fn parse_mountinfo(text: &str) -> Vec<MountInfo> {
 /// permanently-unresponsive mount costs at most one blocked probe thread per
 /// re-probe window rather than one per tick.
 #[cfg(target_os = "linux")]
-const DISK_REPROBE_TICKS: u64 = 60;
-
 #[cfg(target_os = "linux")]
 const PER_MOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Mounts whose statvfs timed out, and the tick at which each may be re-probed.
-/// Held across ticks — this is what bounds the thread leak: a known-dead mount
-/// is SKIPPED (no `spawn_blocking`) until it is due for a re-probe.
+/// A mount whose statvfs timed out, keyed to the still-in-flight probe. The
+/// handle is HELD, not dropped (#40): while it is pending the mount stays
+/// quarantined and no new probe is spawned; when the statvfs finally returns
+/// (the mount recovered) the handle finishes — which both signals recovery and
+/// reclaims the one blocked thread. So the leak is bounded to exactly one
+/// thread per dead mount, ever — not one per re-probe window. Held across ticks.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct DeadMounts {
-    next_probe: std::collections::HashMap<std::path::PathBuf, u64>,
+    pending:
+        std::collections::HashMap<std::path::PathBuf, tokio::task::JoinHandle<Option<DiskSample>>>,
+}
+
+/// Where a mount stands relative to a held probe.
+#[cfg(target_os = "linux")]
+enum ProbeState {
+    /// No probe held — probe this mount normally.
+    Fresh,
+    /// A held probe is still blocked — the mount is still dead; spawn nothing.
+    StillDead,
+    /// The held probe finished — the mount answered; here is its (fresh) sample.
+    Recovered(Option<DiskSample>),
 }
 
 #[cfg(target_os = "linux")]
 impl DeadMounts {
-    /// Probe a mount we've never seen fail, or one whose re-probe tick arrived.
-    fn should_probe(&self, path: &std::path::Path, tick: u64) -> bool {
-        match self.next_probe.get(path) {
-            None => true,
-            Some(&next) => tick >= next,
+    /// Where `path` stands: no held probe (`Fresh`), a held probe still blocked
+    /// (`StillDead`), or a held probe that just finished (`Recovered` — the
+    /// mount came back and its statvfs returned CURRENT stats). A finished
+    /// handle is taken and its entry cleared here.
+    async fn check(&mut self, path: &std::path::Path) -> ProbeState {
+        let finished = match self.pending.get(path) {
+            None => return ProbeState::Fresh,
+            Some(h) => h.is_finished(),
+        };
+        if finished {
+            // Finished, so this await returns immediately.
+            let sample = self
+                .pending
+                .remove(path)
+                .expect("present: just matched")
+                .await
+                .ok()
+                .flatten();
+            ProbeState::Recovered(sample)
+        } else {
+            ProbeState::StillDead
         }
     }
-    fn mark_dead(&mut self, path: std::path::PathBuf, tick: u64) {
-        self.next_probe.insert(path, tick + DISK_REPROBE_TICKS);
+
+    /// Hold a timed-out probe's handle so recovery is detected without ever
+    /// spawning another probe for this mount.
+    fn hold(
+        &mut self,
+        path: std::path::PathBuf,
+        handle: tokio::task::JoinHandle<Option<DiskSample>>,
+    ) {
+        self.pending.insert(path, handle);
     }
-    fn mark_alive(&mut self, path: &std::path::Path) {
-        self.next_probe.remove(path);
+
+    /// Drop held handles for mounts no longer present (unmounted). The detached
+    /// statvfs thread can't be stopped — it lives until its call returns or the
+    /// process exits — but this stops tracking it so the map can't grow.
+    fn prune(&mut self, present: &std::collections::HashSet<std::path::PathBuf>) {
+        self.pending.retain(|p, _| present.contains(p));
     }
 }
 
 /// Gather disk on Linux: enumerate mounts (no statvfs), then statvfs each one
-/// that isn't quarantined in its OWN bounded task. A mount that times out is
-/// quarantined and skipped on later ticks; the healthy mounts keep reporting,
-/// and no new probe thread is spawned for a mount known to be dead.
+/// in its OWN bounded task. A mount whose probe times out has its handle HELD
+/// (quarantined) and is not probed again until that held statvfs returns —
+/// which means the mount recovered. Healthy mounts keep reporting; a known-dead
+/// mount spawns no new thread (#40).
 #[cfg(target_os = "linux")]
-async fn gather_disks_linux(dead: &mut DeadMounts, tick: u64) -> Vec<DiskSample> {
+async fn gather_disks_linux(dead: &mut DeadMounts) -> Vec<DiskSample> {
     let mounts = match std::fs::read_to_string("/proc/self/mountinfo") {
         Ok(t) => parse_mountinfo(&t),
         Err(e) => {
@@ -814,31 +855,41 @@ async fn gather_disks_linux(dead: &mut DeadMounts, tick: u64) -> Vec<DiskSample>
             return Vec::new();
         }
     };
+    let present: std::collections::HashSet<std::path::PathBuf> =
+        mounts.iter().map(|m| m.path.clone()).collect();
     let mut out = Vec::new();
     for m in mounts {
-        if !dead.should_probe(&m.path, tick) {
-            continue; // quarantined and not yet due — do NOT spawn a probe
+        match dead.check(&m.path).await {
+            // A held probe is still blocked — the mount is still dead. Spawn
+            // nothing; this is the whole point of #40.
+            ProbeState::StillDead => continue,
+            // The held probe just finished — the mount answered, with current
+            // stats. Emit them; next tick probes it fresh.
+            ProbeState::Recovered(sample) => {
+                if let Some(s) = sample {
+                    out.push(s);
+                }
+                continue;
+            }
+            ProbeState::Fresh => {}
         }
         let path = m.path.clone();
-        let probe = tokio::task::spawn_blocking(move || statvfs_sample(&m));
-        match tokio::time::timeout(PER_MOUNT_TIMEOUT, probe).await {
-            Ok(Ok(Some(sample))) => {
-                dead.mark_alive(&path);
-                out.push(sample);
-            }
-            // statvfs returned (mount alive) with nothing, or the task panicked
-            // — don't quarantine a responsive mount over a transient.
-            Ok(Ok(None)) => dead.mark_alive(&path),
-            Ok(Err(_join)) => {}
-            Err(_timeout) => {
-                dead.mark_dead(path.clone(), tick);
+        // `&mut probe` so the handle survives an elapsed timeout and can be held.
+        let mut probe = tokio::task::spawn_blocking(move || statvfs_sample(&m));
+        match tokio::time::timeout(PER_MOUNT_TIMEOUT, &mut probe).await {
+            Ok(Ok(Some(sample))) => out.push(sample),
+            // responsive with nothing (e.g. f_files==0), or the task panicked.
+            Ok(Ok(None)) | Ok(Err(_)) => {}
+            Err(_elapsed) => {
                 tracing::warn!(
                     mount = %path.display(),
-                    "mount statvfs timed out; quarantined until re-probe"
+                    "mount statvfs timed out; holding its probe (mount quarantined)"
                 );
+                dead.hold(path, probe);
             }
         }
     }
+    dead.prune(&present);
     out
 }
 
@@ -875,11 +926,11 @@ type DiskState = ();
 /// Linux isolates per mount (with the quarantine); elsewhere the whole sysinfo
 /// gather runs in one bounded task.
 #[cfg(target_os = "linux")]
-async fn gather_disks_bounded(dead: &mut DiskState, tick: u64) -> Vec<DiskSample> {
-    gather_disks_linux(dead, tick).await
+async fn gather_disks_bounded(dead: &mut DiskState) -> Vec<DiskSample> {
+    gather_disks_linux(dead).await
 }
 #[cfg(not(target_os = "linux"))]
-async fn gather_disks_bounded(_dead: &mut DiskState, _tick: u64) -> Vec<DiskSample> {
+async fn gather_disks_bounded(_dead: &mut DiskState) -> Vec<DiskSample> {
     match tokio::time::timeout(
         Duration::from_secs(5),
         tokio::task::spawn_blocking(gather_disks_sysinfo),
@@ -1081,11 +1132,9 @@ pub async fn run(
     // cold (no real window since the baseline above), so cpu is skipped on it.
     let mut first_tick = true;
     let mut last_ts: i64 = 0;
-    let mut tick_count: u64 = 0;
 
     loop {
         ticker.tick().await;
-        tick_count += 1;
 
         sys.refresh_memory();
         sys.refresh_cpu_all();
@@ -1105,7 +1154,7 @@ pub async fn run(
         // itself instead of wedging every collector, and a mount already known
         // dead isn't re-probed until its re-probe tick.
         let disk_samples = if want(Collector::Disk) {
-            gather_disks_bounded(&mut disk_state, tick_count).await
+            gather_disks_bounded(&mut disk_state).await
         } else {
             Vec::new()
         };
@@ -1407,48 +1456,57 @@ mod tests {
         assert_eq!(m[0].path, std::path::PathBuf::from("/mnt/my disk"));
     }
 
-    // The leak bound: a quarantined mount is NOT probed every tick (so no
-    // thread is spawned every tick), a healthy mount is always probed, and a
-    // recovered mount is un-quarantined. This is the property #35 is about.
+    // The leak bound (#40): a mount whose probe hangs is HELD as a single
+    // in-flight handle and never re-spawned while pending; when the held
+    // statvfs finally returns the mount recovers and the handle clears. A
+    // spawn_blocking that sleeps-then-returns stands in for a slow-then-
+    // recovering mount — the exact path a real hung-then-recovered mount takes,
+    // without needing a real hang.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_dead_mount_is_quarantined_not_probed_every_tick_and_recovers() {
+    #[tokio::test]
+    async fn a_held_probe_is_pending_then_recovers_and_clears() {
         use std::path::PathBuf;
-        let dead = PathBuf::from("/mnt/dead");
-        let live = PathBuf::from("/mnt/live");
         let mut dm = DeadMounts::default();
+        let path = PathBuf::from("/mnt/dead");
 
-        // tick 0: nothing cached, both are probed.
-        assert!(dm.should_probe(&dead, 0));
-        assert!(dm.should_probe(&live, 0));
+        // A probe that blocks, then returns a sample: a mount that recovers.
+        let probe = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            Some(DiskSample {
+                device: "nfs:/x".to_string(),
+                path: "/mnt/dead".to_string(),
+                fstype: "nfs4".to_string(),
+                total: 0,
+                free: 0,
+                inodes: None,
+            })
+        });
+        dm.hold(path.clone(), probe);
 
-        // dead one times out -> quarantined; live one answers -> stays clear.
-        dm.mark_dead(dead.clone(), 0);
-        dm.mark_alive(&live);
+        // While it is blocked: StillDead — so the gather loop spawns NOTHING.
+        assert!(matches!(dm.check(&path).await, ProbeState::StillDead));
 
-        // Until the re-probe tick the dead mount is SKIPPED every tick (0
-        // probes -> 0 threads spawned), while the healthy mount is unaffected.
-        let mut dead_probes = 0u64;
-        for tick in 1..DISK_REPROBE_TICKS {
-            if dm.should_probe(&dead, tick) {
-                dead_probes += 1;
-            }
-            assert!(
-                dm.should_probe(&live, tick),
-                "a healthy mount is never quarantined"
-            );
+        // Once it returns: Recovered with the fresh sample, and the entry
+        // clears so the next tick probes the mount normally.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        match dm.check(&path).await {
+            ProbeState::Recovered(Some(s)) => assert_eq!(s.fstype, "nfs4"),
+            _ => panic!("expected Recovered(Some) once the held statvfs returned"),
         }
-        assert_eq!(
-            dead_probes, 0,
-            "a quarantined mount must not be probed every tick"
-        );
+        assert!(matches!(dm.check(&path).await, ProbeState::Fresh));
+    }
 
-        // At the re-probe tick it is probed exactly once...
-        assert!(dm.should_probe(&dead, DISK_REPROBE_TICKS));
-        // ...and if it answers this time, the quarantine clears.
-        dm.mark_alive(&dead);
-        assert!(dm.should_probe(&dead, DISK_REPROBE_TICKS + 1));
-        assert!(dm.should_probe(&dead, DISK_REPROBE_TICKS + 2));
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn prune_drops_a_vanished_mounts_held_handle() {
+        use std::path::PathBuf;
+        let mut dm = DeadMounts::default();
+        let gone = PathBuf::from("/mnt/gone");
+        dm.hold(gone.clone(), tokio::task::spawn_blocking(|| None));
+
+        // /mnt/gone is no longer in mountinfo -> pruned; no stale entry left.
+        dm.prune(&std::collections::HashSet::new());
+        assert!(matches!(dm.check(&gone).await, ProbeState::Fresh));
     }
 
     #[test]

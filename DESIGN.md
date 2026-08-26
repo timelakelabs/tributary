@@ -326,10 +326,11 @@ entry cannot corrupt a series or emit a duplicate field key.
 
 On Linux the `disk` collector enumerates mounts from `/proc/self/mountinfo`
 (a plain read, no `statvfs`) and probes each mount's `statvfs` in its own
-bounded task. A mount that times out is quarantined and skipped on later ticks
-until a re-probe window, so an unresponsive mount (a dead NFS) neither wedges
-the collector nor leaks a blocked probe thread per tick — while the healthy
-mounts keep reporting. The fs-type filter matches Telegraf's default ignores.
+bounded task. A mount that times out has its probe handle HELD, not re-spawned:
+it is skipped until that held `statvfs` finally returns (i.e. the mount
+recovered), so an unresponsive mount (a dead NFS) neither wedges the collector
+nor leaks more than one blocked thread — while the healthy mounts keep
+reporting. The fs-type filter matches Telegraf's default ignores.
 
 Known gaps are honest, not hidden: the `cpu` per-state split
 (`usage_user`/`usage_system`/`usage_iowait`/…) is read from `/proc/stat` and is
