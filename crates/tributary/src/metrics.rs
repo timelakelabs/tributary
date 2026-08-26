@@ -38,6 +38,8 @@ use crate::lp::{Record, Value};
 use crate::queue::Queue;
 use crate::ship::Shipper;
 
+mod exec;
+
 // ---- plain samples (what a collector reads; the unit of testability) ------
 
 pub struct MemSample {
@@ -798,6 +800,19 @@ pub async fn run(
         queue_max_bytes,
     )?));
     tokio::spawn(drain(Arc::clone(&queue), shipper));
+
+    // #32: each [[metrics.exec]] runs its command on its own interval, its
+    // line-protocol stdout shipped through this same queue with the global
+    // tags stamped on. One independent task per exec.
+    let global_tags = ctx.tags(&[]);
+    for e in cfg.exec.clone() {
+        tokio::spawn(exec::run_exec(
+            e,
+            global_tags.clone(),
+            interval,
+            Arc::clone(&queue),
+        ));
+    }
 
     // Held across ticks: net counters are cumulative from first observation,
     // so the object must persist to accumulate (trap 4). Disk is gathered

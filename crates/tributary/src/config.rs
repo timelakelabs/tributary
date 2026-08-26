@@ -538,6 +538,51 @@ pub struct Metrics {
     pub global_tags: BTreeMap<String, String>,
     #[serde(default)]
     pub static_fields: BTreeMap<String, FieldValue>,
+    /// Commands run on an interval whose line-protocol stdout is shipped like
+    /// any other metric (#32, Telegraf's `inputs.exec`).
+    #[serde(default)]
+    pub exec: Vec<Exec>,
+}
+
+/// A user command run on an interval; its line-protocol stdout is shipped
+/// like any other metric (#32). `command` is argv — NOT a shell string — so
+/// there is no shell-injection surface. It runs with the AGENT's privileges.
+#[derive(Debug, Deserialize, Clone)]
+pub struct Exec {
+    pub command: Vec<String>,
+    /// Run interval; absent = the `[metrics]` interval.
+    #[serde(default)]
+    pub interval: Option<String>,
+    /// Kill the command (and, on unix, its whole process group) after this
+    /// long. Absent = 5s.
+    #[serde(default)]
+    pub timeout: Option<String>,
+    /// Format of the command's stdout. Only line protocol (`"influx"`) for v1.
+    #[serde(default)]
+    pub data_format: Option<String>,
+}
+
+impl Exec {
+    pub fn interval_parsed(
+        &self,
+        default: std::time::Duration,
+    ) -> anyhow::Result<std::time::Duration> {
+        match &self.interval {
+            None => Ok(default),
+            Some(s) => crate::logfile::parse_duration(s).ok_or_else(|| {
+                anyhow::anyhow!("[[metrics.exec]].interval {s:?} is not a duration like 30s")
+            }),
+        }
+    }
+
+    pub fn timeout_parsed(&self) -> anyhow::Result<std::time::Duration> {
+        match &self.timeout {
+            None => Ok(std::time::Duration::from_secs(5)),
+            Some(s) => crate::logfile::parse_duration(s).ok_or_else(|| {
+                anyhow::anyhow!("[[metrics.exec]].timeout {s:?} is not a duration like 5s")
+            }),
+        }
+    }
 }
 
 fn default_metrics_interval() -> String {
@@ -565,11 +610,11 @@ impl Metrics {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        self.interval_parsed()?;
-        if self.collectors.is_empty() {
+        let default_interval = self.interval_parsed()?;
+        if self.collectors.is_empty() && self.exec.is_empty() {
             anyhow::bail!(
-                "[metrics].collectors is empty — omit the [metrics] section to disable metrics, \
-                 or name at least one of: {}",
+                "[metrics] has no collectors and no [[metrics.exec]] — omit the [metrics] \
+                 section to disable it, or name a collector ({}) / add an exec",
                 KNOWN_COLLECTORS.join(", ")
             );
         }
@@ -579,6 +624,22 @@ impl Metrics {
                     "[metrics].collectors has unknown collector {c:?}; known: {}",
                     KNOWN_COLLECTORS.join(", ")
                 );
+            }
+        }
+        for e in &self.exec {
+            if e.command.is_empty() || e.command[0].trim().is_empty() {
+                anyhow::bail!("[[metrics.exec]] has an empty command");
+            }
+            e.interval_parsed(default_interval)?;
+            e.timeout_parsed()?;
+            if let Some(fmt) = &e.data_format {
+                let f = fmt.to_ascii_lowercase();
+                if !matches!(f.as_str(), "influx" | "lp" | "line-protocol") {
+                    anyhow::bail!(
+                        "[[metrics.exec]].data_format {fmt:?} is unsupported; only line \
+                         protocol (\"influx\") for now"
+                    );
+                }
             }
         }
         Ok(())
@@ -674,6 +735,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("interval"), "got: {err}");
+    }
+
+    #[test]
+    fn a_metrics_exec_config_parses() {
+        let cfg = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [metrics]\n\n\
+             [[metrics.exec]]\n\
+             command = [\"/bin/echo\", \"hi\"]\ninterval = \"30s\"\ntimeout = \"2s\"\n",
+        )
+        .expect("a metrics exec is a valid configuration");
+        let execs = cfg.metrics.unwrap().exec;
+        assert_eq!(execs.len(), 1);
+        assert_eq!(execs[0].command, vec!["/bin/echo", "hi"]);
+        assert_eq!(execs[0].interval.as_deref(), Some("30s"));
+    }
+
+    #[test]
+    fn an_exec_with_an_empty_command_is_refused() {
+        let err = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [metrics]\n\n[[metrics.exec]]\ncommand = []\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty command"), "got: {err}");
+    }
+
+    #[test]
+    fn an_exec_with_a_bad_data_format_is_refused() {
+        let err = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [metrics]\n\n[[metrics.exec]]\n\
+             command = [\"/bin/echo\"]\ndata_format = \"json\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("data_format"), "got: {err}");
     }
 }
 
