@@ -332,6 +332,16 @@ Linux-only — elsewhere `sysinfo` gives one aggregate percentage per core, so
 (`/proc/meminfo`); `diskio` is Linux-only (`/proc/diskstats`); `load*` is zero
 on Windows, which has no load-average concept.
 
+An `[[metrics.exec]]` runs a command (argv, never a shell string) on an
+interval and ships its line-protocol stdout through the same queue, with the
+`global_tags` stamped in — the escape hatch for anything the built-ins don't
+cover. Each run is bounded twice: a `timeout` that, on unix, SIGKILLs the
+command's whole process group (a `sh -c` wrapper's children die with it, not
+just the wrapper), and a 1 MiB stdout cap that drains-and-truncates a flooding
+command instead of buffering it. A non-zero exit ships nothing. Windows gets a
+best-effort child kill (no process groups), and `static_fields` injection into
+arbitrary line protocol is a v1 gap; `global_tags` are applied.
+
 ---
 
 ## 5. Configuration

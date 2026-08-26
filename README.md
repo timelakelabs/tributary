@@ -272,6 +272,36 @@ measurements and they read back carrying Telegraf's names plus the configured
 `global_tags`/`static_fields` — `bench/metrics_collector_drill.sh` (evidence
 `docs/evidence/metrics-collector-drill.log`).
 
+### Custom metrics from a command
+
+For anything the built-in collectors don't cover — an app's own counters, a
+device a script scrapes — run a command on an interval and ingest its
+line-protocol stdout, the way Telegraf's `inputs.exec` does:
+
+```toml
+[[metrics.exec]]
+command  = ["/usr/local/bin/queue_depth", "--lp"]  # argv, NOT a shell line
+interval = "30s"                                    # optional; default = [metrics].interval
+timeout  = "5s"                                     # optional; default 5s
+```
+
+`command` is an argv list, never a shell string, so there is no shell to
+inject into — and it runs with the **agent's** privileges, so don't assume
+root. The command prints line protocol (`myapp,tag=v field=1`); each line is
+stamped with the metrics `global_tags` (and `host`) and shipped through the
+same durable queue as everything else.
+
+Two guardrails, because a metrics agent must outlive a bad command: a run that
+exceeds `timeout` is killed — on unix the whole **process group**, so a
+`sh -c "…"` wrapper's children die with it, not just the wrapper — and stdout
+is capped at 1 MiB (a flooding command is truncated, never buffered
+unbounded). A non-zero exit ships nothing and logs; it never takes the
+collector down.
+
+**Caveats:** `static_fields` are not injected into exec output in v1 (the
+`global_tags` are); and the process-group kill is unix — on Windows the child
+is killed best-effort, so a grandchild can outlive the timeout.
+
 ## The short version of why it exists
 
 Three properties of TimeLakeDB's write contract turn a naive log shipper
