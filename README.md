@@ -270,8 +270,9 @@ which has no load-average concept. `net`/`diskio` counters are emitted cumulativ
 On Linux the `disk` collector enumerates mounts from `/proc/self/mountinfo` (no
 `statvfs`) and probes each mount in its own bounded task, so an unresponsive
 mount (a dead NFS) quarantines itself — the healthy mounts keep reporting, and
-it isn't re-probed until a re-probe window, so a wedged mount can't leak a probe
-thread per tick. The filesystem-type filter matches Telegraf's `disk` default
+its timed-out probe handle is HELD rather than re-spawned, so a wedged mount
+costs exactly one blocked thread and is picked back up the instant its `statvfs`
+returns. The filesystem-type filter matches Telegraf's `disk` default
 ignores (`tmpfs`, `proc`, `overlay`, …); real and network filesystems are kept.
 
 The collector is drilled against a live node: the real binary ships all six
