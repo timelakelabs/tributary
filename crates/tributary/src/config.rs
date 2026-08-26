@@ -281,6 +281,25 @@ pub struct Source {
     /// before the queue AND before the watermark counts them.
     #[serde(default)]
     pub filter: Vec<Filter>,
+
+    /// Transform stage (#43): keep 1-in-`rate` of the records a rule applies
+    /// to. The decision is deterministic on the record's identity, so a
+    /// crash-resumed tail re-decides the same way.
+    #[serde(default)]
+    pub sample: Vec<Sample>,
+}
+
+/// A sample rule for the transform stage (#43). With `field`/`equals` it
+/// applies only to records where that tag or field equals the value (so a
+/// subset can be sampled while the rest passes); without them it applies to
+/// the whole source. `rate` keeps 1-in-`rate` of the records it applies to.
+#[derive(Debug, Deserialize, Clone)]
+pub struct Sample {
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub equals: Option<String>,
+    pub rate: u64,
 }
 
 /// A drop rule for the transform stage (#42). Matches a mapped tag OR field
@@ -465,6 +484,20 @@ impl Config {
                     );
                 }
             }
+            for sm in &s.sample {
+                if sm.rate == 0 {
+                    anyhow::bail!(
+                        "source '{}': a [[source.sample]] needs rate >= 1 (rate = 1 keeps all)",
+                        s.name
+                    );
+                }
+                if sm.field.is_some() != sm.equals.is_some() {
+                    anyhow::bail!(
+                        "source '{}': a [[source.sample]] needs both `field` and `equals`, or neither",
+                        s.name
+                    );
+                }
+            }
         }
         Ok(cfg)
     }
@@ -528,6 +561,7 @@ impl Otlp {
             visibility: self.visibility.clone(),
             multiline: None,
             filter: Vec::new(),
+            sample: Vec::new(),
         }
     }
 }
@@ -736,6 +770,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("filter"), "got: {err}");
+    }
+
+    #[test]
+    fn a_source_sample_parses_and_a_bad_rate_is_refused() {
+        let cfg = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [[source]]\nname = \"app\"\npath = \"/var/log/app.log\"\ntable = \"logs\"\n\n\
+             [[source.sample]]\nfield = \"level\"\nequals = \"debug\"\nrate = 10\n\n\
+             [[source.sample]]\nrate = 5\n",
+        )
+        .expect("well-formed sample rules parse");
+        let s = &cfg.sources[0].sample;
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].field.as_deref(), Some("level"));
+        assert_eq!(s[0].rate, 10);
+        assert!(s[1].field.is_none(), "no predicate = whole source");
+
+        let err = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [[source]]\nname = \"app\"\npath = \"/var/log/app.log\"\ntable = \"logs\"\n\n\
+             [[source.sample]]\nrate = 0\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("rate"), "got: {err}");
     }
 
     #[test]

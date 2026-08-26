@@ -61,6 +61,8 @@ pub struct Telemetry {
     /// Records dropped by the transform filter (#42) — a decision, not a loss;
     /// counted apart so read - shipped - quarantined - dropped still balances.
     pub records_dropped_filter: AtomicU64,
+    /// Records dropped by the transform sampler (#43), same accounting.
+    pub records_dropped_sample: AtomicU64,
     /// OTLP receiver (#12): log records accepted, and records dropped
     /// (un-coercible field, or a stamper that refused the timestamp).
     pub otlp_received: AtomicU64,
@@ -101,6 +103,7 @@ impl Telemetry {
             watermark_violations: AtomicU64::new(0),
             out_of_window: AtomicU64::new(0),
             records_dropped_filter: AtomicU64::new(0),
+            records_dropped_sample: AtomicU64::new(0),
             otlp_received: AtomicU64::new(0),
             otlp_rejected: AtomicU64::new(0),
             read_ns: AtomicU64::new(0),
@@ -369,6 +372,10 @@ impl Telemetry {
             "tributary_records_dropped_total{{stage=\"filter\"}} {}\n",
             g(&self.records_dropped_filter)
         ));
+        s.push_str(&format!(
+            "tributary_records_dropped_total{{stage=\"sample\"}} {}\n",
+            g(&self.records_dropped_sample)
+        ));
         s
     }
 }
@@ -471,13 +478,14 @@ mod tests {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(|| panic!("{name} not exported"))
         };
-        // The dropped metric is labelled, so it is not a `{name} <value>` line.
+        // The dropped metric is labelled per stage, so sum every stage line
+        // (filter + sample + …) rather than a `{name} <value>` lookup.
         let dropped: f64 = out
             .lines()
-            .find(|l| l.starts_with("tributary_records_dropped_total{"))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse().ok())
-            .expect("dropped metric exported");
+            .filter(|l| l.starts_with("tributary_records_dropped_total{"))
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .filter_map(|v| v.parse::<f64>().ok())
+            .sum();
         let unaccounted = val("tributary_lines_read_total")
             - val("tributary_lines_shipped_total")
             - val("tributary_lines_quarantined_total")
