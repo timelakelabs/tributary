@@ -329,7 +329,7 @@ Known gaps are honest, not hidden: the `cpu` per-state split
 Linux-only — elsewhere `sysinfo` gives one aggregate percentage per core, so
 `cpu` carries `usage_idle`/`usage_active` only; disk inodes are unix-only
 (`statvfs`; Windows has no inode concept); `mem` buffered/cached are Linux-only
-(`/proc/meminfo`); `load*` is zero
+(`/proc/meminfo`); `diskio` is Linux-only (`/proc/diskstats`); `load*` is zero
 on Windows, which has no load-average concept.
 
 ---
