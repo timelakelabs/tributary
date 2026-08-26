@@ -26,6 +26,9 @@ bytes.workspace = true
 rustls-pemfile.workspace = true
 x509-parser.workspace = true
 prost = "0.14"
+# Host metrics (#25). One cross-platform reader — /proc on Linux, the
+# equivalent Win32 APIs on Windows — so the collector is a single code path.
+sysinfo = "0.33"
 
 # winlog links wevtapi through the `windows` crate; only a dependency when
 # building FOR windows AND with the feature on, so a Linux build — the

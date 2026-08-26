@@ -1,0 +1,61 @@
+=== host-metrics collector drill (2026-08-26 00:27:01) ===
+node=localhost:1963  db=metrics_drill_1787718421  run=16s
+-- building tributary --
+-- collecting for 16s --
+[2m2026-08-26T04:27:16.882336Z[0m [32m INFO[0m [2mtributary[0m[2m:[0m sourceless agent shipping to TimeLakeDB [3mauthenticated[0m[2m=[0mfalse [3mclient_identity[0m[2m=[0m"none" [3murl[0m[2m=[0mhttp://host.docker.internal:1963
+[2m2026-08-26T04:27:16.883505Z[0m [32m INFO[0m [2mtributary[0m[2m:[0m metrics-only agent; collecting until shutdown
+[2m2026-08-26T04:27:16.906526Z[0m [32m INFO[0m [2mtributary::metrics[0m[2m:[0m host-metrics collector started [3minterval_secs[0m[2m=[0m2 [3mhost[0m[2m=[0m"25e9f8a1503a" [3mcollectors[0m[2m=[0m"cpu,mem,disk,net,system,swap"
+-- collector stopped --
+-- querying the node back --
+  [PASS] cpu: table exists with a row  got 1 rows
+  [PASS] cpu: all Telegraf fields present
+  [PASS] cpu: all Telegraf tags present
+  [PASS] cpu: global tag region=us-east  us-east
+  [PASS] cpu: static field deployment=prod  prod
+  [PASS] mem: table exists with a row  got 1 rows
+  [PASS] mem: all Telegraf fields present
+  [PASS] mem: all Telegraf tags present
+  [PASS] mem: global tag region=us-east  us-east
+  [PASS] mem: static field deployment=prod  prod
+  [PASS] disk: table exists with a row  got 1 rows
+  [PASS] disk: all Telegraf fields present
+  [PASS] disk: all Telegraf tags present
+  [PASS] disk: global tag region=us-east  us-east
+  [PASS] disk: static field deployment=prod  prod
+  [PASS] net: table exists with a row  got 1 rows
+  [PASS] net: all Telegraf fields present
+  [PASS] net: all Telegraf tags present
+  [PASS] net: global tag region=us-east  us-east
+  [PASS] net: static field deployment=prod  prod
+  [PASS] system: table exists with a row  got 1 rows
+  [PASS] system: all Telegraf fields present
+  [PASS] system: all Telegraf tags present
+  [PASS] system: global tag region=us-east  us-east
+  [PASS] system: static field deployment=prod  prod
+  [PASS] swap: table exists with a row  got 1 rows
+  [PASS] swap: all Telegraf fields present
+  [PASS] swap: all Telegraf tags present
+  [PASS] swap: global tag region=us-east  us-east
+  [PASS] swap: static field deployment=prod  prod
+
+=== PASS: metrics land with Telegraf schema + global_tags + static_fields ===
+
+--- sample rows actually stored (db=metrics_drill_1787718421) ---
+
+$ SELECT * FROM cpu ORDER BY time DESC LIMIT 1
+[{"time":"2026-08-26T04:27:30.909361137Z","cpu":"cpu-total","host":"25e9f8a1503a","region":"us-east","usage_idle":95.72649574279785,"usage_active":4.273504257202148,"deployment":"prod"}]
+
+$ SELECT * FROM mem ORDER BY time DESC LIMIT 1
+[{"time":"2026-08-26T04:27:30.909361137Z","host":"25e9f8a1503a","region":"us-east","total":16322297856,"available":14643105792,"used":1679192064,"free":9789538304,"used_percent":10.287718548051963,"available_percent":89.71228145194804,"deployment":"prod"}]
+
+$ SELECT * FROM disk ORDER BY time DESC LIMIT 1
+[{"time":"2026-08-26T04:27:30.909361137Z","device":"/dev/sde","fstype":"ext4","host":"25e9f8a1503a","path":"/etc/hostname","region":"us-east","total":1081101176832,"free":529682415616,"used":551418761216,"used_percent":51.005287297147106,"deployment":"prod"}]
+
+$ SELECT * FROM net ORDER BY time DESC LIMIT 1
+[{"time":"2026-08-26T04:27:30.909361137Z","host":"25e9f8a1503a","interface":"eth0","region":"us-east","bytes_recv":2744,"bytes_sent":8466,"packets_recv":30,"packets_sent":21,"err_in":0,"err_out":0,"deployment":"prod"}]
+
+$ SELECT * FROM system ORDER BY time DESC LIMIT 1
+[{"time":"2026-08-26T04:27:30.909361137Z","host":"25e9f8a1503a","region":"us-east","load1":1.46,"load5":1.45,"load15":1.05,"n_cpus":24,"uptime":284869,"deployment":"prod"}]
+
+$ SELECT * FROM swap ORDER BY time DESC LIMIT 1
+[{"time":"2026-08-26T04:27:30.909361137Z","host":"25e9f8a1503a","region":"us-east","total":4294967296,"used":544116736,"free":3750850560,"used_percent":12.668704986572266,"deployment":"prod"}]

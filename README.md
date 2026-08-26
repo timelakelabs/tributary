@@ -217,6 +217,56 @@ bookmark through the ordinary `Checkpoint` path:
 python bench\winlog_resume_drill.py --exe path\to\tributary.exe
 ```
 
+## Host metrics (Telegraf-compatible)
+
+For a migration off InfluxDB + Telegraf: sample the machine on an interval and
+write the same measurements Telegraf's `system` input family does, with
+Telegraf's exact names, so the host dashboards keep working after the swap. Add
+a `[metrics]` section — no `[[source]]` required, it runs on its own:
+
+```
+[metrics]
+interval   = "10s"
+collectors = ["cpu", "mem", "disk", "net", "system", "swap"]   # this is the default set
+
+# The "add your own fields" half: stamped on EVERY metric row.
+[metrics.global_tags]        # the Telegraf [global_tags] equivalent
+region = "us-east"
+role   = "db"
+[metrics.static_fields]      # constant fields; TOML type -> field type
+deployment = "prod"          # string
+weight     = 3               # integer (3i)
+```
+
+The measurements and their Telegraf names:
+
+| measurement | tags | fields |
+|---|---|---|
+| `cpu` | `cpu` (`cpu-total`, `cpu0`, …) | `usage_idle`, `usage_active` |
+| `mem` | — | `total`, `available`, `used`, `free`, `used_percent`, `available_percent` |
+| `disk` | `device`, `path`, `fstype` | `total`, `free`, `used`, `used_percent` |
+| `net` | `interface` | `bytes_recv`, `bytes_sent`, `packets_recv`, `packets_sent`, `err_in`, `err_out` |
+| `system` | — | `load1`, `load5`, `load15`, `n_cpus`, `uptime` |
+| `swap` | — | `total`, `used`, `free`, `used_percent` |
+
+One `sysinfo` code path covers Linux and Windows. The `host` tag defaults to the
+OS hostname (override with `[metrics].host`), and `global_tags` cannot override
+`host` or a structural tag. Every row in a tick shares one timestamp; distinct
+series (a different `cpu`/`device`/`interface`) are distinct primary keys, so
+the log stamper's per-record disambiguation is deliberately not used here.
+
+**Known gaps** (documented, not bugs): `cpu` carries `usage_idle`/`usage_active`
+only — `sysinfo` reports one usage percentage per core, not the
+user/system/iowait split Telegraf's `cpu` is built from (the `/proc/stat`
+breakdown is a follow-up); no disk inodes; `load*` is zero on Windows, which has
+no load-average concept. `net`/`disk` counters are emitted cumulative — take the
+`derivative()` in the dashboard, do not diff them here.
+
+The collector is drilled against a live node: the real binary ships all six
+measurements and they read back carrying Telegraf's names plus the configured
+`global_tags`/`static_fields` — `bench/metrics_collector_drill.sh` (evidence
+`docs/evidence/metrics-collector-drill.log`).
+
 ## The short version of why it exists
 
 Three properties of TimeLakeDB's write contract turn a naive log shipper
