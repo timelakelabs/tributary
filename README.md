@@ -227,7 +227,7 @@ a `[metrics]` section — no `[[source]]` required, it runs on its own:
 ```
 [metrics]
 interval   = "10s"
-collectors = ["cpu", "mem", "disk", "net", "system", "swap"]   # this is the default set
+collectors = ["cpu", "mem", "disk", "diskio", "net", "system", "swap"]   # this is the default set
 
 # The "add your own fields" half: stamped on EVERY metric row.
 [metrics.global_tags]        # the Telegraf [global_tags] equivalent
@@ -245,6 +245,7 @@ The measurements and their Telegraf names:
 | `cpu` | `cpu` (`cpu-total`, `cpu0`, …) | `usage_idle`, `usage_active`; on Linux also `usage_user`/`usage_system`/`usage_iowait`/`usage_nice`/`usage_irq`/`usage_softirq`/`usage_steal`/`usage_guest`/`usage_guest_nice` |
 | `mem` | — | `total`, `available`, `used`, `free`, `used_percent`, `available_percent`; on Linux also `buffered`/`cached` |
 | `disk` | `device`, `path`, `fstype` | `total`, `free`, `used`, `used_percent`; on unix also `inodes_total`/`inodes_free`/`inodes_used` |
+| `diskio` (Linux) | `name` | `reads`, `writes`, `read_bytes`, `write_bytes`, `read_time`, `write_time`, `io_time`, `weighted_io_time`, `iops_in_progress` |
 | `net` | `interface` | `bytes_recv`, `bytes_sent`, `packets_recv`, `packets_sent`, `err_in`, `err_out` |
 | `system` | — | `load1`, `load5`, `load15`, `n_cpus`, `uptime` |
 | `swap` | — | `total`, `used`, `free`, `used_percent` |
@@ -261,8 +262,9 @@ the log stamper's per-record disambiguation is deliberately not used here.
 Linux-only — on other platforms `sysinfo` reports one aggregate percentage per
 core, so `cpu` there carries `usage_idle`/`usage_active` only; disk inodes are
 unix-only (`statvfs`; Windows has no inode concept); `mem` buffered/cached are
-Linux-only (`/proc/meminfo`); `load*` is zero on Windows,
-which has no load-average concept. `net`/`disk` counters are emitted cumulative — take the
+Linux-only (`/proc/meminfo`); `diskio` is Linux-only (`/proc/diskstats`);
+`load*` is zero on Windows,
+which has no load-average concept. `net`/`diskio` counters are emitted cumulative — take the
 `derivative()` in the dashboard, do not diff them here.
 
 The collector is drilled against a live node: the real binary ships all six

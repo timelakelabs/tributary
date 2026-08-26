@@ -147,6 +147,23 @@ pub struct SystemSample {
     pub uptime: u64,
 }
 
+/// Per-device I/O counters (Telegraf's `diskio`, from `/proc/diskstats`,
+/// #31). This is throughput and busy-time, NOT space: `disk` says a volume is
+/// half full, `diskio` says it is pinned. All fields are cumulative counters
+/// (like `net`) — the dashboard takes the derivative.
+pub struct DiskIoSample {
+    pub name: String,
+    pub reads: u64,
+    pub writes: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub read_time: u64,
+    pub write_time: u64,
+    pub io_time: u64,
+    pub weighted_io_time: u64,
+    pub iops_in_progress: u64,
+}
+
 // ---- the context every row carries: host tag + global tags + static fields
 
 fn fieldvalue_to_lp(v: &FieldValue) -> Value {
@@ -352,6 +369,26 @@ pub fn system_record(s: &SystemSample, ctx: &Ctx, ts_ns: i64) -> Record {
             ("load15", Value::Float(s.load15)),
             ("n_cpus", Value::Int(s.n_cpus as i64)),
             ("uptime", Value::Int(s.uptime as i64)),
+        ]),
+        ts_ns,
+    }
+}
+
+pub fn diskio_record(s: &DiskIoSample, ctx: &Ctx, ts_ns: i64) -> Record {
+    // Cumulative counters (like net) — emit as-is, the dashboard derivatives.
+    Record {
+        table: "diskio".to_string(),
+        tags: ctx.tags(&[("name", &s.name)]),
+        fields: ctx.fields(vec![
+            ("reads", Value::Int(s.reads as i64)),
+            ("writes", Value::Int(s.writes as i64)),
+            ("read_bytes", Value::Int(s.read_bytes as i64)),
+            ("write_bytes", Value::Int(s.write_bytes as i64)),
+            ("read_time", Value::Int(s.read_time as i64)),
+            ("write_time", Value::Int(s.write_time as i64)),
+            ("io_time", Value::Int(s.io_time as i64)),
+            ("weighted_io_time", Value::Int(s.weighted_io_time as i64)),
+            ("iops_in_progress", Value::Int(s.iops_in_progress as i64)),
         ]),
         ts_ns,
     }
@@ -659,6 +696,60 @@ fn gather_system(sys: &System) -> SystemSample {
     }
 }
 
+/// Per-device I/O counters from `/proc/diskstats` (Linux). This is a plain
+/// kernel-generated file — reading it does NOT block on device I/O the way
+/// `statvfs` does, so no bounded task is needed.
+#[cfg(target_os = "linux")]
+fn gather_diskio() -> Vec<DiskIoSample> {
+    match std::fs::read_to_string("/proc/diskstats") {
+        Ok(t) => parse_diskstats(&t),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gather_diskio() -> Vec<DiskIoSample> {
+    Vec::new()
+}
+
+/// Parse `/proc/diskstats`. Two traps: sectors are ALWAYS 512 bytes in this
+/// file regardless of a device's physical sector size (do NOT read the real
+/// block size); and the file lists loop/ram virtual devices alongside real
+/// ones — those are skipped. Partitions are kept, as Telegraf keeps them: a
+/// dashboard picks the device it wants, and hiding `sda1` would drop I/O some
+/// dashboards graph.
+#[cfg(target_os = "linux")]
+fn parse_diskstats(text: &str) -> Vec<DiskIoSample> {
+    const SECTOR: u64 = 512;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // major, minor, name, then the 11 legacy stat fields = 14 tokens.
+        // Newer kernels append discard/flush fields; we only read the first 11.
+        if f.len() < 14 {
+            continue;
+        }
+        let name = f[2];
+        if name.starts_with("loop") || name.starts_with("ram") {
+            continue;
+        }
+        let n = |i: usize| f[i].parse::<u64>().unwrap_or(0);
+        out.push(DiskIoSample {
+            name: name.to_string(),
+            reads: n(3),
+            read_bytes: n(5) * SECTOR,
+            read_time: n(6),
+            writes: n(7),
+            write_bytes: n(9) * SECTOR,
+            write_time: n(10),
+            iops_in_progress: n(11),
+            io_time: n(12),
+            weighted_io_time: n(13),
+        });
+    }
+    out
+}
+
 // ---- the collector loop + its drain ----------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
@@ -666,6 +757,7 @@ enum Collector {
     Cpu,
     Mem,
     Disk,
+    Diskio,
     Net,
     System,
     Swap,
@@ -678,6 +770,7 @@ fn resolve_collectors(names: &[String]) -> Vec<Collector> {
             "cpu" => Some(Collector::Cpu),
             "mem" => Some(Collector::Mem),
             "disk" => Some(Collector::Disk),
+            "diskio" => Some(Collector::Diskio),
             "net" => Some(Collector::Net),
             "system" => Some(Collector::System),
             "swap" => Some(Collector::Swap),
@@ -798,6 +891,11 @@ pub async fn run(
         if want(Collector::Net) {
             for n in gather_net(&nets) {
                 push(net_record(&n, &ctx, ts_ns));
+            }
+        }
+        if want(Collector::Diskio) {
+            for d in gather_diskio() {
+                push(diskio_record(&d, &ctx, ts_ns));
             }
         }
         if want(Collector::Cpu) {
@@ -1042,6 +1140,62 @@ mod tests {
             "net,host=h1,interface=eth0,region=us-east bytes_recv=100i,bytes_sent=200i,\
              packets_recv=3i,packets_sent=4i,err_in=0i,err_out=0i,deployment=\"prod\" 5\n"
         );
+    }
+
+    #[test]
+    fn diskio_is_the_telegraf_shape() {
+        let s = DiskIoSample {
+            name: "sda".to_string(),
+            reads: 10,
+            writes: 20,
+            read_bytes: 5120,
+            write_bytes: 10240,
+            read_time: 3,
+            write_time: 4,
+            io_time: 7,
+            weighted_io_time: 9,
+            iops_in_progress: 1,
+        };
+        assert_eq!(
+            enc(diskio_record(&s, &ctx(), 5)),
+            "diskio,host=h1,name=sda,region=us-east reads=10i,writes=20i,read_bytes=5120i,\
+             write_bytes=10240i,read_time=3i,write_time=4i,io_time=7i,weighted_io_time=9i,\
+             iops_in_progress=1i,deployment=\"prod\" 5\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_diskstats_reads_fields_and_skips_loop_ram() {
+        // Sectors x512; loop/ram skipped; partitions (sda1) kept, as Telegraf.
+        let stats = concat!(
+            "   8       0 sda 1000 10 8000 500 2000 20 16000 600 0 700 1300\n",
+            "   8       1 sda1 5 0 40 1 6 0 48 2 0 3 4\n",
+            "   7       0 loop0 1 2 3 4 5 6 7 8 9 10 11\n",
+            "   1       0 ram0 0 0 0 0 0 0 0 0 0 0 0\n",
+        );
+        let d = parse_diskstats(stats);
+        assert_eq!(d.len(), 2, "loop0/ram0 skipped; sda + sda1 kept");
+        assert_eq!(d[0].name, "sda");
+        assert_eq!(d[0].reads, 1000);
+        assert_eq!(d[0].read_bytes, 8000 * 512);
+        assert_eq!(d[0].writes, 2000);
+        assert_eq!(d[0].write_bytes, 16000 * 512);
+        assert_eq!(d[0].io_time, 700);
+        assert_eq!(d[0].weighted_io_time, 1300);
+        assert_eq!(d[1].name, "sda1");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gather_diskio_reads_real_diskstats() {
+        // Exercises the real /proc/diskstats read + parse; lenient on count
+        // (a minimal container may show no non-loop devices).
+        for d in gather_diskio() {
+            assert_eq!(d.read_bytes % 512, 0);
+            assert_eq!(d.write_bytes % 512, 0);
+            assert!(!d.name.starts_with("loop") && !d.name.starts_with("ram"));
+        }
     }
 
     #[test]

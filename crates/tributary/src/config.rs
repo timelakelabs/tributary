@@ -544,7 +544,7 @@ fn default_metrics_interval() -> String {
     "10s".into()
 }
 fn default_collectors() -> Vec<String> {
-    ["cpu", "mem", "disk", "net", "system", "swap"]
+    ["cpu", "mem", "disk", "diskio", "net", "system", "swap"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -552,7 +552,7 @@ fn default_collectors() -> Vec<String> {
 
 /// The collectors this build knows how to run. A name outside this set is a
 /// typo worth refusing at startup, not a silently ignored line in a config.
-pub const KNOWN_COLLECTORS: [&str; 6] = ["cpu", "mem", "disk", "net", "system", "swap"];
+pub const KNOWN_COLLECTORS: [&str; 7] = ["cpu", "mem", "disk", "diskio", "net", "system", "swap"];
 
 impl Metrics {
     pub fn interval_parsed(&self) -> anyhow::Result<std::time::Duration> {
@@ -654,6 +654,16 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("gpu"), "got: {err}");
+    }
+
+    #[test]
+    fn diskio_is_a_known_collector() {
+        let cfg = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [metrics]\ncollectors = [\"diskio\"]\n",
+        )
+        .expect("diskio is a valid collector");
+        assert_eq!(cfg.metrics.unwrap().collectors, vec!["diskio"]);
     }
 
     #[test]
