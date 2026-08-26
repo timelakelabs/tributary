@@ -13,6 +13,7 @@ mod logfile;
 mod lp;
 mod map;
 mod multiline;
+mod otlp;
 mod queue;
 mod server;
 mod ship;
@@ -116,10 +117,15 @@ async fn main() -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&args.state_dir)?;
 
+    // OTLP-only agent: no file to tail, only the push receiver. (A config
+    // with BOTH runs the receiver alongside the tail, spawned below.)
+    if cfg.sources.is_empty() {
+        return run_otlp_only(cfg, &args).await;
+    }
     let source = cfg
         .sources
         .first()
-        .ok_or_else(|| anyhow::anyhow!("no [[source]] configured"))?;
+        .expect("load() guarantees a source when there is no [otlp]");
 
     let cp_path = Checkpoint::path_for(&args.state_dir, &source.name);
     let restored = Checkpoint::load(&cp_path)?;
@@ -144,52 +150,7 @@ async fn main() -> anyhow::Result<()> {
         wm.restore(l);
     }
 
-    // The data-plane token (SEC-4), sourced from TRIBUTARY_TOKEN or the
-    // configured token_file — never from the config body. Resolved at the
-    // edge so the shipper is handed an opaque, already-redacted credential.
-    let token = auth::resolve_token("TRIBUTARY_TOKEN", cfg.output.token_file.as_deref())?;
-
-    // L4 transport: private trust anchors and/or a client certificate. Both
-    // halves are optional and independent, so an unconfigured agent takes
-    // exactly the path it took before this existed.
-    let tls = match &cfg.output.tls {
-        None => None,
-        Some(t) => {
-            let roots = match &t.ca_file {
-                Some(p) => credential::load_ca_bundle(p)
-                    .map_err(|e| anyhow::anyhow!("[output.tls].ca_file {}: {e}", p.display()))?,
-                None => Vec::new(),
-            };
-            let identity = match (&t.cert_file, &t.key_file) {
-                (Some(c), Some(k)) => Some(
-                    credential::RotatingIdentity::load(Box::new(credential::FileCredentials::new(
-                        c, k,
-                    )))
-                    .map_err(|e| anyhow::anyhow!("[output.tls] client certificate: {e}"))?,
-                ),
-                // `Tls::validate` already refused the half-configured cases.
-                _ => None,
-            };
-            match identity {
-                Some(identity) => Some(std::sync::Arc::new(ship::TlsRuntime { roots, identity })),
-                None if roots.is_empty() => None,
-                // CA-only: trust a private issuer without presenting an
-                // identity, which is what Telegraf's TLS config does.
-                None => Some(std::sync::Arc::new(ship::TlsRuntime {
-                    roots,
-                    identity: credential::RotatingIdentity::none(),
-                })),
-            }
-        }
-    };
-
-    let shipper = ship::Shipper::new(
-        &cfg.output.url,
-        &cfg.output.database,
-        cfg.output.gzip,
-        token,
-        tls,
-    )?;
+    let shipper = build_shipper(&cfg.output)?;
     // A one-line, secret-free statement of posture: an operator can tell from
     // the log whether this agent is presenting a credential, without it ever
     // revealing the credential. The client-certificate CN is not a secret —
@@ -213,6 +174,25 @@ async fn main() -> anyhow::Result<()> {
         // an operator who configured telemetry and silently did not get it
         // finds out from an empty dashboard days later.
         server::serve(addr, std::sync::Arc::clone(&tel)).await?;
+    }
+
+    // #12: run the OTLP receiver alongside the file tail when configured. Its
+    // own queue/shipper/stamper make it an independent pipeline — the tail
+    // loop below is untouched.
+    if let Some(otlp) = &cfg.otlp {
+        let otlp_shipper = build_shipper(&cfg.output)?;
+        let run = otlp::run(
+            otlp.clone(),
+            args.state_dir.clone(),
+            cfg.output.queue_max_bytes,
+            std::sync::Arc::clone(&tel),
+            otlp_shipper,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = run.await {
+                tracing::error!(error = %e, "OTLP receiver stopped");
+            }
+        });
     }
 
     let mut pipe = Pipeline {
@@ -531,6 +511,80 @@ async fn main() -> anyhow::Result<()> {
         pipe.shipper.requests(),
     );
     Ok(())
+}
+
+/// Build a shipper from the output config: resolve the data-plane token (SEC-4,
+/// from `TRIBUTARY_TOKEN` or `token_file`, never the config body) and the
+/// optional L4 TLS runtime, then hand both to `ship::Shipper`. Extracted so the
+/// file-tail path and the OTLP receiver (#12) build identical shippers rather
+/// than drifting into two credential-resolution paths.
+/// The whole agent when there is no `[[source]]`: build the shipper and
+/// telemetry, then run the OTLP receiver until shutdown. Durability is the
+/// receiver's queue, replayed on the next start; there is no file checkpoint
+/// because a push source has no file offset to resume from.
+async fn run_otlp_only(cfg: config::Config, args: &Args) -> anyhow::Result<()> {
+    let otlp = cfg
+        .otlp
+        .as_ref()
+        .expect("load() guarantees [otlp] when there is no source");
+    let shipper = build_shipper(&cfg.output)?;
+    tracing::info!(
+        authenticated = shipper.is_authenticated(),
+        client_identity = shipper.client_identity().unwrap_or_else(|| "none".into()),
+        url = %cfg.output.url,
+        listen = %otlp.listen,
+        "OTLP-only agent shipping to TimeLakeDB"
+    );
+    let tel = telemetry::Telemetry::new(shipper.counters.clone());
+    if let Some(t) = &cfg.telemetry {
+        let addr: std::net::SocketAddr = t.addr.parse().map_err(|_| {
+            anyhow::anyhow!("[telemetry].addr {:?} is not a host:port address", t.addr)
+        })?;
+        server::serve(addr, std::sync::Arc::clone(&tel)).await?;
+    }
+    otlp::run(
+        otlp.clone(),
+        args.state_dir.clone(),
+        cfg.output.queue_max_bytes,
+        tel,
+        shipper,
+    )
+    .await
+}
+
+pub(crate) fn build_shipper(output: &config::Output) -> anyhow::Result<ship::Shipper> {
+    let token = auth::resolve_token("TRIBUTARY_TOKEN", output.token_file.as_deref())?;
+    let tls = match &output.tls {
+        None => None,
+        Some(t) => {
+            let roots = match &t.ca_file {
+                Some(p) => credential::load_ca_bundle(p)
+                    .map_err(|e| anyhow::anyhow!("[output.tls].ca_file {}: {e}", p.display()))?,
+                None => Vec::new(),
+            };
+            let identity = match (&t.cert_file, &t.key_file) {
+                (Some(c), Some(k)) => Some(
+                    credential::RotatingIdentity::load(Box::new(credential::FileCredentials::new(
+                        c, k,
+                    )))
+                    .map_err(|e| anyhow::anyhow!("[output.tls] client certificate: {e}"))?,
+                ),
+                // `Tls::validate` already refused the half-configured cases.
+                _ => None,
+            };
+            match identity {
+                Some(identity) => Some(std::sync::Arc::new(ship::TlsRuntime { roots, identity })),
+                None if roots.is_empty() => None,
+                // CA-only: trust a private issuer without presenting an
+                // identity, which is what Telegraf's TLS config does.
+                None => Some(std::sync::Arc::new(ship::TlsRuntime {
+                    roots,
+                    identity: credential::RotatingIdentity::none(),
+                })),
+            }
+        }
+    };
+    ship::Shipper::new(&output.url, &output.database, output.gzip, token, tls)
 }
 
 fn build(
