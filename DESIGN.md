@@ -324,6 +324,13 @@ request — constant tags and fields stamped on every row (the Telegraf
 override the `host` tag, a structural tag, or a real metric field, so a stray
 entry cannot corrupt a series or emit a duplicate field key.
 
+On Linux the `disk` collector enumerates mounts from `/proc/self/mountinfo`
+(a plain read, no `statvfs`) and probes each mount's `statvfs` in its own
+bounded task. A mount that times out is quarantined and skipped on later ticks
+until a re-probe window, so an unresponsive mount (a dead NFS) neither wedges
+the collector nor leaks a blocked probe thread per tick — while the healthy
+mounts keep reporting. The fs-type filter matches Telegraf's default ignores.
+
 Known gaps are honest, not hidden: the `cpu` per-state split
 (`usage_user`/`usage_system`/`usage_iowait`/…) is read from `/proc/stat` and is
 Linux-only — elsewhere `sysinfo` gives one aggregate percentage per core, so
