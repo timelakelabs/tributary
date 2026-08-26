@@ -267,6 +267,13 @@ Linux-only (`/proc/meminfo`); `diskio` is Linux-only (`/proc/diskstats`);
 which has no load-average concept. `net`/`diskio` counters are emitted cumulative — take the
 `derivative()` in the dashboard, do not diff them here.
 
+On Linux the `disk` collector enumerates mounts from `/proc/self/mountinfo` (no
+`statvfs`) and probes each mount in its own bounded task, so an unresponsive
+mount (a dead NFS) quarantines itself — the healthy mounts keep reporting, and
+it isn't re-probed until a re-probe window, so a wedged mount can't leak a probe
+thread per tick. The filesystem-type filter matches Telegraf's `disk` default
+ignores (`tmpfs`, `proc`, `overlay`, …); real and network filesystems are kept.
+
 The collector is drilled against a live node: the real binary ships all six
 measurements and they read back carrying Telegraf's names plus the configured
 `global_tags`/`static_fields` — `bench/metrics_collector_drill.sh` (evidence

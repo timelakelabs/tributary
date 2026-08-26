@@ -31,7 +31,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{Networks, System};
+// Disk space now comes from statvfs (Linux) — sysinfo's `Disks` is only the
+// fallback on non-Linux, where it is still the path of least resistance.
+#[cfg(not(target_os = "linux"))]
+use sysinfo::Disks;
 
 use crate::config::{FieldValue, Metrics};
 use crate::lp::{Record, Value};
@@ -625,11 +629,224 @@ fn gather_cpu(sys: &System, _prev: &mut CpuBaseline) -> Vec<CpuSample> {
     out
 }
 
-/// Fresh disk list + space + inodes. Called in a bounded blocking task:
-/// `statvfs` — sysinfo's own space read AND our inode read — blocks on an
-/// unresponsive mount, so this must not run on the async runtime. A new
-/// `Disks` each tick is fine — disk space is a gauge, nothing accumulates.
-fn gather_disks() -> Vec<DiskSample> {
+/// One statvfs syscall on `path`. THIS is the call that blocks on an
+/// unresponsive mount, so it runs behind a bounded task per mount (below).
+#[cfg(unix)]
+fn statvfs_raw(path: &std::path::Path) -> Option<libc::statvfs> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated path and `s` is zeroed; statvfs
+    // fills it and returns 0 on success, leaving `s` untouched on failure.
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    Some(s)
+}
+
+/// A mount from `/proc/self/mountinfo`: what to report and what to statvfs.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct MountInfo {
+    source: String,
+    path: std::path::PathBuf,
+    fstype: String,
+}
+
+/// One statvfs gives BOTH space and inodes, so a Linux mount needs a single
+/// syscall — not sysinfo's list-refresh (which statvfs's every mount) plus a
+/// second inode statvfs. `total`/`free` match what sysinfo reported: blocks
+/// and available blocks scaled by the fragment size.
+#[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_cast)] // f_blocks/f_frsize/... are u64 on 64-bit, u32 on some 32-bit
+fn statvfs_sample(m: &MountInfo) -> Option<DiskSample> {
+    let s = statvfs_raw(&m.path)?;
+    let frsize = s.f_frsize as u64;
+    Some(DiskSample {
+        device: m.source.clone(),
+        path: m.path.to_string_lossy().into_owned(),
+        fstype: m.fstype.clone(),
+        total: (s.f_blocks as u64) * frsize,
+        free: (s.f_bavail as u64) * frsize,
+        inodes: inode_stats_from(s.f_files as u64, s.f_ffree as u64),
+    })
+}
+
+/// Pseudo/virtual filesystems Telegraf's `disk` input ignores by default —
+/// no meaningful space, or pure noise.
+#[cfg(target_os = "linux")]
+fn ignore_fs(fstype: &str) -> bool {
+    const IGNORE: &[&str] = &[
+        "tmpfs",
+        "devtmpfs",
+        "devfs",
+        "iso9660",
+        "overlay",
+        "aufs",
+        "squashfs",
+        "proc",
+        "sysfs",
+        "cgroup",
+        "cgroup2",
+        "devpts",
+        "mqueue",
+        "hugetlbfs",
+        "debugfs",
+        "tracefs",
+        "securityfs",
+        "pstore",
+        "bpf",
+        "configfs",
+        "fusectl",
+        "binfmt_misc",
+        "autofs",
+        "nsfs",
+        "ramfs",
+        "rpc_pipefs",
+        "selinuxfs",
+        "efivarfs",
+    ];
+    IGNORE.contains(&fstype)
+}
+
+/// mountinfo octal-escapes space (\040), tab, newline and backslash in the
+/// mount point and source; undo them (byte-wise, so UTF-8 paths survive).
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let esc = if b[i] == b'\\' && i + 4 <= b.len() {
+            std::str::from_utf8(&b[i + 1..i + 4])
+                .ok()
+                .and_then(|o| u8::from_str_radix(o, 8).ok())
+        } else {
+            None
+        };
+        match esc {
+            Some(n) => {
+                out.push(n);
+                i += 4;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Enumerate real mounts from `/proc/self/mountinfo` with NO statvfs — a plain
+/// file read that can't block on a dead mount. Pseudo filesystems are filtered
+/// out; real and network filesystems (ext4/xfs/nfs/cifs/…) are kept.
+#[cfg(target_os = "linux")]
+fn parse_mountinfo(text: &str) -> Vec<MountInfo> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        // ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTS [optional tags] - FSTYPE SOURCE SUPEROPTS
+        let toks: Vec<&str> = line.split(' ').collect();
+        let Some(sep) = toks.iter().position(|&t| t == "-") else {
+            continue;
+        };
+        if toks.len() <= 4 || sep + 2 >= toks.len() {
+            continue;
+        }
+        let fstype = toks[sep + 1].to_string();
+        if ignore_fs(&fstype) {
+            continue;
+        }
+        out.push(MountInfo {
+            source: unescape_mountinfo(toks[sep + 2]),
+            path: std::path::PathBuf::from(unescape_mountinfo(toks[4])),
+            fstype,
+        });
+    }
+    out
+}
+
+/// A dead mount is quarantined for this many ticks before a re-probe, so a
+/// permanently-unresponsive mount costs at most one blocked probe thread per
+/// re-probe window rather than one per tick.
+#[cfg(target_os = "linux")]
+const DISK_REPROBE_TICKS: u64 = 60;
+
+#[cfg(target_os = "linux")]
+const PER_MOUNT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Mounts whose statvfs timed out, and the tick at which each may be re-probed.
+/// Held across ticks — this is what bounds the thread leak: a known-dead mount
+/// is SKIPPED (no `spawn_blocking`) until it is due for a re-probe.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct DeadMounts {
+    next_probe: std::collections::HashMap<std::path::PathBuf, u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl DeadMounts {
+    /// Probe a mount we've never seen fail, or one whose re-probe tick arrived.
+    fn should_probe(&self, path: &std::path::Path, tick: u64) -> bool {
+        match self.next_probe.get(path) {
+            None => true,
+            Some(&next) => tick >= next,
+        }
+    }
+    fn mark_dead(&mut self, path: std::path::PathBuf, tick: u64) {
+        self.next_probe.insert(path, tick + DISK_REPROBE_TICKS);
+    }
+    fn mark_alive(&mut self, path: &std::path::Path) {
+        self.next_probe.remove(path);
+    }
+}
+
+/// Gather disk on Linux: enumerate mounts (no statvfs), then statvfs each one
+/// that isn't quarantined in its OWN bounded task. A mount that times out is
+/// quarantined and skipped on later ticks; the healthy mounts keep reporting,
+/// and no new probe thread is spawned for a mount known to be dead.
+#[cfg(target_os = "linux")]
+async fn gather_disks_linux(dead: &mut DeadMounts, tick: u64) -> Vec<DiskSample> {
+    let mounts = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(t) => parse_mountinfo(&t),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read /proc/self/mountinfo; skipping disk");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for m in mounts {
+        if !dead.should_probe(&m.path, tick) {
+            continue; // quarantined and not yet due — do NOT spawn a probe
+        }
+        let path = m.path.clone();
+        let probe = tokio::task::spawn_blocking(move || statvfs_sample(&m));
+        match tokio::time::timeout(PER_MOUNT_TIMEOUT, probe).await {
+            Ok(Ok(Some(sample))) => {
+                dead.mark_alive(&path);
+                out.push(sample);
+            }
+            // statvfs returned (mount alive) with nothing, or the task panicked
+            // — don't quarantine a responsive mount over a transient.
+            Ok(Ok(None)) => dead.mark_alive(&path),
+            Ok(Err(_join)) => {}
+            Err(_timeout) => {
+                dead.mark_dead(path.clone(), tick);
+                tracing::warn!(
+                    mount = %path.display(),
+                    "mount statvfs timed out; quarantined until re-probe"
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Gather disk on non-Linux: the whole sysinfo list-refresh in one bounded
+/// task. No `/proc/self/mountinfo` there, so the per-mount isolation doesn't
+/// apply — this is the pre-existing behaviour, kept.
+#[cfg(not(target_os = "linux"))]
+fn gather_disks_sysinfo() -> Vec<DiskSample> {
     let disks = Disks::new_with_refreshed_list();
     disks
         .iter()
@@ -647,27 +864,49 @@ fn gather_disks() -> Vec<DiskSample> {
         .collect()
 }
 
-/// Inode counts for a mount via `statvfs`. Runs right after sysinfo read the
-/// same mount for its space numbers, so a mount that answers sysinfo answers
-/// this too.
-#[cfg(unix)]
-// f_files/f_ffree are fsfilcnt_t, which is u64 on 64-bit Linux (so the cast is
-// redundant there) but u32 on some 32-bit targets (so it's needed for those).
-#[allow(clippy::unnecessary_cast)]
-fn inode_stats(mount: &std::path::Path) -> Option<InodeStats> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(mount.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `c` is a valid NUL-terminated path and `s` is zeroed; statvfs
-    // fills it and returns 0 on success, and we ignore `s` on any failure.
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        return None;
+/// Disk state held across the loop: the dead-mount quarantine on Linux,
+/// nothing elsewhere.
+#[cfg(target_os = "linux")]
+type DiskState = DeadMounts;
+#[cfg(not(target_os = "linux"))]
+type DiskState = ();
+
+/// Gather disk samples, bounded so a dead mount can't wedge the collector.
+/// Linux isolates per mount (with the quarantine); elsewhere the whole sysinfo
+/// gather runs in one bounded task.
+#[cfg(target_os = "linux")]
+async fn gather_disks_bounded(dead: &mut DiskState, tick: u64) -> Vec<DiskSample> {
+    gather_disks_linux(dead, tick).await
+}
+#[cfg(not(target_os = "linux"))]
+async fn gather_disks_bounded(_dead: &mut DiskState, _tick: u64) -> Vec<DiskSample> {
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(gather_disks_sysinfo),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(_)) => {
+            tracing::error!("disk gather task panicked; skipped this tick");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("disk gather timed out (an unresponsive mount?); skipped this tick");
+            Vec::new()
+        }
     }
-    inode_stats_from(s.f_files as u64, s.f_ffree as u64)
 }
 
-/// Windows (and any non-unix) has no inode concept; Telegraf omits these
-/// fields there too.
+/// Inode counts for a mount via `statvfs` — macOS and other non-Linux unix
+/// (on Linux the space+inode read is fused in `statvfs_sample`). Windows has
+/// no inode concept, so `None`.
+#[cfg(all(unix, not(target_os = "linux")))]
+#[allow(clippy::unnecessary_cast)]
+fn inode_stats(mount: &std::path::Path) -> Option<InodeStats> {
+    let s = statvfs_raw(mount)?;
+    inode_stats_from(s.f_files as u64, s.f_ffree as u64)
+}
 #[cfg(not(unix))]
 fn inode_stats(_mount: &std::path::Path) -> Option<InodeStats> {
     None
@@ -815,9 +1054,9 @@ pub async fn run(
     }
 
     // Held across ticks: net counters are cumulative from first observation,
-    // so the object must persist to accumulate (trap 4). Disk is gathered
-    // fresh each tick in a bounded blocking task (below) — space is a gauge,
-    // and statvfs must not block the async runtime.
+    // so the object must persist to accumulate (trap 4). Disk is enumerated
+    // fresh each tick and statvfs'd per mount in bounded tasks (below) — space
+    // is a gauge, and statvfs must not block the async runtime.
     let mut sys = System::new();
     let mut nets = Networks::new_with_refreshed_list();
     // Trap 2: establish a CPU baseline so the first emitted tick has a delta.
@@ -825,9 +1064,10 @@ pub async fn run(
     // baseline is seeded by the first gather_cpu call below.)
     sys.refresh_cpu_all();
     let mut cpu_baseline: CpuBaseline = Default::default();
-    // How long a disk gather may take before it is skipped for a tick: a dead
-    // NFS mount blocks statvfs, and that must not wedge the other collectors.
-    const DISK_GATHER_TIMEOUT_SECS: u64 = 5;
+    // Disk is probed per mount in bounded tasks (Linux) so an unresponsive
+    // mount quarantines itself instead of wedging the collector or leaking a
+    // probe thread per tick. This holds the quarantine across ticks.
+    let mut disk_state: DiskState = Default::default();
 
     tracing::info!(
         interval_secs = interval.as_secs(),
@@ -841,9 +1081,11 @@ pub async fn run(
     // cold (no real window since the baseline above), so cpu is skipped on it.
     let mut first_tick = true;
     let mut last_ts: i64 = 0;
+    let mut tick_count: u64 = 0;
 
     loop {
         ticker.tick().await;
+        tick_count += 1;
 
         sys.refresh_memory();
         sys.refresh_cpu_all();
@@ -858,30 +1100,14 @@ pub async fn run(
         let ts_ns = now.max(last_ts + 1);
         last_ts = ts_ns;
 
-        // Disk is gathered in a bounded blocking task BEFORE the line batch is
-        // built (statvfs blocks on an unresponsive mount): a dead NFS skips
-        // disk for this tick instead of wedging every collector.
+        // Disk is gathered BEFORE the line batch is built: each mount's statvfs
+        // runs in its own bounded task (Linux), so an unresponsive mount skips
+        // itself instead of wedging every collector, and a mount already known
+        // dead isn't re-probed until its re-probe tick.
         let disk_samples = if want(Collector::Disk) {
-            match tokio::time::timeout(
-                Duration::from_secs(DISK_GATHER_TIMEOUT_SECS),
-                tokio::task::spawn_blocking(gather_disks),
-            )
-            .await
-            {
-                Ok(Ok(s)) => Some(s),
-                Ok(Err(_)) => {
-                    tracing::error!("disk gather task panicked; skipped this tick");
-                    None
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "disk gather timed out (an unresponsive mount?); skipped this tick"
-                    );
-                    None
-                }
-            }
+            gather_disks_bounded(&mut disk_state, tick_count).await
         } else {
-            None
+            Vec::new()
         };
 
         let mut lines = String::new();
@@ -898,10 +1124,8 @@ pub async fn run(
         if want(Collector::System) {
             push(system_record(&gather_system(&sys), &ctx, ts_ns));
         }
-        if let Some(samples) = disk_samples {
-            for d in samples {
-                push(disk_record(&d, &ctx, ts_ns));
-            }
+        for d in &disk_samples {
+            push(disk_record(d, &ctx, ts_ns));
         }
         if want(Collector::Net) {
             for n in gather_net(&nets) {
@@ -1127,16 +1351,104 @@ mod tests {
         assert_eq!((i.total, i.free, i.used), (100, 40, 60));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn inode_stats_reads_a_real_mount_without_crashing() {
-        // Exercises the real statvfs FFI — linking and struct layout. A real
-        // fs answers Some with a coherent count; a pseudo-fs answers None.
-        // Both are fine; the point is the call works and the numbers agree.
-        if let Some(i) = inode_stats(std::path::Path::new("/")) {
-            assert!(i.total >= i.free);
-            assert_eq!(i.used, i.total - i.free);
+    fn statvfs_sample_reads_a_real_mount() {
+        // Exercises the real statvfs FFI (linking, struct layout) on `/` and
+        // the space+inode extraction. Coherent numbers, not a pinned value.
+        let m = MountInfo {
+            source: "test".into(),
+            path: std::path::PathBuf::from("/"),
+            fstype: "test".into(),
+        };
+        if let Some(d) = statvfs_sample(&m) {
+            assert!(d.total >= d.free);
+            if let Some(i) = d.inodes {
+                assert!(i.total >= i.free);
+                assert_eq!(i.used, i.total - i.free);
+            }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ignore_fs_filters_pseudo_keeps_real() {
+        assert!(ignore_fs("tmpfs") && ignore_fs("proc") && ignore_fs("overlay"));
+        assert!(!ignore_fs("ext4") && !ignore_fs("xfs") && !ignore_fs("nfs4"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_keeps_real_and_network_fs_skips_pseudo() {
+        let text = concat!(
+            "25 0 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n",
+            "26 25 0:22 / /proc rw shared:2 - proc proc rw\n",
+            "27 25 0:23 / /sys rw - sysfs sysfs rw\n",
+            "30 25 8:16 / /data rw shared:3 - xfs /dev/sdb1 rw\n",
+            "31 25 0:44 / /mnt/nfs rw - nfs4 server:/export rw\n",
+        );
+        let m = parse_mountinfo(text);
+        assert_eq!(
+            m.len(),
+            3,
+            "ext4 /, xfs /data, nfs4 /mnt/nfs; proc+sysfs skipped"
+        );
+        assert_eq!(m[0].path, std::path::PathBuf::from("/"));
+        assert_eq!(m[0].fstype, "ext4");
+        assert_eq!(m[0].source, "/dev/sda1");
+        assert_eq!(m[2].fstype, "nfs4");
+        assert_eq!(m[2].source, "server:/export");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_unescapes_a_space_in_the_mount_point() {
+        let m = parse_mountinfo("40 25 8:32 / /mnt/my\\040disk rw - ext4 /dev/sdc1 rw\n");
+        assert_eq!(m[0].path, std::path::PathBuf::from("/mnt/my disk"));
+    }
+
+    // The leak bound: a quarantined mount is NOT probed every tick (so no
+    // thread is spawned every tick), a healthy mount is always probed, and a
+    // recovered mount is un-quarantined. This is the property #35 is about.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dead_mount_is_quarantined_not_probed_every_tick_and_recovers() {
+        use std::path::PathBuf;
+        let dead = PathBuf::from("/mnt/dead");
+        let live = PathBuf::from("/mnt/live");
+        let mut dm = DeadMounts::default();
+
+        // tick 0: nothing cached, both are probed.
+        assert!(dm.should_probe(&dead, 0));
+        assert!(dm.should_probe(&live, 0));
+
+        // dead one times out -> quarantined; live one answers -> stays clear.
+        dm.mark_dead(dead.clone(), 0);
+        dm.mark_alive(&live);
+
+        // Until the re-probe tick the dead mount is SKIPPED every tick (0
+        // probes -> 0 threads spawned), while the healthy mount is unaffected.
+        let mut dead_probes = 0u64;
+        for tick in 1..DISK_REPROBE_TICKS {
+            if dm.should_probe(&dead, tick) {
+                dead_probes += 1;
+            }
+            assert!(
+                dm.should_probe(&live, tick),
+                "a healthy mount is never quarantined"
+            );
+        }
+        assert_eq!(
+            dead_probes, 0,
+            "a quarantined mount must not be probed every tick"
+        );
+
+        // At the re-probe tick it is probed exactly once...
+        assert!(dm.should_probe(&dead, DISK_REPROBE_TICKS));
+        // ...and if it answers this time, the quarantine clears.
+        dm.mark_alive(&dead);
+        assert!(dm.should_probe(&dead, DISK_REPROBE_TICKS + 1));
+        assert!(dm.should_probe(&dead, DISK_REPROBE_TICKS + 2));
     }
 
     #[test]
