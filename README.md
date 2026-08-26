@@ -251,6 +251,29 @@ Equality only: a regex is redaction, an expression would be a second language to
 maintain. Sample and redact are the sibling transforms, tracked under the same
 [transform stage (#7)](https://github.com/timelakelabs/tributary/issues/7).
 
+## Sampling records (sample)
+
+A `[[source.sample]]` keeps 1-in-`rate` of the records it applies to — for a
+firehose you want thinned but not silenced. With a `field`/`equals` predicate it
+samples only matching records, so you keep every error and thin the debug noise:
+
+```toml
+[[source.sample]]
+field  = "level"   # only records where level == debug are sampled;
+equals = "debug"   # everything else passes untouched
+rate   = 10        # keep 1 in 10 of them
+
+[[source.sample]]
+rate = 5           # no predicate: sample the whole source 1-in-5
+```
+
+The keep/drop decision is **deterministic on the record's identity** (a
+fixed-seed hash — not a running counter, and not a randomly-seeded one), so a
+tail that crashes and resumes re-decides every record the same way, and
+TimeLakeDB's last-write-wins collapses the replay instead of double-counting.
+Like filter, a sampled-out record is dropped **before the watermark counts it**
+and tallied in `tributary_records_dropped_total{stage="sample"}`.
+
 ## Host metrics (Telegraf-compatible)
 
 For a migration off InfluxDB + Telegraf: sample the machine on an interval and

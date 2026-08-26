@@ -140,6 +140,17 @@ struct Pipeline {
     /// Records dropped by the transform filter (#42) — a decision, counted
     /// apart from loss so it never reads as data lost.
     dropped_filter: u64,
+    /// Records dropped by the transform sampler (#43), same accounting.
+    dropped_sample: u64,
+}
+
+impl Pipeline {
+    fn count_drop(&mut self, stage: DropStage) {
+        match stage {
+            DropStage::Filter => self.dropped_filter += 1,
+            DropStage::Sample => self.dropped_sample += 1,
+        }
+    }
 }
 
 #[tokio::main]
@@ -292,6 +303,7 @@ async fn main() -> anyhow::Result<()> {
         dead_letter: args.state_dir.join("dead-letter.lp"),
         quarantined: 0,
         dropped_filter: 0,
+        dropped_sample: 0,
     };
 
     let mut framer = match source.parser {
@@ -395,7 +407,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Ok(Built::Empty) => read_total -= 1,
-                Ok(Built::Dropped) => pipe.dropped_filter += 1,
+                Ok(Built::Dropped(stage)) => pipe.count_drop(stage),
                 Err(e) => {
                     dead_letter(&mut pipe, &line, &e.to_string())?;
                 }
@@ -423,7 +435,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Ok(Built::Empty) => read_total -= 1,
-                Ok(Built::Dropped) => pipe.dropped_filter += 1,
+                Ok(Built::Dropped(stage)) => pipe.count_drop(stage),
                 Err(e) => dead_letter(&mut pipe, &line, &e.to_string())?,
             }
         }
@@ -453,6 +465,8 @@ async fn main() -> anyhow::Result<()> {
             tel.quarantined.store(pipe.quarantined, Relaxed);
             tel.records_dropped_filter
                 .store(pipe.dropped_filter, Relaxed);
+            tel.records_dropped_sample
+                .store(pipe.dropped_sample, Relaxed);
             tel.queue_bytes.store(pipe.queue.bytes(), Relaxed);
             tel.queue_segments.store(pipe.queue.len() as u64, Relaxed);
             tel.queue_full.store(pipe.queue.full, Relaxed);
@@ -552,9 +566,9 @@ async fn main() -> anyhow::Result<()> {
                     batch_max_ts = batch_max_ts.max(source_ts);
                 }
             }
-            Ok(Built::Dropped) => {
+            Ok(Built::Dropped(stage)) => {
                 read_total += 1;
-                pipe.dropped_filter += 1;
+                pipe.count_drop(stage);
             }
             _ => {}
         }
@@ -606,7 +620,7 @@ async fn main() -> anyhow::Result<()> {
         read_total,
         pipe.shipper.shipped(),
         pipe.quarantined,
-        pipe.dropped_filter,
+        pipe.dropped_filter + pipe.dropped_sample,
         tailer.rotations,
         tailer.files_lost,
         pipe.queue.spilled_total,
@@ -892,6 +906,7 @@ fn run_winlog_dump(raw: &[String]) -> anyhow::Result<()> {
             visibility: None,
             multiline: None,
             filter: Vec::new(),
+            sample: Vec::new(),
         };
 
         let cp_path = Checkpoint::path_for(&state_dir, &stream);
@@ -951,15 +966,22 @@ fn run_winlog_dump(raw: &[String]) -> anyhow::Result<()> {
     }
 }
 
+/// Which transform stage dropped a record — for the per-stage drop counter.
+#[derive(Clone, Copy)]
+enum DropStage {
+    Filter,
+    Sample,
+}
+
 /// The outcome of turning a raw line into a shippable record.
 enum Built {
     /// A record ready to encode and ship.
     Ready(lp::Record, i64),
     /// An empty line — nothing to do, and it does not count as read.
     Empty,
-    /// Dropped by the transform filter (#42): a decision, not a loss. Never
-    /// observed by the watermark, never shipped, counted on its own.
-    Dropped,
+    /// Dropped by a transform stage (#42 filter, #43 sample): a decision, not a
+    /// loss. Never observed by the watermark, never shipped, counted on its own.
+    Dropped(DropStage),
 }
 
 fn build(
@@ -975,7 +997,13 @@ fn build(
             // watermark claim arrival for data deliberately thrown away — the
             // completeness guarantee quietly lying (#7).
             if !transform::keeps(&record, &source.filter) {
-                return Ok(Built::Dropped);
+                return Ok(Built::Dropped(DropStage::Filter));
+            }
+            // Sample (#43) also runs before observe — a sampled-out record is
+            // not arrived. Deterministic on the record's identity, so a resume
+            // re-decides the same and LWW collapses the replay.
+            if !transform::sample_keeps(&record, source_ts, &source.sample) {
+                return Ok(Built::Dropped(DropStage::Sample));
             }
             wm.observe(source_ts);
             record.ts_ns = stamper

@@ -631,6 +631,7 @@ mod tests {
             visibility: None,
             multiline: None,
             filter: Vec::new(),
+            sample: Vec::new(),
         }
     }
 

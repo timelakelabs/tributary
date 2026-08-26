@@ -228,6 +228,7 @@ mod tests {
             visibility: None,
             multiline: None,
             filter: Vec::new(),
+            sample: Vec::new(),
         }
     }
 
@@ -257,6 +258,7 @@ mod tests {
             visibility: None,
             multiline: None,
             filter: Vec::new(),
+            sample: Vec::new(),
         };
         let (rec, ts) = map_line(&src, &envelope).unwrap();
         assert_eq!(rec.table, "container_logs");
