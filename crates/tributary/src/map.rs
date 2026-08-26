@@ -227,6 +227,7 @@ mod tests {
             .into(),
             visibility: None,
             multiline: None,
+            filter: Vec::new(),
         }
     }
 
@@ -255,6 +256,7 @@ mod tests {
             fields: [("log".to_string(), FieldType::String)].into(),
             visibility: None,
             multiline: None,
+            filter: Vec::new(),
         };
         let (rec, ts) = map_line(&src, &envelope).unwrap();
         assert_eq!(rec.table, "container_logs");

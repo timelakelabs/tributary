@@ -262,6 +262,18 @@ argument for a native agent over a Vector configuration, and it requires
 publishing `timelake-ingest` as a standalone crate — worth doing anyway,
 since it already carries no heavy dependencies.
 
+**Transform stage (T-2, #7).** Between the mapped record and the queue is
+where a record can be dropped, sampled, or redacted — declared, not a DSL.
+Filter (#42) ships first: a `[[source.filter]]` equality that drops
+matching records. The load-bearing detail is *ordering against the
+watermark*: the drop runs **before `wm.observe()`**, so a dropped record's
+timestamp is never counted as arrived. Dropping after the watermark had
+counted it would make the completeness claim — Tributary's whole
+differentiator — quietly lie about data that was deliberately thrown away.
+Drops are counted as a decision (`tributary_records_dropped_total{stage}`),
+apart from the loss/at-risk accounting, so `read − shipped − quarantined −
+dropped` still balances.
+
 ### 4.4 Ship, with bisect as the safety net
 
 `POST /api/v3/write_lp`, gzipped. Responses:

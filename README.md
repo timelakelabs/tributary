@@ -217,6 +217,40 @@ bookmark through the ordinary `Checkpoint` path:
 python bench\winlog_resume_drill.py --exe path\to\tributary.exe
 ```
 
+## Dropping records (filter)
+
+Not every line is worth shipping. A `[[source.filter]]` drops matching records
+**before they reach the queue** — a debug-level firehose then costs no network
+and no storage:
+
+```toml
+[[source]]
+name   = "app"
+path   = "/var/log/app.log"
+table  = "logs"
+fields = { message = "string", level = "string" }
+
+[[source.filter]]
+field  = "level"      # a mapped tag or field name
+equals = "debug"      # drop records whose level is debug
+# drop = true is the default; drop = false makes it an allow rule instead
+```
+
+`drop = true` rules are a deny-list (a match is dropped); `drop = false` rules
+are an allow-list (only records matching some allow rule survive). Deny is
+checked first — an allow for `env=prod` plus a deny for `level=debug` keeps a
+prod error and drops a prod debug line.
+
+The drop happens **after mapping and before the watermark counts the record**,
+so a dropped record is never claimed as arrived and the completeness guarantee
+stays honest. Drops are counted apart from loss in
+`tributary_records_dropped_total{stage="filter"}` — a healthy drop is a
+decision, not data lost, and must never read as one.
+
+Equality only: a regex is redaction, an expression would be a second language to
+maintain. Sample and redact are the sibling transforms, tracked under the same
+[transform stage (#7)](https://github.com/timelakelabs/tributary/issues/7).
+
 ## Host metrics (Telegraf-compatible)
 
 For a migration off InfluxDB + Telegraf: sample the machine on an interval and

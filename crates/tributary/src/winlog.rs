@@ -630,6 +630,7 @@ mod tests {
             fields: [("Message".to_string(), FieldType::String)].into(),
             visibility: None,
             multiline: None,
+            filter: Vec::new(),
         }
     }
 

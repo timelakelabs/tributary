@@ -24,6 +24,7 @@ mod ship;
 mod stamp;
 mod tail;
 mod telemetry;
+mod transform;
 mod watermark;
 // Ungated on purpose: the reader trait, mapping and loop are
 // platform-independent and their tests run in the default build. Only the
@@ -136,6 +137,9 @@ struct Pipeline {
     cp_path: PathBuf,
     dead_letter: PathBuf,
     quarantined: u64,
+    /// Records dropped by the transform filter (#42) — a decision, counted
+    /// apart from loss so it never reads as data lost.
+    dropped_filter: u64,
 }
 
 #[tokio::main]
@@ -287,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
         cp_path,
         dead_letter: args.state_dir.join("dead-letter.lp"),
         quarantined: 0,
+        dropped_filter: 0,
     };
 
     let mut framer = match source.parser {
@@ -380,7 +385,7 @@ async fn main() -> anyhow::Result<()> {
             };
             read_total += 1;
             match build(source, &line, &mut stamper, &mut pipe.watermark) {
-                Ok(Some((record, source_ts))) => {
+                Ok(Built::Ready(record, source_ts)) => {
                     let mut encoded = String::new();
                     if record.encode(&mut encoded).is_ok() {
                         batch.push(encoded);
@@ -389,7 +394,8 @@ async fn main() -> anyhow::Result<()> {
                         dead_letter(&mut pipe, &line, "unencodable")?;
                     }
                 }
-                Ok(None) => read_total -= 1,
+                Ok(Built::Empty) => read_total -= 1,
+                Ok(Built::Dropped) => pipe.dropped_filter += 1,
                 Err(e) => {
                     dead_letter(&mut pipe, &line, &e.to_string())?;
                 }
@@ -407,7 +413,7 @@ async fn main() -> anyhow::Result<()> {
         if let Some(line) = framer.expire() {
             read_total += 1;
             match build(source, &line, &mut stamper, &mut pipe.watermark) {
-                Ok(Some((record, source_ts))) => {
+                Ok(Built::Ready(record, source_ts)) => {
                     let mut encoded = String::new();
                     if record.encode(&mut encoded).is_ok() {
                         batch.push(encoded);
@@ -416,7 +422,8 @@ async fn main() -> anyhow::Result<()> {
                         dead_letter(&mut pipe, &line, "unencodable")?;
                     }
                 }
-                Ok(None) => read_total -= 1,
+                Ok(Built::Empty) => read_total -= 1,
+                Ok(Built::Dropped) => pipe.dropped_filter += 1,
                 Err(e) => dead_letter(&mut pipe, &line, &e.to_string())?,
             }
         }
@@ -444,6 +451,8 @@ async fn main() -> anyhow::Result<()> {
             tel.tick();
             tel.lines_read.store(read_total, Relaxed);
             tel.quarantined.store(pipe.quarantined, Relaxed);
+            tel.records_dropped_filter
+                .store(pipe.dropped_filter, Relaxed);
             tel.queue_bytes.store(pipe.queue.bytes(), Relaxed);
             tel.queue_segments.store(pipe.queue.len() as u64, Relaxed);
             tel.queue_full.store(pipe.queue.full, Relaxed);
@@ -534,16 +543,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     while let Some(line) = framer.drain() {
-        if let Ok(Some((mut record, source_ts))) =
-            build(source, &line, &mut stamper, &mut pipe.watermark)
-        {
-            record.ts_ns = record.ts_ns.max(record.ts_ns);
-            let mut encoded = String::new();
-            if record.encode(&mut encoded).is_ok() {
-                read_total += 1;
-                batch.push(encoded);
-                batch_max_ts = batch_max_ts.max(source_ts);
+        match build(source, &line, &mut stamper, &mut pipe.watermark) {
+            Ok(Built::Ready(record, source_ts)) => {
+                let mut encoded = String::new();
+                if record.encode(&mut encoded).is_ok() {
+                    read_total += 1;
+                    batch.push(encoded);
+                    batch_max_ts = batch_max_ts.max(source_ts);
+                }
             }
+            Ok(Built::Dropped) => {
+                read_total += 1;
+                pipe.dropped_filter += 1;
+            }
+            _ => {}
         }
     }
     flush(&mut pipe, &mut batch, &mut batch_max_ts).await?;
@@ -588,11 +601,12 @@ async fn main() -> anyhow::Result<()> {
         "done"
     );
     println!(
-        "{{\"read\":{},\"shipped\":{},\"quarantined\":{},\"rotations\":{},\"files_lost\":{},\
+        "{{\"read\":{},\"shipped\":{},\"quarantined\":{},\"dropped\":{},\"rotations\":{},\"files_lost\":{},\
           \"spilled\":{},\"drained\":{},\"bisects\":{},\"queued\":{},\"queue_bytes\":{},          \"watermark_violations\":{},\"read_ms\":{},\"ship_ms\":{},\"requests\":{}}}",
         read_total,
         pipe.shipper.shipped(),
         pipe.quarantined,
+        pipe.dropped_filter,
         tailer.rotations,
         tailer.files_lost,
         pipe.queue.spilled_total,
@@ -877,6 +891,7 @@ fn run_winlog_dump(raw: &[String]) -> anyhow::Result<()> {
             .into(),
             visibility: None,
             multiline: None,
+            filter: Vec::new(),
         };
 
         let cp_path = Checkpoint::path_for(&state_dir, &stream);
@@ -936,21 +951,39 @@ fn run_winlog_dump(raw: &[String]) -> anyhow::Result<()> {
     }
 }
 
+/// The outcome of turning a raw line into a shippable record.
+enum Built {
+    /// A record ready to encode and ship.
+    Ready(lp::Record, i64),
+    /// An empty line — nothing to do, and it does not count as read.
+    Empty,
+    /// Dropped by the transform filter (#42): a decision, not a loss. Never
+    /// observed by the watermark, never shipped, counted on its own.
+    Dropped,
+}
+
 fn build(
     source: &config::Source,
     line: &str,
     stamper: &mut stamp::Stamper,
     wm: &mut watermark::Watermark,
-) -> anyhow::Result<Option<(lp::Record, i64)>> {
+) -> anyhow::Result<Built> {
     match map::map_line(source, line) {
         Ok((mut record, source_ts)) => {
+            // Transform stage (#42): the filter runs BEFORE the watermark
+            // observes this timestamp. Dropping after observe would make the
+            // watermark claim arrival for data deliberately thrown away — the
+            // completeness guarantee quietly lying (#7).
+            if !transform::keeps(&record, &source.filter) {
+                return Ok(Built::Dropped);
+            }
             wm.observe(source_ts);
             record.ts_ns = stamper
                 .stamp(source_ts)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            Ok(Some((record, source_ts)))
+            Ok(Built::Ready(record, source_ts))
         }
-        Err(map::MapError::Empty) => Ok(None),
+        Err(map::MapError::Empty) => Ok(Built::Empty),
         Err(e) => Err(anyhow::anyhow!(e.to_string())),
     }
 }
