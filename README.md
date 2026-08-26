@@ -132,6 +132,33 @@ to the source `name` (its stream identity). Allowlist docker's own `stream`
 (stdout/stderr) and it takes that tag over — last write wins. Give the
 container its identity through `tags_static`, as above, and let `stream`
 carry stdout/stderr.
+## journald source (feature-gated)
+
+On a systemd host, half the services log only to the journal — not a file you
+can tail. Build with the `journald` feature and declare a `parser = "journald"`
+source:
+
+```
+cargo build --release --features journald   # links libsystemd
+
+[[source]]
+name   = "journald"
+table  = "syslog"
+parser = "journald"
+fields = { MESSAGE = "string" }         # the log line -> a field
+tags   = ["_SYSTEMD_UNIT", "PRIORITY"]  # only NAMED fields become tags (FR-2)
+```
+
+Each entry becomes a record on the same map -> queue -> ship path a file tail
+uses, timestamped by the journal's own `__REALTIME_TIMESTAMP`. The resume token
+is the journal **cursor** — an opaque string persisted through the checkpoint,
+not a byte offset. A default build (no feature) links no libsystemd and refuses
+a journald config at startup, so CI on a plain runner is unaffected.
+
+Crash-exact resume is drilled end to end — 200 entries, a hard `kill -9`
+mid-run, restart, every entry delivered exactly once, none skipped or
+duplicated — by `bench/journald_resume_drill.sh` (evidence
+`docs/evidence/journald-resume-drill.log`).
 
 ## The short version of why it exists
 

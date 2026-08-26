@@ -109,9 +109,10 @@ pub fn map_line(src: &Source, line: &str) -> Result<(Record, i64), MapError> {
     }
 
     let parsed: BTreeMap<String, serde_json::Value> = match src.parser {
-        // DockerJson is JSON here: the reassembled envelope's keys
-        // (log/stream/time) are the parsed map. Reassembly is upstream.
-        Parser::Json | Parser::DockerJson => {
+        // DockerJson and Journald are JSON here: an upstream step (the
+        // docker reassembler / the journald reader) has already turned the
+        // wire form into a JSON object whose keys are the parsed map.
+        Parser::Json | Parser::DockerJson | Parser::Journald => {
             serde_json::from_str(line).map_err(|e| MapError::Unparseable(e.to_string()))?
         }
         Parser::Plain => {

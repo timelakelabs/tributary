@@ -1,0 +1,20 @@
+=== journald crash-exact resume drill (2026-08-26T02:06:01Z) ===
+workdir=/tmp/tmp.xjrei3OAlq
+-- build --features journald --
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.12s
+Collecting audit messages is enabled.
+Failed to join audit multicast group. The kernel is probably too old or multicast reading is not supported. Ignoring: Operation not permitted
+Failed to install memory pressure event source, ignoring: Read-only file system
+journald running (pid 559)
+-- writing entries drill-1 .. drill-100 into the journal --
+-- run 1: agent reads + ships, then a hard kill -9 --
+  run 1 delivered 100 distinct drill messages before the kill
+-- writing entries drill-101 .. drill-200 WHILE the agent is dead --
+-- run 2: restart from the saved cursor --
+-- verdict --
+  [PASS] every entry delivered across the crash (200 distinct) (200)
+  [PASS] no entry missing (no gap) (0)
+  [PASS] no duplicate delivered (total == distinct) (200)
+  [PASS] run 2 resumed past run 1 rather than replaying from head (yes)
+=== PASS: journald resumes crash-exact from its cursor — no gap, no dupe ===
+Received SIGTERM from PID 543 (bash).

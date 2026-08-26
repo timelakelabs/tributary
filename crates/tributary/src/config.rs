@@ -240,10 +240,14 @@ pub struct Source {
     /// Stream identity. Becomes the `stream` tag, and scopes the
     /// timestamp sequence (DESIGN.md §3.1).
     pub name: String,
+    /// Filesystem path to tail. Empty/omitted for a journald source, which
+    /// reads the journal, not a file.
+    #[serde(default)]
     pub path: String,
     pub table: String,
     #[serde(default)]
     pub parser: Parser,
+    #[serde(default)]
     pub timestamp: Timestamp,
 
     /// An ALLOWLIST. Never "promote every parsed key" — tags are in the
@@ -305,6 +309,9 @@ pub enum Parser {
     /// parsed as JSON — see [`crate::docker`].
     #[serde(rename = "docker_json")]
     DockerJson,
+    /// systemd journal entries (#23) — parsed as JSON after the journald
+    /// source turns each entry into a JSON object.
+    Journald,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
@@ -336,6 +343,16 @@ fn default_resolution() -> String {
     "ms".into()
 }
 
+impl Default for Timestamp {
+    fn default() -> Self {
+        Timestamp {
+            field: None,
+            format: default_format(),
+            resolution: default_resolution(),
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Config> {
         let text = std::fs::read_to_string(path)?;
@@ -352,6 +369,17 @@ impl Config {
             }
             if o.name.trim().is_empty() {
                 anyhow::bail!("[otlp].name is required (it becomes the `stream` tag)");
+            }
+        }
+        for src in &cfg.sources {
+            if src.parser == Parser::Journald {
+                #[cfg(not(feature = "journald"))]
+                anyhow::bail!(
+                    "source '{}' is journald, but this binary was built without the                      `journald` feature (rebuild with --features journald on a systemd host)",
+                    src.name
+                );
+            } else if src.path.trim().is_empty() {
+                anyhow::bail!("source '{}' has no `path` to tail", src.name);
             }
         }
         if let Some(tls) = &cfg.output.tls {
@@ -485,5 +513,30 @@ mod tests {
             err.to_string().contains("source") || err.to_string().contains("otlp"),
             "got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cfg_journald_tests {
+    #[cfg(not(feature = "journald"))]
+    #[test]
+    fn a_journald_source_is_refused_without_the_feature() {
+        let dir = std::env::temp_dir().join(format!("trib-jrnl-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.toml");
+        std::fs::write(
+            &path,
+            "[output]
+url = \"http://localhost:1963\"
+
+[[source]]
+name = \"j\"
+table = \"syslog\"
+parser = \"journald\"
+",
+        )
+        .unwrap();
+        let err = super::Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("journald"), "got: {err}");
     }
 }

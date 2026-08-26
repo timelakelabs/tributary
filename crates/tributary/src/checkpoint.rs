@@ -34,6 +34,10 @@ pub struct Checkpoint {
     /// it instead of falling back to the conservative ceiling.
     #[serde(default)]
     pub lateness_ns: Option<i64>,
+    /// journald's opaque resume cursor (#23). The file tail leaves this
+    /// None; a journald source sets it. It is NOT a byte offset.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 impl Checkpoint {
@@ -99,6 +103,7 @@ mod tests {
             last_tick_ns: Some(1_786_280_343_206_000_000),
             next_seq: 37,
             lateness_ns: Some(250_000_000),
+            cursor: None,
         };
         cp.save(&p).unwrap();
         assert_eq!(Checkpoint::load(&p).unwrap().unwrap(), cp);
