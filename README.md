@@ -242,25 +242,26 @@ The measurements and their Telegraf names:
 
 | measurement | tags | fields |
 |---|---|---|
-| `cpu` | `cpu` (`cpu-total`, `cpu0`, …) | `usage_idle`, `usage_active` |
+| `cpu` | `cpu` (`cpu-total`, `cpu0`, …) | `usage_idle`, `usage_active`; on Linux also `usage_user`/`usage_system`/`usage_iowait`/`usage_nice`/`usage_irq`/`usage_softirq`/`usage_steal`/`usage_guest`/`usage_guest_nice` |
 | `mem` | — | `total`, `available`, `used`, `free`, `used_percent`, `available_percent` |
 | `disk` | `device`, `path`, `fstype` | `total`, `free`, `used`, `used_percent`; on unix also `inodes_total`/`inodes_free`/`inodes_used` |
 | `net` | `interface` | `bytes_recv`, `bytes_sent`, `packets_recv`, `packets_sent`, `err_in`, `err_out` |
 | `system` | — | `load1`, `load5`, `load15`, `n_cpus`, `uptime` |
 | `swap` | — | `total`, `used`, `free`, `used_percent` |
 
-One `sysinfo` code path covers Linux and Windows. The `host` tag defaults to the
+One mostly-`sysinfo` code path covers Linux and Windows (the Linux CPU per-state
+split is read straight from `/proc/stat`). The `host` tag defaults to the
 OS hostname (override with `[metrics].host`), and `global_tags` cannot override
 `host` or a structural tag. Every row in a tick shares one timestamp; distinct
 series (a different `cpu`/`device`/`interface`) are distinct primary keys, so
 the log stamper's per-record disambiguation is deliberately not used here.
 
-**Known gaps** (documented, not bugs): `cpu` carries `usage_idle`/`usage_active`
-only — `sysinfo` reports one usage percentage per core, not the
-user/system/iowait split Telegraf's `cpu` is built from (the `/proc/stat`
-breakdown is a follow-up); disk inodes are unix-only (`statvfs`; Windows has no
-inode concept); `load*` is zero on Windows, which has
-no load-average concept. `net`/`disk` counters are emitted cumulative — take the
+**Known gaps** (documented, not bugs): the `cpu` per-state split
+(`usage_user`/`usage_system`/`usage_iowait`/…) is read from `/proc/stat` and is
+Linux-only — on other platforms `sysinfo` reports one aggregate percentage per
+core, so `cpu` there carries `usage_idle`/`usage_active` only; disk inodes are
+unix-only (`statvfs`; Windows has no inode concept); `load*` is zero on Windows,
+which has no load-average concept. `net`/`disk` counters are emitted cumulative — take the
 `derivative()` in the dashboard, do not diff them here.
 
 The collector is drilled against a live node: the real binary ships all six

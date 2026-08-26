@@ -324,11 +324,12 @@ request — constant tags and fields stamped on every row (the Telegraf
 override the `host` tag, a structural tag, or a real metric field, so a stray
 entry cannot corrupt a series or emit a duplicate field key.
 
-Known gaps are honest, not hidden: `cpu` is `usage_idle`/`usage_active` only
-(`sysinfo` gives one usage percentage per core, not the user/system/iowait
-split — the `/proc/stat` breakdown is a follow-up); disk inodes are unix-only
-(`statvfs`; Windows has no inode concept); `load*` is
-zero on Windows, which has no load-average concept.
+Known gaps are honest, not hidden: the `cpu` per-state split
+(`usage_user`/`usage_system`/`usage_iowait`/…) is read from `/proc/stat` and is
+Linux-only — elsewhere `sysinfo` gives one aggregate percentage per core, so
+`cpu` carries `usage_idle`/`usage_active` only; disk inodes are unix-only
+(`statvfs`; Windows has no inode concept); `load*` is zero
+on Windows, which has no load-average concept.
 
 ---
 
