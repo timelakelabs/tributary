@@ -494,9 +494,12 @@ quarantine, queue, backpressure, metrics.
 **Deliberately out:** metric extraction and aggregation (Telegraf already
 does that, over the same wire, and is a first-class integration —
 FR-8/FR-9); fan-out to other sinks (this is a TimeLakeDB agent, not a
-router); a transformation DSL. Container and syslog/journald sources are
-plausible v2, and are excluded now so that v1 can be *correct* rather
-than broad.
+router); a transformation DSL. Container, journald and Windows Event Log
+sources were plausible v2 when this was written and have since shipped as
+push/pull additions on the same map -> queue -> ship path — each behind a
+feature (`docker_json` needs none, `journald` links libsystemd, `winlog`
+links wevtapi on Windows), so the default build stays as small and portable
+as v1 was. Still out: metric extraction, fan-out, a transformation DSL.
 
 Refusing to become Vector is what keeps this small enough to prove.
 

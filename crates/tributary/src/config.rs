@@ -312,6 +312,10 @@ pub enum Parser {
     /// systemd journal entries (#23) — parsed as JSON after the journald
     /// source turns each entry into a JSON object.
     Journald,
+    /// Windows Event Log events (#11) — parsed as JSON after the winlog
+    /// source renders each event and pulls the kept fields out of its XML.
+    /// The source's `path` names the channel (`System`, `Application`, …).
+    Winlog,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
@@ -378,6 +382,23 @@ impl Config {
                     "source '{}' is journald, but this binary was built without the                      `journald` feature (rebuild with --features journald on a systemd host)",
                     src.name
                 );
+            } else if src.parser == Parser::Winlog {
+                #[cfg(not(feature = "winlog"))]
+                anyhow::bail!(
+                    "source '{}' is winlog, but this binary was built without the `winlog` \
+                     feature (rebuild with --features winlog for a Windows host)",
+                    src.name
+                );
+                // The channel to read rides in `path` (`System`, `Application`,
+                // or a custom channel path). Empty is a mistake, not a tail.
+                #[cfg(feature = "winlog")]
+                if src.path.trim().is_empty() {
+                    anyhow::bail!(
+                        "source '{}' is winlog but names no channel — set `path` to a \
+                         channel like \"System\" or \"Application\"",
+                        src.name
+                    );
+                }
             } else if src.path.trim().is_empty() {
                 anyhow::bail!("source '{}' has no `path` to tail", src.name);
             }
@@ -538,5 +559,31 @@ parser = \"journald\"
         .unwrap();
         let err = super::Config::load(&path).unwrap_err().to_string();
         assert!(err.contains("journald"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod cfg_winlog_tests {
+    #[cfg(not(feature = "winlog"))]
+    #[test]
+    fn a_winlog_source_is_refused_without_the_feature() {
+        let dir = std::env::temp_dir().join(format!("trib-winlog-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w.toml");
+        std::fs::write(
+            &path,
+            "[output]
+url = \"http://localhost:1963\"
+
+[[source]]
+name = \"winsys\"
+path = \"System\"
+table = \"eventlog\"
+parser = \"winlog\"
+",
+        )
+        .unwrap();
+        let err = super::Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("winlog"), "got: {err}");
     }
 }

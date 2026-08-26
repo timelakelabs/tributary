@@ -24,6 +24,10 @@ mod stamp;
 mod tail;
 mod telemetry;
 mod watermark;
+// Ungated on purpose: the reader trait, mapping and loop are
+// platform-independent and their tests run in the default build. Only the
+// wevtapi implementation inside is #[cfg(all(feature = "winlog", windows))].
+mod winlog;
 
 /// The per-line framer: multiline joins for stack traces, or docker json-file
 /// reassembly for the 16 KB splits. One per source; both emit complete "lines"
@@ -139,6 +143,16 @@ async fn main() -> anyhow::Result<()> {
     // what decides where the log goes. Nothing between here and `.init()`
     // logs; a config error surfaces on stderr through anyhow, which is
     // where someone running this by hand is already looking.
+    // #11 diagnostic: `--winlog-dump` reads a channel through the real reader
+    // and prints what it would ship, resuming from the checkpoint bookmark —
+    // the drill uses it to prove crash-exact resume without standing up a
+    // TimeLakeDB sink. Intercepted before the normal arg parse (its flags are
+    // not the agent's) and before any config is required.
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.iter().any(|a| a == "--winlog-dump") {
+        return run_winlog_dump(&raw);
+    }
+
     let args = parse_args();
     let cfg = Config::load(&args.config)?;
 
@@ -227,6 +241,14 @@ async fn main() -> anyhow::Result<()> {
     // file-tail setup below.
     if source.parser == config::Parser::Journald {
         return run_journald_source(source, shipper, &args, &cfg).await;
+    }
+
+    // #11: a winlog source reads a Windows Event Log channel via wevtapi and
+    // its bookmark, not a file — its own pull loop, reusing this shipper and
+    // the same queue/stamper/checkpoint machinery. Returns instead of falling
+    // into the file-tail setup below.
+    if source.parser == config::Parser::Winlog {
+        return run_winlog_source(source, shipper, &args, &cfg).await;
     }
 
     // #12: run the OTLP receiver alongside the file tail when configured. Its
@@ -701,6 +723,178 @@ async fn run_journald_source(
         anyhow::bail!(
             "journald source configured but this binary was built without the `journald` feature"
         )
+    }
+}
+
+/// Run a winlog source (#11): reader + the shared ship path, raced against
+/// shutdown. Behind the feature AND the windows target so a default (or
+/// Linux) binary links no wevtapi; the `not` arm is unreachable at runtime
+/// (Config::load refuses winlog without the feature) but is needed to
+/// compile.
+#[allow(unused_variables)]
+async fn run_winlog_source(
+    source: &config::Source,
+    shipper: ship::Shipper,
+    args: &Args,
+    cfg: &Config,
+) -> anyhow::Result<()> {
+    #[cfg(all(feature = "winlog", windows))]
+    {
+        // `path` is the channel name (`System`, `Application`, …).
+        let reader = winlog::RealEventLog::open(&source.path)?;
+        tracing::info!(
+            stream = source.name,
+            channel = source.path,
+            follow = !args.once,
+            "winlog source started"
+        );
+        let run = winlog::run_winlog(
+            reader,
+            source,
+            shipper,
+            &args.state_dir,
+            cfg.output.queue_max_bytes,
+            cfg.output.batch_lines,
+            args.once,
+        );
+        let shutdown = async {
+            // No SIGTERM on Windows; Ctrl-C (and Ctrl-Break via ctrl_c) is the
+            // stop signal a service manager sends.
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        tokio::select! {
+            r = run => r,
+            _ = shutdown => { tracing::info!("shutdown"); Ok(()) }
+        }
+    }
+    #[cfg(not(all(feature = "winlog", windows)))]
+    {
+        anyhow::bail!(
+            "winlog source configured but this binary was built without the `winlog` feature \
+             (or not for a Windows target)"
+        )
+    }
+}
+
+/// `--winlog-dump --channel <name> --state-dir <dir> [--stream <s>] [--limit <n>]`
+/// (#11): read up to `--limit` events (default 20) from the channel, resuming
+/// from the checkpoint bookmark under `--state-dir`/`--stream`, print one line
+/// per event (`EventRecordID<TAB>time_created_ns<TAB>mapped?`) and save the
+/// advanced bookmark back to the checkpoint — the SAME `Checkpoint`+bookmark
+/// path production uses, so a second run resumes exactly where the first
+/// stopped. This is the drill's instrument; it also runs `map_event` on each
+/// event so the mapping path is exercised, not just the read.
+#[allow(unused_variables)]
+fn run_winlog_dump(raw: &[String]) -> anyhow::Result<()> {
+    #[cfg(all(feature = "winlog", windows))]
+    {
+        use winlog::WinlogReader as _;
+
+        let mut channel = String::new();
+        let mut state_dir = PathBuf::from("./state");
+        let mut stream = "winsys".to_string();
+        let mut limit: usize = 20;
+        let mut it = raw.iter().skip(1);
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--winlog-dump" => {}
+                "--channel" => channel = it.next().cloned().unwrap_or_default(),
+                "--state-dir" => {
+                    if let Some(v) = it.next() {
+                        state_dir = PathBuf::from(v);
+                    }
+                }
+                "--stream" => stream = it.next().cloned().unwrap_or(stream),
+                "--limit" => {
+                    if let Some(v) = it.next() {
+                        limit = v.parse().unwrap_or(limit);
+                    }
+                }
+                other => anyhow::bail!("unknown --winlog-dump argument {other:?}"),
+            }
+        }
+        if channel.trim().is_empty() {
+            anyhow::bail!("--winlog-dump needs --channel <name> (e.g. System)");
+        }
+        std::fs::create_dir_all(&state_dir)?;
+
+        // A synthetic source so map_event runs the real allowlist path. Fields
+        // present on essentially every event, so the mapping is exercised.
+        let source = config::Source {
+            name: stream.clone(),
+            path: channel.clone(),
+            table: "eventlog".into(),
+            parser: config::Parser::Winlog,
+            timestamp: config::Timestamp {
+                field: None,
+                format: "unix_ms".into(),
+                resolution: "us".into(),
+            },
+            tags: vec!["Provider".into(), "Channel".into()],
+            tags_static: Default::default(),
+            fields: [
+                ("EventID".to_string(), config::FieldType::String),
+                ("Computer".to_string(), config::FieldType::String),
+            ]
+            .into(),
+            visibility: None,
+            multiline: None,
+        };
+
+        let cp_path = Checkpoint::path_for(&state_dir, &stream);
+        let restored = Checkpoint::load(&cp_path)?;
+        let bookmark = restored.as_ref().and_then(|c| c.cursor.clone());
+
+        let mut stamper = stamp::Stamper::new(source.resolution());
+        if let Some(c) = &restored
+            && let Some(t) = c.last_tick_ns
+        {
+            stamper.restore(t, c.next_seq);
+        }
+
+        let mut reader = winlog::RealEventLog::open(&channel)?;
+        reader.seek(bookmark.as_deref())?;
+        eprintln!(
+            "winlog-dump: channel={channel} stream={stream} limit={limit} resuming={}",
+            bookmark.is_some()
+        );
+
+        let mut last_bookmark = bookmark.clone();
+        let mut n = 0usize;
+        while n < limit {
+            match reader.next()? {
+                Some(ev) => {
+                    let rid = ev.fields.get("EventRecordID").cloned().unwrap_or_default();
+                    let mapped = winlog::map_event(&source, &ev, &mut stamper)?.is_some();
+                    println!("{rid}\t{}\t{mapped}", ev.time_created_ns);
+                    last_bookmark = Some(reader.bookmark()?);
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+
+        let (last_tick_ns, next_seq) = match stamper.checkpoint() {
+            Some((t, s)) => (Some(t), s),
+            None => (None, 0),
+        };
+        Checkpoint {
+            files: Vec::new(),
+            last_tick_ns,
+            next_seq,
+            lateness_ns: None,
+            cursor: last_bookmark,
+        }
+        .save(&cp_path)?;
+        eprintln!(
+            "winlog-dump: read {n} events, checkpoint saved to {}",
+            cp_path.display()
+        );
+        Ok(())
+    }
+    #[cfg(not(all(feature = "winlog", windows)))]
+    {
+        anyhow::bail!("--winlog-dump requires a build with --features winlog for a Windows target")
     }
 }
 
