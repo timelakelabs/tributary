@@ -328,7 +328,8 @@ Known gaps are honest, not hidden: the `cpu` per-state split
 (`usage_user`/`usage_system`/`usage_iowait`/…) is read from `/proc/stat` and is
 Linux-only — elsewhere `sysinfo` gives one aggregate percentage per core, so
 `cpu` carries `usage_idle`/`usage_active` only; disk inodes are unix-only
-(`statvfs`; Windows has no inode concept); `load*` is zero
+(`statvfs`; Windows has no inode concept); `mem` buffered/cached are Linux-only
+(`/proc/meminfo`); `load*` is zero
 on Windows, which has no load-average concept.
 
 ---

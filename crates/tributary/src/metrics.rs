@@ -45,6 +45,19 @@ pub struct MemSample {
     pub available: u64,
     pub used: u64,
     pub free: u64,
+    /// Buffered + cached memory (Linux `/proc/meminfo`, #30); `None` where it
+    /// isn't available (Windows, macOS).
+    pub cache: Option<MemCache>,
+}
+
+/// Reclaimable memory the kernel spends on buffers and page cache (Linux,
+/// #30). "used" is misleading without these: free RAM is used for cache that
+/// is instantly reclaimable, so real memory pressure is `used - buffered -
+/// cached`, not `used` — and a box that caches well looks near-OOM otherwise.
+#[derive(Clone, Copy)]
+pub struct MemCache {
+    pub buffered: u64,
+    pub cached: u64,
 }
 
 pub struct SwapSample {
@@ -214,17 +227,25 @@ fn pct(part: u64, whole: u64) -> f64 {
 // ---- pure mapping: sample -> Record with Telegraf names (golden-tested) ----
 
 pub fn mem_record(s: &MemSample, ctx: &Ctx, ts_ns: i64) -> Record {
+    let mut fields = vec![
+        ("total", Value::Int(s.total as i64)),
+        ("available", Value::Int(s.available as i64)),
+        ("used", Value::Int(s.used as i64)),
+        ("free", Value::Int(s.free as i64)),
+        ("used_percent", Value::Float(pct(s.used, s.total))),
+        ("available_percent", Value::Float(pct(s.available, s.total))),
+    ];
+    // Linux buffered/cached (#30) — the fields that make "used" interpretable.
+    if let Some(c) = &s.cache {
+        fields.extend([
+            ("buffered", Value::Int(c.buffered as i64)),
+            ("cached", Value::Int(c.cached as i64)),
+        ]);
+    }
     Record {
         table: "mem".to_string(),
         tags: ctx.tags(&[]),
-        fields: ctx.fields(vec![
-            ("total", Value::Int(s.total as i64)),
-            ("available", Value::Int(s.available as i64)),
-            ("used", Value::Int(s.used as i64)),
-            ("free", Value::Int(s.free as i64)),
-            ("used_percent", Value::Float(pct(s.used, s.total))),
-            ("available_percent", Value::Float(pct(s.available, s.total))),
-        ]),
+        fields: ctx.fields(fields),
         ts_ns,
     }
 }
@@ -344,7 +365,58 @@ fn gather_mem(sys: &System) -> MemSample {
         available: sys.available_memory(),
         used: sys.used_memory(),
         free: sys.free_memory(),
+        cache: mem_cache(),
     }
+}
+
+/// Buffered + cached from `/proc/meminfo` (Linux). sysinfo doesn't expose the
+/// cache split, so read it directly.
+#[cfg(target_os = "linux")]
+fn mem_cache() -> Option<MemCache> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    mem_cache_from(&text)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mem_cache() -> Option<MemCache> {
+    None
+}
+
+/// Parse `buffered`/`cached` (in BYTES) out of `/proc/meminfo`. Two traps live
+/// here: the file is in kB, so every value is x1024; and Telegraf's `cached`
+/// is `Cached + SReclaimable - Shmem`, NOT the raw `Cached:` line — matching
+/// that formula is the whole point, because a dashboard keys on the number.
+#[cfg(target_os = "linux")]
+fn mem_cache_from(meminfo: &str) -> Option<MemCache> {
+    // "Buffers:   123456 kB" -> 123456 * 1024 bytes.
+    fn val_bytes(line: &str) -> Option<u64> {
+        line.split_whitespace()
+            .nth(1)?
+            .parse::<u64>()
+            .ok()
+            .map(|kb| kb * 1024)
+    }
+    let mut buffered = None;
+    let mut cached = None;
+    let mut sreclaimable = 0u64;
+    let mut shmem = 0u64;
+    for line in meminfo.lines() {
+        // `Cached:` must not catch `SwapCached:`; `Shmem:` must not catch
+        // `ShmemHugePages:` — the trailing colon in the prefix guards both.
+        if line.starts_with("Buffers:") {
+            buffered = val_bytes(line);
+        } else if line.starts_with("Cached:") {
+            cached = val_bytes(line);
+        } else if line.starts_with("SReclaimable:") {
+            sreclaimable = val_bytes(line).unwrap_or(0);
+        } else if line.starts_with("Shmem:") {
+            shmem = val_bytes(line).unwrap_or(0);
+        }
+    }
+    Some(MemCache {
+        buffered: buffered?,
+        cached: cached?.saturating_add(sreclaimable).saturating_sub(shmem),
+    })
 }
 
 fn gather_swap(sys: &System) -> SwapSample {
@@ -812,12 +884,68 @@ mod tests {
             available: 8_000,
             used: 8_000,
             free: 8_000,
+            cache: None,
         };
         assert_eq!(
             enc(mem_record(&s, &ctx(), 1000)),
             "mem,host=h1,region=us-east total=16000i,available=8000i,used=8000i,free=8000i,\
              used_percent=50,available_percent=50,deployment=\"prod\" 1000\n"
         );
+    }
+
+    #[test]
+    fn mem_record_carries_cache_when_present() {
+        let s = MemSample {
+            total: 16_000,
+            available: 8_000,
+            used: 8_000,
+            free: 8_000,
+            cache: Some(MemCache {
+                buffered: 100,
+                cached: 500,
+            }),
+        };
+        assert_eq!(
+            enc(mem_record(&s, &ctx(), 1000)),
+            "mem,host=h1,region=us-east total=16000i,available=8000i,used=8000i,free=8000i,\
+             used_percent=50,available_percent=50,buffered=100i,cached=500i,\
+             deployment=\"prod\" 1000\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mem_cache_from_applies_the_telegraf_formula_in_bytes() {
+        // SwapCached and ShmemHugePages are decoys: `Cached:`/`Shmem:` must not
+        // catch them. cached = (Cached + SReclaimable - Shmem), all x1024.
+        let meminfo = "MemTotal:       16000000 kB\n\
+                       MemFree:         2000000 kB\n\
+                       Buffers:             100 kB\n\
+                       Cached:              500 kB\n\
+                       SwapCached:           10 kB\n\
+                       SReclaimable:         50 kB\n\
+                       Shmem:                20 kB\n\
+                       ShmemHugePages:        0 kB\n";
+        let c = mem_cache_from(meminfo).expect("a well-formed meminfo");
+        assert_eq!(c.buffered, 100 * 1024);
+        assert_eq!(c.cached, (500 + 50 - 20) * 1024); // SwapCached ignored
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mem_cache_from_is_none_without_the_lines() {
+        assert!(mem_cache_from("MemTotal: 16000000 kB\n").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mem_cache_reads_real_meminfo() {
+        // Exercises the real /proc/meminfo read + parse. Every Linux meminfo
+        // has Buffers and Cached, so this is Some; assert only the kB->bytes
+        // conversion happened (both are multiples of 1024), not a live value.
+        let c = mem_cache().expect("/proc/meminfo has Buffers and Cached");
+        assert_eq!(c.buffered % 1024, 0);
+        assert_eq!(c.cached % 1024, 0);
     }
 
     #[test]
@@ -952,6 +1080,7 @@ mod tests {
                     available: 1,
                     used: 0,
                     free: 1,
+                    cache: None,
                 },
                 &c,
                 1,
@@ -1006,6 +1135,7 @@ mod tests {
                 available: 4,
                 used: 6,
                 free: 4,
+                cache: None,
             },
             &c,
             1,
