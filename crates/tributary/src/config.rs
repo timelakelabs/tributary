@@ -276,6 +276,24 @@ pub struct Source {
     /// Join continuation lines into one record (stack traces).
     #[serde(default)]
     pub multiline: Option<Multiline>,
+
+    /// Transform stage (#42): drop records matching a declared predicate,
+    /// before the queue AND before the watermark counts them.
+    #[serde(default)]
+    pub filter: Vec<Filter>,
+}
+
+/// A drop rule for the transform stage (#42). Matches a mapped tag OR field
+/// named `field` whose value equals `equals`. `drop = true` (the default) is a
+/// deny rule (matching records are dropped); `drop = false` is an allow rule
+/// (only records matching some allow rule survive). Equality only — a regex is
+/// redaction (#44), an expression is the mini-VRL #7 forbids.
+#[derive(Debug, Deserialize, Clone)]
+pub struct Filter {
+    pub field: String,
+    pub equals: String,
+    #[serde(default = "default_true")]
+    pub drop: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,6 +457,14 @@ impl Config {
                     s.timestamp.resolution
                 );
             }
+            for f in &s.filter {
+                if f.field.trim().is_empty() || f.equals.trim().is_empty() {
+                    anyhow::bail!(
+                        "source '{}': a [[source.filter]] needs a non-empty `field` and `equals`",
+                        s.name
+                    );
+                }
+            }
         }
         Ok(cfg)
     }
@@ -501,6 +527,7 @@ impl Otlp {
             fields: self.fields.clone(),
             visibility: self.visibility.clone(),
             multiline: None,
+            filter: Vec::new(),
         }
     }
 }
@@ -685,6 +712,30 @@ mod tests {
             err.to_string().contains("source") || err.to_string().contains("otlp"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn a_source_filter_parses_and_a_bad_one_is_refused() {
+        let cfg = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [[source]]\nname = \"app\"\npath = \"/var/log/app.log\"\ntable = \"logs\"\n\n\
+             [[source.filter]]\nfield = \"level\"\nequals = \"debug\"\n\n\
+             [[source.filter]]\nfield = \"level\"\nequals = \"error\"\ndrop = false\n",
+        )
+        .expect("a well-formed filter parses");
+        let f = &cfg.sources[0].filter;
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].field, "level");
+        assert!(f[0].drop, "drop defaults to true");
+        assert!(!f[1].drop);
+
+        let err = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [[source]]\nname = \"app\"\npath = \"/var/log/app.log\"\ntable = \"logs\"\n\n\
+             [[source.filter]]\nfield = \"\"\nequals = \"x\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("filter"), "got: {err}");
     }
 
     #[test]

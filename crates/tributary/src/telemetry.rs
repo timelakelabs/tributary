@@ -22,8 +22,14 @@
 //! of this existed. That section also states an invariant this module is
 //! built to keep checkable from the outside:
 //!
-//! > `lines_read` minus `lines_shipped` minus `lines_quarantined` should be
-//! > the queue depth. If it is not, something is being lost.
+//! > `lines_read` minus `lines_shipped` minus `lines_quarantined` minus
+//! > `records_dropped` should be the queue depth. If it is not, something is
+//! > being lost.
+//!
+//! `records_dropped` (the transform stage, #42) is subtracted because a
+//! dropped record is a DECISION, not a loss — it counts as read but is never
+//! shipped, quarantined, or queued, so without it a healthy drop reads as data
+//! lost.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -52,6 +58,9 @@ pub struct Telemetry {
     pub rotations: AtomicU64,
     pub watermark_violations: AtomicU64,
     pub out_of_window: AtomicU64,
+    /// Records dropped by the transform filter (#42) — a decision, not a loss;
+    /// counted apart so read - shipped - quarantined - dropped still balances.
+    pub records_dropped_filter: AtomicU64,
     /// OTLP receiver (#12): log records accepted, and records dropped
     /// (un-coercible field, or a stamper that refused the timestamp).
     pub otlp_received: AtomicU64,
@@ -91,6 +100,7 @@ impl Telemetry {
             rotations: AtomicU64::new(0),
             watermark_violations: AtomicU64::new(0),
             out_of_window: AtomicU64::new(0),
+            records_dropped_filter: AtomicU64::new(0),
             otlp_received: AtomicU64::new(0),
             otlp_rejected: AtomicU64::new(0),
             read_ns: AtomicU64::new(0),
@@ -346,6 +356,19 @@ impl Telemetry {
             "Seconds since the main loop last turned. This is what /healthz reads.",
             format!("{:.3}", self.since_tick_ms() as f64 / 1000.0),
         );
+        // Records dropped by the transform stage (#42), labelled by stage — one
+        // HELP/TYPE for the family, a value line per stage (filter now,
+        // sample/redact later). Dropped is a DECISION, counted apart from the
+        // loss/at-risk accounting, so read - shipped - quarantined - dropped
+        // still balances and a healthy drop never reads as data lost. Emitted
+        // after the m() calls so it isn't fighting that closure's &mut s.
+        s.push_str(
+            "# HELP tributary_records_dropped_total Records dropped by the transform stage — a decision, not a loss.\n# TYPE tributary_records_dropped_total counter\n",
+        );
+        s.push_str(&format!(
+            "tributary_records_dropped_total{{stage=\"filter\"}} {}\n",
+            g(&self.records_dropped_filter)
+        ));
         s
     }
 }
@@ -437,7 +460,8 @@ mod tests {
         t.lines_read.store(1000, Ordering::Relaxed);
         t.ship.shipped.store(900, Ordering::Relaxed);
         t.quarantined.store(10, Ordering::Relaxed);
-        t.pending_lines.store(90, Ordering::Relaxed);
+        t.records_dropped_filter.store(30, Ordering::Relaxed);
+        t.pending_lines.store(60, Ordering::Relaxed);
 
         let out = t.render_prometheus();
         let val = |name: &str| -> f64 {
@@ -447,13 +471,21 @@ mod tests {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(|| panic!("{name} not exported"))
         };
+        // The dropped metric is labelled, so it is not a `{name} <value>` line.
+        let dropped: f64 = out
+            .lines()
+            .find(|l| l.starts_with("tributary_records_dropped_total{"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .expect("dropped metric exported");
         let unaccounted = val("tributary_lines_read_total")
             - val("tributary_lines_shipped_total")
-            - val("tributary_lines_quarantined_total");
+            - val("tributary_lines_quarantined_total")
+            - dropped;
         assert_eq!(
             unaccounted,
             val("tributary_at_risk_lines"),
-            "read - shipped - quarantined must equal what is still held"
+            "read - shipped - quarantined - dropped must equal what is still held"
         );
     }
 

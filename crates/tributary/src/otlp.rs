@@ -494,6 +494,7 @@ mod tests {
             fields: [("body".to_string(), FieldType::String)].into(),
             visibility: None,
             multiline: None,
+            filter: Vec::new(),
         }
     }
 
