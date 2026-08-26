@@ -40,6 +40,12 @@ windows = { version = "0.59", optional = true, features = [
     "Win32_System_EventLog",
 ] }
 
+# statvfs for the disk collector's inode counts (#29): sysinfo reports space
+# but not inodes. libc is unix-only, so a Windows build never pulls it and
+# simply omits the inode fields (Telegraf omits them on Windows too).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # journald links libsystemd (raw sd-journal FFI, no crate dep); OFF by
 # default so the standard build and CI on a plain runner stay dep-free.

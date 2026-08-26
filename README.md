@@ -244,7 +244,7 @@ The measurements and their Telegraf names:
 |---|---|---|
 | `cpu` | `cpu` (`cpu-total`, `cpu0`, …) | `usage_idle`, `usage_active` |
 | `mem` | — | `total`, `available`, `used`, `free`, `used_percent`, `available_percent` |
-| `disk` | `device`, `path`, `fstype` | `total`, `free`, `used`, `used_percent` |
+| `disk` | `device`, `path`, `fstype` | `total`, `free`, `used`, `used_percent`; on unix also `inodes_total`/`inodes_free`/`inodes_used` |
 | `net` | `interface` | `bytes_recv`, `bytes_sent`, `packets_recv`, `packets_sent`, `err_in`, `err_out` |
 | `system` | — | `load1`, `load5`, `load15`, `n_cpus`, `uptime` |
 | `swap` | — | `total`, `used`, `free`, `used_percent` |
@@ -258,7 +258,8 @@ the log stamper's per-record disambiguation is deliberately not used here.
 **Known gaps** (documented, not bugs): `cpu` carries `usage_idle`/`usage_active`
 only — `sysinfo` reports one usage percentage per core, not the
 user/system/iowait split Telegraf's `cpu` is built from (the `/proc/stat`
-breakdown is a follow-up); no disk inodes; `load*` is zero on Windows, which has
+breakdown is a follow-up); disk inodes are unix-only (`statvfs`; Windows has no
+inode concept); `load*` is zero on Windows, which has
 no load-average concept. `net`/`disk` counters are emitted cumulative — take the
 `derivative()` in the dashboard, do not diff them here.
 

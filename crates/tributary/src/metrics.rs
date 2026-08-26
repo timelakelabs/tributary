@@ -64,6 +64,33 @@ pub struct DiskSample {
     pub fstype: String,
     pub total: u64,
     pub free: u64,
+    /// Inode counts from `statvfs`; `None` where the filesystem has no inode
+    /// concept — Windows, and pseudo-filesystems that report zero.
+    pub inodes: Option<InodeStats>,
+}
+
+/// Inode usage for a mount, the way Telegraf's `disk` reports it. A
+/// filesystem can exhaust these long before it runs out of bytes, at which
+/// point writes fail on a volume a byte-only dashboard swears is half empty.
+#[derive(Clone, Copy)]
+pub struct InodeStats {
+    pub total: u64,
+    pub free: u64,
+    pub used: u64,
+}
+
+/// Build `InodeStats` from `statvfs` counts. A pseudo-filesystem (proc,
+/// sysfs, some tmpfs) reports `f_files == 0` — there is nothing to report,
+/// and an `inodes_used` computed from it would be a lie — so return `None`.
+fn inode_stats_from(files: u64, ffree: u64) -> Option<InodeStats> {
+    if files == 0 {
+        return None;
+    }
+    Some(InodeStats {
+        total: files,
+        free: ffree,
+        used: files.saturating_sub(ffree),
+    })
 }
 
 pub struct NetSample {
@@ -210,6 +237,22 @@ pub fn cpu_record(s: &CpuSample, ctx: &Ctx, ts_ns: i64) -> Record {
 
 pub fn disk_record(s: &DiskSample, ctx: &Ctx, ts_ns: i64) -> Record {
     let used = s.total.saturating_sub(s.free);
+    let mut fields = vec![
+        ("total", Value::Int(s.total as i64)),
+        ("free", Value::Int(s.free as i64)),
+        ("used", Value::Int(used as i64)),
+        ("used_percent", Value::Float(pct(used, s.total))),
+    ];
+    // Inodes are present on unix filesystems that have them (#29); a volume
+    // can be ENOSPC on inodes while bytes look fine, and this is the field
+    // that shows it.
+    if let Some(i) = &s.inodes {
+        fields.extend([
+            ("inodes_total", Value::Int(i.total as i64)),
+            ("inodes_free", Value::Int(i.free as i64)),
+            ("inodes_used", Value::Int(i.used as i64)),
+        ]);
+    }
     Record {
         table: "disk".to_string(),
         tags: ctx.tags(&[
@@ -217,12 +260,7 @@ pub fn disk_record(s: &DiskSample, ctx: &Ctx, ts_ns: i64) -> Record {
             ("path", &s.path),
             ("fstype", &s.fstype),
         ]),
-        fields: ctx.fields(vec![
-            ("total", Value::Int(s.total as i64)),
-            ("free", Value::Int(s.free as i64)),
-            ("used", Value::Int(used as i64)),
-            ("used_percent", Value::Float(pct(used, s.total))),
-        ]),
+        fields: ctx.fields(fields),
         ts_ns,
     }
 }
@@ -296,17 +334,52 @@ fn gather_cpu(sys: &System) -> Vec<CpuSample> {
     out
 }
 
-fn gather_disks(disks: &Disks) -> Vec<DiskSample> {
+/// Fresh disk list + space + inodes. Called in a bounded blocking task:
+/// `statvfs` — sysinfo's own space read AND our inode read — blocks on an
+/// unresponsive mount, so this must not run on the async runtime. A new
+/// `Disks` each tick is fine — disk space is a gauge, nothing accumulates.
+fn gather_disks() -> Vec<DiskSample> {
+    let disks = Disks::new_with_refreshed_list();
     disks
         .iter()
-        .map(|d| DiskSample {
-            device: d.name().to_string_lossy().into_owned(),
-            path: d.mount_point().to_string_lossy().into_owned(),
-            fstype: d.file_system().to_string_lossy().into_owned(),
-            total: d.total_space(),
-            free: d.available_space(),
+        .map(|d| {
+            let path = d.mount_point();
+            DiskSample {
+                device: d.name().to_string_lossy().into_owned(),
+                path: path.to_string_lossy().into_owned(),
+                fstype: d.file_system().to_string_lossy().into_owned(),
+                total: d.total_space(),
+                free: d.available_space(),
+                inodes: inode_stats(path),
+            }
         })
         .collect()
+}
+
+/// Inode counts for a mount via `statvfs`. Runs right after sysinfo read the
+/// same mount for its space numbers, so a mount that answers sysinfo answers
+/// this too.
+#[cfg(unix)]
+// f_files/f_ffree are fsfilcnt_t, which is u64 on 64-bit Linux (so the cast is
+// redundant there) but u32 on some 32-bit targets (so it's needed for those).
+#[allow(clippy::unnecessary_cast)]
+fn inode_stats(mount: &std::path::Path) -> Option<InodeStats> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(mount.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated path and `s` is zeroed; statvfs
+    // fills it and returns 0 on success, and we ignore `s` on any failure.
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    inode_stats_from(s.f_files as u64, s.f_ffree as u64)
+}
+
+/// Windows (and any non-unix) has no inode concept; Telegraf omits these
+/// fields there too.
+#[cfg(not(unix))]
+fn inode_stats(_mount: &std::path::Path) -> Option<InodeStats> {
+    None
 }
 
 fn gather_net(nets: &Networks) -> Vec<NetSample> {
@@ -381,13 +454,17 @@ pub async fn run(
     )?));
     tokio::spawn(drain(Arc::clone(&queue), shipper));
 
-    // Held across ticks: net/disk counters are cumulative from first
-    // observation, so the objects must persist to accumulate (trap 4).
+    // Held across ticks: net counters are cumulative from first observation,
+    // so the object must persist to accumulate (trap 4). Disk is gathered
+    // fresh each tick in a bounded blocking task (below) — space is a gauge,
+    // and statvfs must not block the async runtime.
     let mut sys = System::new();
-    let mut disks = Disks::new_with_refreshed_list();
     let mut nets = Networks::new_with_refreshed_list();
     // Trap 2: establish a CPU baseline so the first emitted tick has a delta.
     sys.refresh_cpu_all();
+    // How long a disk gather may take before it is skipped for a tick: a dead
+    // NFS mount blocks statvfs, and that must not wedge the other collectors.
+    const DISK_GATHER_TIMEOUT_SECS: u64 = 5;
 
     tracing::info!(
         interval_secs = interval.as_secs(),
@@ -407,7 +484,6 @@ pub async fn run(
 
         sys.refresh_memory();
         sys.refresh_cpu_all();
-        disks.refresh(true);
         nets.refresh(true);
 
         // One timestamp for the whole tick, forced strictly monotonic so two
@@ -418,6 +494,32 @@ pub async fn run(
             .unwrap_or(0);
         let ts_ns = now.max(last_ts + 1);
         last_ts = ts_ns;
+
+        // Disk is gathered in a bounded blocking task BEFORE the line batch is
+        // built (statvfs blocks on an unresponsive mount): a dead NFS skips
+        // disk for this tick instead of wedging every collector.
+        let disk_samples = if want(Collector::Disk) {
+            match tokio::time::timeout(
+                Duration::from_secs(DISK_GATHER_TIMEOUT_SECS),
+                tokio::task::spawn_blocking(gather_disks),
+            )
+            .await
+            {
+                Ok(Ok(s)) => Some(s),
+                Ok(Err(_)) => {
+                    tracing::error!("disk gather task panicked; skipped this tick");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "disk gather timed out (an unresponsive mount?); skipped this tick"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let mut lines = String::new();
         let mut push = |r: Record| {
@@ -433,8 +535,8 @@ pub async fn run(
         if want(Collector::System) {
             push(system_record(&gather_system(&sys), &ctx, ts_ns));
         }
-        if want(Collector::Disk) {
-            for d in gather_disks(&disks) {
+        if let Some(samples) = disk_samples {
+            for d in samples {
                 push(disk_record(&d, &ctx, ts_ns));
             }
         }
@@ -550,6 +652,7 @@ mod tests {
             fstype: "ext4".to_string(),
             total: 1000,
             free: 250,
+            inodes: None,
         };
         // used = 750, used_percent = 75
         assert_eq!(
@@ -557,6 +660,52 @@ mod tests {
             "disk,device=/dev/sda1,fstype=ext4,host=h1,path=/,region=us-east \
              total=1000i,free=250i,used=750i,used_percent=75,deployment=\"prod\" 2\n"
         );
+    }
+
+    #[test]
+    fn disk_record_carries_inodes_when_present() {
+        let s = DiskSample {
+            device: "/dev/sda1".to_string(),
+            path: "/".to_string(),
+            fstype: "ext4".to_string(),
+            total: 1000,
+            free: 250,
+            inodes: Some(InodeStats {
+                total: 100,
+                free: 40,
+                used: 60,
+            }),
+        };
+        assert_eq!(
+            enc(disk_record(&s, &ctx(), 2)),
+            "disk,device=/dev/sda1,fstype=ext4,host=h1,path=/,region=us-east \
+             total=1000i,free=250i,used=750i,used_percent=75,\
+             inodes_total=100i,inodes_free=40i,inodes_used=60i,deployment=\"prod\" 2\n"
+        );
+    }
+
+    #[test]
+    fn inode_stats_from_zero_files_is_none() {
+        // A pseudo-filesystem reports 0 inodes — there is nothing to report.
+        assert!(inode_stats_from(0, 0).is_none());
+    }
+
+    #[test]
+    fn inode_stats_from_computes_used() {
+        let i = inode_stats_from(100, 40).expect("100 files is a real fs");
+        assert_eq!((i.total, i.free, i.used), (100, 40, 60));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inode_stats_reads_a_real_mount_without_crashing() {
+        // Exercises the real statvfs FFI — linking and struct layout. A real
+        // fs answers Some with a coherent count; a pseudo-fs answers None.
+        // Both are fine; the point is the call works and the numbers agree.
+        if let Some(i) = inode_stats(std::path::Path::new("/")) {
+            assert!(i.total >= i.free);
+            assert_eq!(i.used, i.total - i.free);
+        }
     }
 
     #[test]

@@ -326,7 +326,8 @@ entry cannot corrupt a series or emit a duplicate field key.
 
 Known gaps are honest, not hidden: `cpu` is `usage_idle`/`usage_active` only
 (`sysinfo` gives one usage percentage per core, not the user/system/iowait
-split — the `/proc/stat` breakdown is a follow-up); no disk inodes; `load*` is
+split — the `/proc/stat` breakdown is a follow-up); disk inodes are unix-only
+(`statvfs`; Windows has no inode concept); `load*` is
 zero on Windows, which has no load-average concept.
 
 ---
