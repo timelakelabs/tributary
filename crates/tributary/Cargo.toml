@@ -27,10 +27,24 @@ rustls-pemfile.workspace = true
 x509-parser.workspace = true
 prost = "0.14"
 
+# winlog links wevtapi through the `windows` crate; only a dependency when
+# building FOR windows AND with the feature on, so a Linux build — the
+# default target, feature on or off — never pulls it. Kept minimal: two
+# feature groups, not the whole Win32 surface.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.59", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_EventLog",
+] }
+
 [features]
 # journald links libsystemd (raw sd-journal FFI, no crate dep); OFF by
 # default so the standard build and CI on a plain runner stay dep-free.
 journald = []
+# winlog reads the Windows Event Log via wevtapi. OFF by default; the real
+# reader is also #[cfg(windows)], so `--features winlog` on Linux still
+# links nothing — the feature only bites when the target is windows.
+winlog = ["dep:windows"]
 
 [dev-dependencies]
 tempfile = "3"

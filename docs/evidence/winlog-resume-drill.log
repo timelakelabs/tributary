@@ -1,0 +1,19 @@
+=== Windows Event Log crash-exact resume drill (2026-08-25T23:58:56) ===
+exe=C:\project-time-lord-db\tributary\target\x86_64-pc-windows-gnu\debug\tributary.exe
+channel=System  N=20  workdir=C:\Users\rlcow\AppData\Local\Temp\winlog-drill-sls8d0jd
+
+-- reference: 40 events (oldest first), RecordIDs 3525..3564 --
+  [PASS] every reference event mapped to a line
+  [PASS] reference RecordIDs are unique
+
+-- run 1: read 20 events 3525..3544, bookmark saved --
+  [PASS] run 1 started fresh (no bookmark yet)  resuming=False
+  [PASS] run 1 read exactly N  got 20, want 20
+-- run 2: resumed, read 20 events 3545..3564 --
+  [PASS] run 2 resumed from the saved bookmark  resuming=True
+  [PASS] run 2 read exactly N  got 20, want 20
+  [PASS] no event read by BOTH runs (no dupe)  overlap=[]
+  [PASS] run 2 begins exactly where run 1 stopped (no gap)
+  [PASS] union covers the reference set exactly
+
+=== PASS: the bookmark is the checkpoint; resume is crash-exact ===

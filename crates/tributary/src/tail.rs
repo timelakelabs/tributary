@@ -17,10 +17,48 @@
 //! notices are missing.
 
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::checkpoint::{Checkpoint, FileMark};
+
+// The tailer identifies a file by `(dev, ino)` — POSIX inode identity, which
+// is what survives every rotation style (see the module doc). Windows has no
+// stable equivalent exposed on `Metadata` (`file_index`/`volume_serial_number`
+// are still unstable), and file tailing is not the Windows use case anyway —
+// the Windows source is the event log (`winlog`), which never touches this
+// module. So on non-unix targets this is a *best-effort* identity, present
+// only so the crate links: the creation time stands in for the inode (it
+// changes when a file is recreated at the same path, so a rename-and-recreate
+// is still seen as a new file) and the device is a constant.
+//
+// KNOWN LIMIT, not drilled: Windows file-system tunneling can preserve a
+// recreated file's creation time for ~15 s, so a very fast rotation can be
+// missed. A real Windows tailer would `GetFileInformationByHandle`; that is
+// out of scope for #11.
+#[cfg(not(unix))]
+trait MetadataExt {
+    fn dev(&self) -> u64;
+    fn ino(&self) -> u64;
+}
+#[cfg(not(unix))]
+impl MetadataExt for std::fs::Metadata {
+    fn dev(&self) -> u64 {
+        0
+    }
+    fn ino(&self) -> u64 {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            self.creation_time()
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    }
+}
 
 pub struct Open {
     pub dev: u64,

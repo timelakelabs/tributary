@@ -160,6 +160,63 @@ mid-run, restart, every entry delivered exactly once, none skipped or
 duplicated — by `bench/journald_resume_drill.sh` (evidence
 `docs/evidence/journald-resume-drill.log`).
 
+## Windows Event Log source (feature-gated)
+
+The Windows equivalent of the journal: on Windows, services log to Event Log
+channels (`System`, `Application`, …), not files. Build with the `winlog`
+feature — it links `wevtapi` through the `windows` crate — and declare a
+`parser = "winlog"` source whose `path` names the channel:
+
+```
+cargo build --release --features winlog     # links wevtapi (Windows only)
+
+[[source]]
+name   = "winsys"
+path   = "System"                 # the channel to read (path == channel here)
+table  = "eventlog"
+parser = "winlog"
+timestamp = { resolution = "us" } # events carry 100 ns time; us fills seq safely
+fields = { EventID = "string", Computer = "string" }
+tags   = ["Provider", "Channel"] # only NAMED fields become tags (FR-2)
+```
+
+Each event is rendered to XML, the kept fields are pulled out and mapped on the
+same map -> queue -> ship path a file tail uses, timestamped by the event's own
+`TimeCreated`. The resume token is the Windows **bookmark** — an opaque XML
+token persisted through the checkpoint, NOT an `EventRecordID` offset (records
+are purged and the channel wraps, so an offset can point at nothing; the
+bookmark survives that). A default build (no feature) links no `wevtapi` and
+refuses a winlog config at startup, and the reader is also `#[cfg(windows)]`, so
+`--features winlog` on Linux still links nothing — the feature only bites on a
+Windows target.
+
+**The Security channel** is not read by default and is called out on purpose:
+it needs elevation and carries audit weight, so name it explicitly
+(`path = "Security"`) and run the agent with the rights to read it.
+
+This machine has no MSVC toolchain, so the binary is **cross-compiled** from
+the Linux build container and **run on the Windows host**, where the real Event
+Log lives:
+
+```
+rustup target add x86_64-pc-windows-gnu
+apt-get install -y gcc-mingw-w64-x86-64
+cargo build --features winlog --target x86_64-pc-windows-gnu
+# copy target/x86_64-pc-windows-gnu/debug/tributary.exe to the host and run it
+```
+
+Crash-exact resume is drilled on the host against the real System channel —
+read the oldest 2N events one-shot, then read N + resume-from-bookmark N, and
+assert the split read equals the one-shot read (every event once, no gap, no
+dupe) — by `bench/winlog_resume_drill.py` (evidence
+`docs/evidence/winlog-resume-drill.log`). The drill drives the binary's
+`--winlog-dump` diagnostic, which runs the real reader and persists the
+bookmark through the ordinary `Checkpoint` path:
+
+```
+python bench\winlog_resume_drill.py --exe path\to\tributary.exe
+```
+
 ## The short version of why it exists
 
 Three properties of TimeLakeDB's write contract turn a naive log shipper
