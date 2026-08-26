@@ -291,6 +291,44 @@ tunable, and never silent"). The real risk in this state is a file
 rotating away before Tributary catches up, which is why
 `tributary_checkpoint_lag_bytes` is the metric to alert on.
 
+### 4.6 Host metrics (Telegraf compatibility)
+
+A `[metrics]` collector (#25) makes Tributary a Telegraf replacement for the
+host-metrics half of an InfluxDB migration, not only the log half. It samples
+the machine every `interval` through `sysinfo` — one cross-platform reader —
+and emits Telegraf's `system` input family: `cpu`, `mem`, `disk`, `net`,
+`system`, `swap`. The point is **schema fidelity**: the measurement, field and
+tag names are Telegraf's exact strings (`used_percent`, `usage_idle`, tag
+`host`, tag value `cpu-total`), because a Grafana panel keys on those literals
+and one rename blanks it with no error. The mapping is a set of pure
+`sample -> Record` functions whose output is pinned by golden-string tests, so
+a rename fails review instead of a dashboard.
+
+The collector is its own pipeline — its own queue and shipper — feeding the
+same durable `Queue -> Shipper` path (§4.4–4.5) a source uses. Two properties
+differ from a log source and are deliberate:
+
+- **One timestamp per tick.** All rows a tick produces share the tick's
+  timestamp. The §3.1 disambiguator is a log defence (many records on one
+  stream at one instant); applying it here would push `cpu0` a nanosecond off
+  `cpu-total` and break the time-alignment a dashboard depends on. Distinct
+  series (a different `cpu`/`device`/`interface` tag) are already distinct
+  primary keys, so there is nothing to disambiguate.
+- **Counters stay cumulative.** `net`/`disk` byte and packet counters are
+  emitted as read; the dashboard takes the derivative. (`sysinfo` counts from
+  first observation rather than boot, but the derivative is identical.)
+
+`global_tags`/`static_fields` are the "add your own fields" half of the
+request — constant tags and fields stamped on every row (the Telegraf
+`[global_tags]` equivalent), mirroring a source's `tags_static`. Neither can
+override the `host` tag, a structural tag, or a real metric field, so a stray
+entry cannot corrupt a series or emit a duplicate field key.
+
+Known gaps are honest, not hidden: `cpu` is `usage_idle`/`usage_active` only
+(`sysinfo` gives one usage percentage per core, not the user/system/iowait
+split — the `/proc/stat` breakdown is a follow-up); no disk inodes; `load*` is
+zero on Windows, which has no load-average concept.
+
 ---
 
 ## 5. Configuration

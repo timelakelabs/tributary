@@ -15,6 +15,7 @@ mod journald;
 mod logfile;
 mod lp;
 mod map;
+mod metrics;
 mod multiline;
 mod otlp;
 mod queue;
@@ -176,10 +177,11 @@ async fn main() -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&args.state_dir)?;
 
-    // OTLP-only agent: no file to tail, only the push receiver. (A config
-    // with BOTH runs the receiver alongside the tail, spawned below.)
+    // Sourceless agent: no file to tail — a push receiver, a metrics
+    // collector, or both. (A config WITH a source runs these alongside the
+    // tail, spawned below.)
     if cfg.sources.is_empty() {
-        return run_otlp_only(cfg, &args).await;
+        return run_sourceless(cfg, &args).await;
     }
     let source = cfg
         .sources
@@ -234,6 +236,11 @@ async fn main() -> anyhow::Result<()> {
         // finds out from an empty dashboard days later.
         server::serve(addr, std::sync::Arc::clone(&tel)).await?;
     }
+
+    // #25: a metrics collector, if configured, runs alongside the source as
+    // its own independent pipeline. Spawned before the journald/winlog early
+    // returns so it runs regardless of which source path this config takes.
+    spawn_metrics(&cfg, &args)?;
 
     // #23: a journald source reads the journal via the sd-journal cursor, not
     // a file — its own pull loop, reusing this shipper and the same
@@ -610,18 +617,13 @@ async fn main() -> anyhow::Result<()> {
 /// telemetry, then run the OTLP receiver until shutdown. Durability is the
 /// receiver's queue, replayed on the next start; there is no file checkpoint
 /// because a push source has no file offset to resume from.
-async fn run_otlp_only(cfg: config::Config, args: &Args) -> anyhow::Result<()> {
-    let otlp = cfg
-        .otlp
-        .as_ref()
-        .expect("load() guarantees [otlp] when there is no source");
+async fn run_sourceless(cfg: config::Config, args: &Args) -> anyhow::Result<()> {
     let shipper = build_shipper(&cfg.output)?;
     tracing::info!(
         authenticated = shipper.is_authenticated(),
         client_identity = shipper.client_identity().unwrap_or_else(|| "none".into()),
         url = %cfg.output.url,
-        listen = %otlp.listen,
-        "OTLP-only agent shipping to TimeLakeDB"
+        "sourceless agent shipping to TimeLakeDB"
     );
     let tel = telemetry::Telemetry::new(shipper.counters.clone());
     if let Some(t) = &cfg.telemetry {
@@ -630,14 +632,50 @@ async fn run_otlp_only(cfg: config::Config, args: &Args) -> anyhow::Result<()> {
         })?;
         server::serve(addr, std::sync::Arc::clone(&tel)).await?;
     }
-    otlp::run(
-        otlp.clone(),
-        args.state_dir.clone(),
-        cfg.output.queue_max_bytes,
-        tel,
-        shipper,
-    )
-    .await
+
+    // The collector, if configured, is its own pipeline with its own shipper.
+    spawn_metrics(&cfg, args)?;
+
+    match &cfg.otlp {
+        Some(otlp) => {
+            otlp::run(
+                otlp.clone(),
+                args.state_dir.clone(),
+                cfg.output.queue_max_bytes,
+                tel,
+                shipper,
+            )
+            .await
+        }
+        // Metrics-only: nothing to serve or tail. The collector runs in its
+        // spawned task; park here until a stop signal so the process stays up.
+        None => {
+            tracing::info!("metrics-only agent; collecting until shutdown");
+            let _ = tokio::signal::ctrl_c().await;
+            Ok(())
+        }
+    }
+}
+
+/// Spawn the host-metrics collector (#25) if `[metrics]` is configured. Its
+/// own shipper and queue make it independent of whatever source pipeline the
+/// caller is running; a collector failure logs and stops that task alone.
+fn spawn_metrics(cfg: &config::Config, args: &Args) -> anyhow::Result<()> {
+    if let Some(m) = &cfg.metrics {
+        let shipper = build_shipper(&cfg.output)?;
+        let run = metrics::run(
+            m.clone(),
+            args.state_dir.clone(),
+            cfg.output.queue_max_bytes,
+            shipper,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = run.await {
+                tracing::error!(error = %e, "metrics collector stopped");
+            }
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn build_shipper(output: &config::Output) -> anyhow::Result<ship::Shipper> {

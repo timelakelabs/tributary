@@ -20,6 +20,11 @@ pub struct Config {
     /// agent as before. Present = a push endpoint on its own port.
     #[serde(default)]
     pub otlp: Option<Otlp>,
+    /// Host-metrics collector (#25). Absent = no metrics, a log-only agent
+    /// exactly as before. Present = Telegraf-shaped cpu/mem/disk/net/system/
+    /// swap sampled on an interval and shipped like any other data.
+    #[serde(default)]
+    pub metrics: Option<Metrics>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -361,8 +366,13 @@ impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Config> {
         let text = std::fs::read_to_string(path)?;
         let cfg: Config = toml::from_str(&text)?;
-        if cfg.sources.is_empty() && cfg.otlp.is_none() {
-            anyhow::bail!("nothing to do: configure at least one [[source]] or an [otlp] receiver");
+        if cfg.sources.is_empty() && cfg.otlp.is_none() && cfg.metrics.is_none() {
+            anyhow::bail!(
+                "nothing to do: configure at least one [[source]], an [otlp] receiver, or [metrics]"
+            );
+        }
+        if let Some(m) = &cfg.metrics {
+            m.validate()?;
         }
         if let Some(o) = &cfg.otlp {
             if o.listen.trim().is_empty() {
@@ -495,6 +505,86 @@ impl Otlp {
     }
 }
 
+/// A constant value for `[metrics.static_fields]`. TOML's own scalar types
+/// map straight onto a line-protocol field type — an untagged enum so
+/// `deployment = "prod"`, `weight = 3`, `ratio = 0.5`, `canary = true` each
+/// land as the type they look like. Order matters for `serde(untagged)`:
+/// bool and integer are tried before float and string so `3` stays an
+/// integer field (`3i`), not a float.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum FieldValue {
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    Str(String),
+}
+
+/// Host-metrics collector (#25). Samples the machine every `interval` and
+/// writes Telegraf's measurements (`cpu`/`mem`/`disk`/`net`/`system`/`swap`)
+/// with Telegraf's exact names, so dashboards survive a migration off
+/// InfluxDB + Telegraf. `global_tags`/`static_fields` are the "add your own
+/// fields" half — stamped on every point (mirrors [`Source::tags_static`]).
+#[derive(Debug, Deserialize, Clone)]
+pub struct Metrics {
+    #[serde(default = "default_metrics_interval")]
+    pub interval: String,
+    #[serde(default = "default_collectors")]
+    pub collectors: Vec<String>,
+    /// The `host` tag value. Absent = the OS hostname.
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub global_tags: BTreeMap<String, String>,
+    #[serde(default)]
+    pub static_fields: BTreeMap<String, FieldValue>,
+}
+
+fn default_metrics_interval() -> String {
+    "10s".into()
+}
+fn default_collectors() -> Vec<String> {
+    ["cpu", "mem", "disk", "net", "system", "swap"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// The collectors this build knows how to run. A name outside this set is a
+/// typo worth refusing at startup, not a silently ignored line in a config.
+pub const KNOWN_COLLECTORS: [&str; 6] = ["cpu", "mem", "disk", "net", "system", "swap"];
+
+impl Metrics {
+    pub fn interval_parsed(&self) -> anyhow::Result<std::time::Duration> {
+        crate::logfile::parse_duration(&self.interval).ok_or_else(|| {
+            anyhow::anyhow!(
+                "[metrics].interval {:?} is not a duration like 10s or 1m",
+                self.interval
+            )
+        })
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.interval_parsed()?;
+        if self.collectors.is_empty() {
+            anyhow::bail!(
+                "[metrics].collectors is empty — omit the [metrics] section to disable metrics, \
+                 or name at least one of: {}",
+                KNOWN_COLLECTORS.join(", ")
+            );
+        }
+        for c in &self.collectors {
+            if !KNOWN_COLLECTORS.contains(&c.as_str()) {
+                anyhow::bail!(
+                    "[metrics].collectors has unknown collector {c:?}; known: {}",
+                    KNOWN_COLLECTORS.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +624,46 @@ mod tests {
             err.to_string().contains("source") || err.to_string().contains("otlp"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn a_metrics_only_config_is_valid_without_a_source() {
+        let cfg = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [metrics]\ninterval = \"5s\"\n\n\
+             [metrics.global_tags]\nregion = \"us-east\"\n\n\
+             [metrics.static_fields]\ndeployment = \"prod\"\nweight = 3\nratio = 0.5\n",
+        )
+        .expect("a metrics-only agent is a valid configuration");
+        let m = cfg.metrics.expect("metrics present");
+        assert_eq!(m.interval, "5s");
+        // Untagged FieldValue keeps TOML's types apart.
+        assert_eq!(
+            m.static_fields["deployment"],
+            FieldValue::Str("prod".into())
+        );
+        assert_eq!(m.static_fields["weight"], FieldValue::Integer(3));
+        assert_eq!(m.static_fields["ratio"], FieldValue::Float(0.5));
+    }
+
+    #[test]
+    fn an_unknown_collector_is_refused() {
+        let err = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [metrics]\ncollectors = [\"cpu\", \"gpu\"]\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("gpu"), "got: {err}");
+    }
+
+    #[test]
+    fn a_bad_metrics_interval_is_refused_at_load() {
+        let err = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [metrics]\ninterval = \"soon\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("interval"), "got: {err}");
     }
 }
 
