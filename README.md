@@ -274,6 +274,26 @@ TimeLakeDB's last-write-wins collapses the replay instead of double-counting.
 Like filter, a sampled-out record is dropped **before the watermark counts it**
 and tallied in `tributary_records_dropped_total{stage="sample"}`.
 
+## Redacting secrets (redact)
+
+A `[[source.redact]]` regex-replaces a value inside a string field **before the
+record is ever written durably** — the queue, the checkpoint, everything. A
+password or token that lands in a log line never leaves the host in the clear:
+
+```toml
+[[source.redact]]
+field       = "message"
+pattern     = '(password=)\S+'   # a TOML literal string (single quotes) needs
+replacement = '$1***'            # no backslash escaping; $1 keeps the prefix
+```
+
+That turns `password=hunter2` into `password=***`. The regex is compiled and
+validated at startup, so a bad pattern is a config error, not a first-match
+surprise. Two honest limits: redaction is best-effort pattern matching —
+defence in depth, not a guarantee the app can't log a secret in a shape the
+pattern misses (the real answer to that is not logging it) — and it operates on
+**string fields only**, since a numeric field has no substring to scrub.
+
 ## Host metrics (Telegraf-compatible)
 
 For a migration off InfluxDB + Telegraf: sample the machine on an interval and

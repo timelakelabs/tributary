@@ -203,6 +203,10 @@ async fn main() -> anyhow::Result<()> {
         .first()
         .expect("load() guarantees a source when there is no [otlp]");
 
+    // Compile the redaction regexes once (#44) — config validation already
+    // checked they parse, so this does not fail in practice.
+    let redacts = transform::compile_redacts(&source.redact)?;
+
     let cp_path = Checkpoint::path_for(&args.state_dir, &source.name);
     let restored = Checkpoint::load(&cp_path)?;
 
@@ -396,7 +400,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             read_total += 1;
-            match build(source, &line, &mut stamper, &mut pipe.watermark) {
+            match build(source, &line, &mut stamper, &mut pipe.watermark, &redacts) {
                 Ok(Built::Ready(record, source_ts)) => {
                     let mut encoded = String::new();
                     if record.encode(&mut encoded).is_ok() {
@@ -424,7 +428,7 @@ async fn main() -> anyhow::Result<()> {
         // The last record in a quiet file has no successor to close it.
         if let Some(line) = framer.expire() {
             read_total += 1;
-            match build(source, &line, &mut stamper, &mut pipe.watermark) {
+            match build(source, &line, &mut stamper, &mut pipe.watermark, &redacts) {
                 Ok(Built::Ready(record, source_ts)) => {
                     let mut encoded = String::new();
                     if record.encode(&mut encoded).is_ok() {
@@ -557,7 +561,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     while let Some(line) = framer.drain() {
-        match build(source, &line, &mut stamper, &mut pipe.watermark) {
+        match build(source, &line, &mut stamper, &mut pipe.watermark, &redacts) {
             Ok(Built::Ready(record, source_ts)) => {
                 let mut encoded = String::new();
                 if record.encode(&mut encoded).is_ok() {
@@ -907,6 +911,7 @@ fn run_winlog_dump(raw: &[String]) -> anyhow::Result<()> {
             multiline: None,
             filter: Vec::new(),
             sample: Vec::new(),
+            redact: Vec::new(),
         };
 
         let cp_path = Checkpoint::path_for(&state_dir, &stream);
@@ -989,6 +994,7 @@ fn build(
     line: &str,
     stamper: &mut stamp::Stamper,
     wm: &mut watermark::Watermark,
+    redacts: &[transform::CompiledRedact],
 ) -> anyhow::Result<Built> {
     match map::map_line(source, line) {
         Ok((mut record, source_ts)) => {
@@ -1005,6 +1011,10 @@ fn build(
             if !transform::sample_keeps(&record, source_ts, &source.sample) {
                 return Ok(Built::Dropped(DropStage::Sample));
             }
+            // Redact (#44): scrub matched values in string fields BEFORE the
+            // record is encoded and queued, so a secret never reaches the queue,
+            // the checkpoint, or anything durable — only the redacted form does.
+            transform::apply_redacts(&mut record, redacts);
             wm.observe(source_ts);
             record.ts_ns = stamper
                 .stamp(source_ts)

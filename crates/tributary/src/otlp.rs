@@ -496,6 +496,7 @@ mod tests {
             multiline: None,
             filter: Vec::new(),
             sample: Vec::new(),
+            redact: Vec::new(),
         }
     }
 
