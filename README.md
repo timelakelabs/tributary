@@ -41,7 +41,7 @@ rather than a Vector configuration.
 Each release attaches a `.deb` and an `.rpm` built from that tag.
 
 ```bash
-VER=0.2.0
+VER=0.3.0
 
 # Debian / Ubuntu
 curl -LO https://github.com/timelakelabs/tributary/releases/latest/download/tributary_${VER}_amd64.deb
