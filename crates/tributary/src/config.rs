@@ -287,6 +287,12 @@ pub struct Source {
     /// crash-resumed tail re-decides the same way.
     #[serde(default)]
     pub sample: Vec<Sample>,
+
+    /// Transform stage (#44): regex-replace a value inside a string field
+    /// before the record is ever written durably, so a secret in a log line
+    /// never leaves the host.
+    #[serde(default)]
+    pub redact: Vec<Redact>,
 }
 
 /// A sample rule for the transform stage (#43). With `field`/`equals` it
@@ -300,6 +306,23 @@ pub struct Sample {
     #[serde(default)]
     pub equals: Option<String>,
     pub rate: u64,
+}
+
+/// A redaction rule for the transform stage (#44). In the STRING field named
+/// `field`, every match of `pattern` (a regex) is replaced by `replacement`.
+/// `replacement` may reference capture groups (`$1`), so `pattern =
+/// "(password=)\\S+"` with `replacement = "$1***"` keeps the key and scrubs
+/// the value. The regex is compiled and validated at load.
+#[derive(Debug, Deserialize, Clone)]
+pub struct Redact {
+    pub field: String,
+    pub pattern: String,
+    #[serde(default = "default_redaction")]
+    pub replacement: String,
+}
+
+fn default_redaction() -> String {
+    "***".to_string()
 }
 
 /// A drop rule for the transform stage (#42). Matches a mapped tag OR field
@@ -498,6 +521,21 @@ impl Config {
                     );
                 }
             }
+            for rd in &s.redact {
+                if rd.field.trim().is_empty() {
+                    anyhow::bail!(
+                        "source '{}': a [[source.redact]] needs a non-empty `field`",
+                        s.name
+                    );
+                }
+                if let Err(e) = regex::Regex::new(&rd.pattern) {
+                    anyhow::bail!(
+                        "source '{}': a [[source.redact]] pattern {:?} is not a valid regex: {e}",
+                        s.name,
+                        rd.pattern
+                    );
+                }
+            }
         }
         Ok(cfg)
     }
@@ -562,6 +600,7 @@ impl Otlp {
             multiline: None,
             filter: Vec::new(),
             sample: Vec::new(),
+            redact: Vec::new(),
         }
     }
 }
@@ -794,6 +833,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("rate"), "got: {err}");
+    }
+
+    #[test]
+    fn a_source_redact_parses_and_a_bad_regex_is_refused() {
+        let cfg = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [[source]]\nname = \"app\"\npath = \"/var/log/app.log\"\ntable = \"logs\"\n\n\
+             [[source.redact]]\nfield = \"message\"\npattern = \"secret=.*\"\nreplacement = \"***\"\n",
+        )
+        .expect("a well-formed redact parses");
+        let rd = &cfg.sources[0].redact;
+        assert_eq!(rd.len(), 1);
+        assert_eq!(rd[0].field, "message");
+        assert_eq!(rd[0].replacement, "***");
+
+        let err = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [[source]]\nname = \"app\"\npath = \"/var/log/app.log\"\ntable = \"logs\"\n\n\
+             [[source.redact]]\nfield = \"message\"\npattern = \"(unclosed\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("regex"), "got: {err}");
     }
 
     #[test]

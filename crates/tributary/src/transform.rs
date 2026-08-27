@@ -6,8 +6,9 @@
 //! raw text — and BEFORE the watermark counts the record, so a dropped record
 //! is never claimed as arrived and the completeness guarantee stays honest.
 
-use crate::config::{Filter, Sample};
+use crate::config::{Filter, Redact, Sample};
 use crate::lp::{Record, Value};
+use regex::Regex;
 
 /// Whether a record survives the filter rules (#42). `drop = true` rules form a
 /// deny-list (a match removes the record); `drop = false` rules form an
@@ -121,6 +122,54 @@ impl Fnv {
     fn byte(&mut self, b: u8) {
         self.0 ^= b as u64;
         self.0 = self.0.wrapping_mul(0x100000001b3);
+    }
+}
+
+/// A compiled redaction rule (#44): the field to scrub, its compiled regex, and
+/// the replacement. Compiled once per source at startup, not per record.
+pub struct CompiledRedact {
+    field: String,
+    regex: Regex,
+    replacement: String,
+}
+
+/// Compile a source's redaction rules. Fails on a bad regex — but config
+/// validation already compiled every pattern at load, so at startup this only
+/// re-checks (a bad one is a startup error, never a runtime surprise).
+pub fn compile_redacts(rules: &[Redact]) -> anyhow::Result<Vec<CompiledRedact>> {
+    rules
+        .iter()
+        .map(|r| {
+            Ok(CompiledRedact {
+                field: r.field.clone(),
+                regex: Regex::new(&r.pattern)?,
+                replacement: r.replacement.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Replace every match of each rule's regex inside its named STRING field, in
+/// place (#44). This runs BEFORE the record is encoded and queued, so the
+/// original value never reaches the queue, the checkpoint, or anything durable
+/// — only the redacted form does. `replacement` supports `$1` capture-group
+/// references. Non-string fields have no substring to scrub and are left alone.
+pub fn apply_redacts(record: &mut Record, redacts: &[CompiledRedact]) {
+    for rd in redacts {
+        for (k, v) in record.fields.iter_mut() {
+            if k != &rd.field {
+                continue;
+            }
+            // Only string fields have a substring to scrub.
+            let Value::Str(s) = v else { continue };
+            // Cow::Owned only when something actually matched — a non-matching
+            // value is left untouched (and unallocated).
+            if let std::borrow::Cow::Owned(scrubbed) =
+                rd.regex.replace_all(s, rd.replacement.as_str())
+            {
+                *s = scrubbed;
+            }
+        }
     }
 }
 
@@ -259,5 +308,68 @@ mod tests {
                 &rules
             ));
         }
+    }
+
+    fn redacts(field: &str, pattern: &str, replacement: &str) -> Vec<CompiledRedact> {
+        compile_redacts(&[Redact {
+            field: field.to_string(),
+            pattern: pattern.to_string(),
+            replacement: replacement.to_string(),
+        }])
+        .expect("valid regex")
+    }
+
+    #[test]
+    fn redact_scrubs_a_matching_string_field() {
+        let rds = redacts("message", r"password=\S+", "password=***");
+        let mut r = rec(
+            &[],
+            &[("message", Value::Str("user=bob password=hunter2 ok".into()))],
+        );
+        apply_redacts(&mut r, &rds);
+        assert_eq!(r.fields[0].1, Value::Str("user=bob password=*** ok".into()));
+    }
+
+    #[test]
+    fn redact_keeps_a_prefix_with_a_capture_group() {
+        let rds = redacts("message", r"(token=)\S+", "$1***");
+        let mut r = rec(&[], &[("message", Value::Str("token=abc123".into()))]);
+        apply_redacts(&mut r, &rds);
+        assert_eq!(r.fields[0].1, Value::Str("token=***".into()));
+    }
+
+    #[test]
+    fn the_secret_never_reaches_the_encoded_record() {
+        // The grep-the-queue proof at unit level: the queue holds ENCODED
+        // records, so redact + encode must leave no trace of the secret.
+        let rds = redacts("msg", r"secret-\w+", "***");
+        let mut r = rec(
+            &[("host", "n1")],
+            &[("msg", Value::Str("saw secret-hunter2 here".into()))],
+        );
+        apply_redacts(&mut r, &rds);
+        let mut encoded = String::new();
+        r.encode(&mut encoded).unwrap();
+        assert!(
+            !encoded.contains("secret-hunter2"),
+            "secret leaked into the encoded record: {encoded}"
+        );
+        assert!(encoded.contains("***"));
+    }
+
+    #[test]
+    fn redact_leaves_a_non_string_field_alone() {
+        let rds = redacts("code", r"\d+", "X");
+        let mut r = rec(&[], &[("code", Value::Int(500))]);
+        apply_redacts(&mut r, &rds);
+        assert_eq!(r.fields[0].1, Value::Int(500));
+    }
+
+    #[test]
+    fn a_non_matching_value_is_untouched() {
+        let rds = redacts("message", r"password=\S+", "***");
+        let mut r = rec(&[], &[("message", Value::Str("nothing sensitive".into()))]);
+        apply_redacts(&mut r, &rds);
+        assert_eq!(r.fields[0].1, Value::Str("nothing sensitive".into()));
     }
 }
