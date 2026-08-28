@@ -162,7 +162,7 @@ pub struct Telemetry {
 ///   server verifies in want mode. Both or neither; one alone is a
 ///   configuration mistake worth refusing at startup rather than
 ///   discovering as a handshake failure.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 pub struct Tls {
     /// PEM CA bundle used to verify the server. A bundle, not one
     /// certificate: dual-CA overlap is how the server rotates its trust
@@ -338,7 +338,7 @@ pub struct Filter {
     pub drop: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 pub struct Multiline {
     /// A line matching this begins a record; anything else continues the
     /// one above it.
@@ -392,7 +392,7 @@ pub enum FieldType {
     Boolean,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 pub struct Timestamp {
     /// Parsed key holding the timestamp. Absent means "stamp on read".
     #[serde(default)]

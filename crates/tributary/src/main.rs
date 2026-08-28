@@ -203,9 +203,14 @@ async fn main() -> anyhow::Result<()> {
         .first()
         .expect("load() guarantees a source when there is no [otlp]");
 
-    // Compile the redaction regexes once (#44) — config validation already
-    // checked they parse, so this does not fail in practice.
-    let redacts = transform::compile_redacts(&source.redact)?;
+    // The transform stage (#42/#43/#44) is the reloadable part of the source
+    // (#10): held in its own locals, not read off `source`, so a SIGHUP can
+    // swap the rules on the running tail while the source's identity and
+    // schema stay frozen. Compiled once here — config validation already
+    // checked the regexes parse, so this does not fail in practice.
+    let mut filters = source.filter.clone();
+    let mut samples = source.sample.clone();
+    let mut redacts = transform::compile_redacts(&source.redact)?;
 
     let cp_path = Checkpoint::path_for(&args.state_dir, &source.name);
     let restored = Checkpoint::load(&cp_path)?;
@@ -347,10 +352,14 @@ async fn main() -> anyhow::Result<()> {
     let mut last_rpo_report = Instant::now();
     // 0 means off. Without this it would mean "every loop iteration", which
     // is a very effective way to make an operator turn the log off entirely.
-    let rpo_every = match cfg.output.rpo_report_secs {
+    let mut rpo_every = match cfg.output.rpo_report_secs {
         0 => Duration::from_secs(u64::MAX),
         n => Duration::from_secs(n),
     };
+    // #10: the reloadable output knobs, held as locals so a SIGHUP can retune
+    // them on the running tail (the loop reads these, not cfg.output).
+    let mut batch_lines = cfg.output.batch_lines;
+    let mut watermark_every = cfg.output.watermark_every_secs;
     let mut last_cert_check = Instant::now();
     let cert_refresh_every = Duration::from_secs(
         cfg.output
@@ -359,6 +368,31 @@ async fn main() -> anyhow::Result<()> {
             .map(|t| t.refresh_secs)
             .unwrap_or(u64::MAX),
     );
+
+    // #10 (T-5): SIGHUP requests a config reload. A dedicated listener sets a
+    // flag the loop drains once per pass — the same shape as the L4 cert check
+    // below, so a reload cannot race the shutdown or checkpoint path and a
+    // burst of HUPs collapses to one reload. Unix only: there is no SIGHUP on
+    // Windows (a winlog agent restarts via its service manager), and the flag
+    // simply never sets there.
+    let reload_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        let flag = std::sync::Arc::clone(&reload_flag);
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut hup = match signal(SignalKind::hangup()) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(error = %e, "could not install SIGHUP handler — config reload disabled");
+                    return;
+                }
+            };
+            while hup.recv().await.is_some() {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
 
     let shutdown = async {
         #[cfg(unix)]
@@ -400,7 +434,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             read_total += 1;
-            match build(source, &line, &mut stamper, &mut pipe.watermark, &redacts) {
+            match build(
+                source,
+                &line,
+                &mut stamper,
+                &mut pipe.watermark,
+                &filters,
+                &samples,
+                &redacts,
+            ) {
                 Ok(Built::Ready(record, source_ts)) => {
                     let mut encoded = String::new();
                     if record.encode(&mut encoded).is_ok() {
@@ -419,7 +461,7 @@ async fn main() -> anyhow::Result<()> {
             pipe.read_ns += t_read.elapsed().as_nanos() as u64;
             // Never record progress past a half-assembled record: a
             // crash would resume after its lines and lose it.
-            if batch.len() >= cfg.output.batch_lines && !framer.has_pending() {
+            if batch.len() >= batch_lines && !framer.has_pending() {
                 flush(&mut pipe, &mut batch, &mut batch_max_ts).await?;
                 last_flush = Instant::now();
             }
@@ -428,7 +470,15 @@ async fn main() -> anyhow::Result<()> {
         // The last record in a quiet file has no successor to close it.
         if let Some(line) = framer.expire() {
             read_total += 1;
-            match build(source, &line, &mut stamper, &mut pipe.watermark, &redacts) {
+            match build(
+                source,
+                &line,
+                &mut stamper,
+                &mut pipe.watermark,
+                &filters,
+                &samples,
+                &redacts,
+            ) {
                 Ok(Built::Ready(record, source_ts)) => {
                     let mut encoded = String::new();
                     if record.encode(&mut encoded).is_ok() {
@@ -454,7 +504,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Publish the completeness claim as ordinary rows, so a dashboard
         // can tell "this window is empty" from "not complete yet".
-        if last_wm_write.elapsed() >= Duration::from_secs(cfg.output.watermark_every_secs) {
+        if last_wm_write.elapsed() >= Duration::from_secs(watermark_every) {
             write_watermark(&mut pipe, &cfg, &source.name).await?;
             last_wm_write = Instant::now();
         }
@@ -546,6 +596,29 @@ async fn main() -> anyhow::Result<()> {
             last_cert_check = Instant::now();
         }
 
+        // #10 (T-5): a SIGHUP asked for a reload. Drain the flag and apply —
+        // validate-before-swap: a new file that fails to load or validate is
+        // refused and the last-good config keeps running, exactly like the
+        // credential reload above. The checkpoint and queue are untouched; the
+        // in-flight batch finishes on the old rules.
+        if reload_flag.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            reload_config(
+                &args.config,
+                source,
+                &cfg,
+                &mut Reloadable {
+                    filters: &mut filters,
+                    samples: &mut samples,
+                    redacts: &mut redacts,
+                    batch_lines: &mut batch_lines,
+                    watermark_every: &mut watermark_every,
+                    max_inflight: &mut pipe.max_inflight,
+                    rpo_every: &mut rpo_every,
+                },
+                &tel,
+            );
+        }
+
         if idle {
             if args.once && pipe.queue.is_empty() {
                 break;
@@ -561,7 +634,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     while let Some(line) = framer.drain() {
-        match build(source, &line, &mut stamper, &mut pipe.watermark, &redacts) {
+        match build(
+            source,
+            &line,
+            &mut stamper,
+            &mut pipe.watermark,
+            &filters,
+            &samples,
+            &redacts,
+        ) {
             Ok(Built::Ready(record, source_ts)) => {
                 let mut encoded = String::new();
                 if record.encode(&mut encoded).is_ok() {
@@ -994,6 +1075,11 @@ fn build(
     line: &str,
     stamper: &mut stamp::Stamper,
     wm: &mut watermark::Watermark,
+    // #10: the transform rules are passed in rather than read off `source`, so
+    // a SIGHUP reload can swap filter/sample/redact live. `source` still owns
+    // the frozen half — mapping, tags, schema — which a reload does not touch.
+    filters: &[config::Filter],
+    samples: &[config::Sample],
     redacts: &[transform::CompiledRedact],
 ) -> anyhow::Result<Built> {
     match map::map_line(source, line) {
@@ -1002,13 +1088,13 @@ fn build(
             // observes this timestamp. Dropping after observe would make the
             // watermark claim arrival for data deliberately thrown away — the
             // completeness guarantee quietly lying (#7).
-            if !transform::keeps(&record, &source.filter) {
+            if !transform::keeps(&record, filters) {
                 return Ok(Built::Dropped(DropStage::Filter));
             }
             // Sample (#43) also runs before observe — a sampled-out record is
             // not arrived. Deterministic on the record's identity, so a resume
             // re-decides the same and LWW collapses the replay.
-            if !transform::sample_keeps(&record, source_ts, &source.sample) {
+            if !transform::sample_keeps(&record, source_ts, samples) {
                 return Ok(Built::Dropped(DropStage::Sample));
             }
             // Redact (#44): scrub matched values in string fields BEFORE the
@@ -1024,6 +1110,202 @@ fn build(
         Err(map::MapError::Empty) => Ok(Built::Empty),
         Err(e) => Err(anyhow::anyhow!(e.to_string())),
     }
+}
+
+/// The reloadable slice of the running file-tail pipeline (#10, T-5).
+/// Everything reachable through here can change on a SIGHUP without dropping
+/// the tail; everything the reload does NOT touch — the source's identity and
+/// schema, the output endpoint, TLS, the queue, bound listeners — needs a
+/// restart, and a change to one is reported so it is visible, not silently
+/// ignored.
+struct Reloadable<'a> {
+    filters: &'a mut Vec<config::Filter>,
+    samples: &'a mut Vec<config::Sample>,
+    redacts: &'a mut Vec<transform::CompiledRedact>,
+    batch_lines: &'a mut usize,
+    watermark_every: &'a mut u64,
+    max_inflight: &'a mut usize,
+    rpo_every: &'a mut Duration,
+}
+
+/// What a reload did: the knobs it applied, and the fields that changed but
+/// need a restart to take effect.
+#[derive(Default)]
+struct ReloadReport {
+    applied: Vec<String>,
+    restart_required: Vec<String>,
+}
+
+/// Re-read the config and apply what can change live. Never fails the agent:
+/// a file that will not load or validate is REFUSED, counted, and the running
+/// config is left exactly as it was — the same contract as the L4 credential
+/// reload.
+fn reload_config(
+    path: &std::path::Path,
+    source: &config::Source,
+    current: &config::Config,
+    r: &mut Reloadable,
+    tel: &telemetry::Telemetry,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let new = match Config::load(path) {
+        Ok(c) => c,
+        Err(e) => {
+            tel.config_reloads_refused.fetch_add(1, Relaxed);
+            tel.config_last_reload_ok.store(false, Relaxed);
+            tracing::error!(
+                error = %e, path = %path.display(),
+                "config reload REFUSED — the new file failed to load or validate; keeping the last-good config"
+            );
+            return;
+        }
+    };
+    match apply_reload(source, current, new, r) {
+        Ok(report) => {
+            tel.config_reloads.fetch_add(1, Relaxed);
+            tel.config_last_reload_ok.store(true, Relaxed);
+            if report.restart_required.is_empty() {
+                tracing::info!(applied = ?report.applied, "config reloaded");
+            } else {
+                tracing::warn!(
+                    applied = ?report.applied,
+                    restart_required = ?report.restart_required,
+                    "config reloaded — the listed changes need a restart to take effect; still running the previous values for those"
+                );
+            }
+        }
+        Err(e) => {
+            // Loaded and validated, but a hot-swap piece (a redaction regex)
+            // would not compile. Refuse rather than half-apply.
+            tel.config_reloads_refused.fetch_add(1, Relaxed);
+            tel.config_last_reload_ok.store(false, Relaxed);
+            tracing::error!(error = %e, "config reload REFUSED after load — keeping the last-good config");
+        }
+    }
+}
+
+/// The pure half of a reload: diff the loaded config against what is running
+/// and mutate the reloadable state. Split from the I/O so it is unit-testable.
+/// The transform rules swap only when the source's IDENTITY (name/path/parser)
+/// is unchanged — a different source is a restart, not a live re-tail. That is
+/// the #10 trap: never re-seek a tail the change did not actually touch.
+fn apply_reload(
+    source: &config::Source,
+    current: &config::Config,
+    new: Config,
+    r: &mut Reloadable,
+) -> anyhow::Result<ReloadReport> {
+    let mut report = ReloadReport::default();
+
+    match new.sources.into_iter().next() {
+        None => report
+            .restart_required
+            .push("the source was removed".into()),
+        Some(ns) => {
+            let same_source =
+                ns.name == source.name && ns.path == source.path && ns.parser == source.parser;
+            if !same_source {
+                report
+                    .restart_required
+                    .push("source identity (name/path/parser)".into());
+            } else {
+                // Validate-before-swap: compile the NEW redacts first. A bad
+                // regex refuses the whole reload (propagated up), so nothing
+                // is half-applied.
+                let new_redacts = transform::compile_redacts(&ns.redact)?;
+                // Schema is frozen at boot — the database fixes a field's type
+                // on first write and tags are in the primary key. Report a
+                // change rather than silently dropping it.
+                if ns.table != source.table {
+                    report.restart_required.push("source.table".into());
+                }
+                if ns.tags != source.tags {
+                    report.restart_required.push("source.tags".into());
+                }
+                if ns.tags_static != source.tags_static {
+                    report.restart_required.push("source.tags_static".into());
+                }
+                if ns.fields != source.fields {
+                    report.restart_required.push("source.fields".into());
+                }
+                if ns.timestamp != source.timestamp {
+                    report.restart_required.push("source.timestamp".into());
+                }
+                if ns.visibility != source.visibility {
+                    report.restart_required.push("source.visibility".into());
+                }
+                if ns.multiline != source.multiline {
+                    report.restart_required.push("source.multiline".into());
+                }
+                // The transforms hot-swap.
+                *r.filters = ns.filter;
+                *r.samples = ns.sample;
+                *r.redacts = new_redacts;
+                report
+                    .applied
+                    .push("transforms (filter/sample/redact)".into());
+            }
+        }
+    }
+
+    // Output knobs the loop just reads each pass — safe to retune live.
+    if new.output.batch_lines != *r.batch_lines {
+        *r.batch_lines = new.output.batch_lines;
+        report
+            .applied
+            .push(format!("batch_lines={}", new.output.batch_lines));
+    }
+    if new.output.max_inflight != *r.max_inflight {
+        *r.max_inflight = new.output.max_inflight;
+        report
+            .applied
+            .push(format!("max_inflight={}", new.output.max_inflight));
+    }
+    if new.output.watermark_every_secs != *r.watermark_every {
+        *r.watermark_every = new.output.watermark_every_secs;
+        report.applied.push(format!(
+            "watermark_every_secs={}",
+            new.output.watermark_every_secs
+        ));
+    }
+    let new_rpo = match new.output.rpo_report_secs {
+        0 => Duration::from_secs(u64::MAX),
+        n => Duration::from_secs(n),
+    };
+    if new_rpo != *r.rpo_every {
+        *r.rpo_every = new_rpo;
+        report
+            .applied
+            .push(format!("rpo_report_secs={}", new.output.rpo_report_secs));
+    }
+
+    // Output fields captured at boot — a bound socket, an opened queue, a
+    // built shipper. A change needs a restart; report, do not apply. Comparing
+    // against `current` (the boot config) is right: these are never hot-
+    // swapped, so the running value is always the boot value.
+    if new.output.url != current.output.url {
+        report.restart_required.push("output.url".into());
+    }
+    if new.output.tls != current.output.tls {
+        report.restart_required.push("output.tls".into());
+    }
+    if new.output.queue_max_bytes != current.output.queue_max_bytes {
+        report
+            .restart_required
+            .push("output.queue_max_bytes".into());
+    }
+    if new.output.database != current.output.database {
+        report.restart_required.push("output.database".into());
+    }
+    if new.output.watermark_floor_ms != current.output.watermark_floor_ms
+        || new.output.watermark_ceiling_ms != current.output.watermark_ceiling_ms
+    {
+        report
+            .restart_required
+            .push("output.watermark_floor_ms/ceiling_ms".into());
+    }
+
+    Ok(report)
 }
 
 /// Submit a batch to the in-flight pipeline. Deliberately does NOT
@@ -1209,4 +1491,125 @@ async fn write_watermark(pipe: &mut Pipeline, cfg: &Config, stream: &str) -> any
         tracing::debug!(error = %e, "watermark publish deferred");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // A minimal valid config: one file source, no transforms.
+    const V1: &str = "[output]\nurl = \"http://localhost:1963\"\n\n\
+        [[source]]\nname = \"app\"\npath = \"/var/log/app.log\"\ntable = \"logs\"\n";
+    // Same source identity; adds a redact rule and retunes batch_lines.
+    const V2: &str = "[output]\nurl = \"http://localhost:1963\"\nbatch_lines = 123\n\n\
+        [[source]]\nname = \"app\"\npath = \"/var/log/app.log\"\ntable = \"logs\"\n\n\
+        [[source.redact]]\nfield = \"msg\"\npattern = \"secret\"\nreplacement = \"***\"\n";
+    // A different source PATH — an identity change, not a live re-tail.
+    const V3: &str = "[output]\nurl = \"http://localhost:1963\"\n\n\
+        [[source]]\nname = \"app\"\npath = \"/var/log/other.log\"\ntable = \"logs\"\n\n\
+        [[source.redact]]\nfield = \"msg\"\npattern = \"x\"\n";
+    // Fails validation: a file source with no path to tail.
+    const BAD: &str = "[output]\nurl = \"http://localhost:1963\"\n\n\
+        [[source]]\nname = \"app\"\npath = \"\"\ntable = \"logs\"\n";
+
+    fn write(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let p = dir.join("c.toml");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// Held reloadable state, so the two tests build it the same way.
+    struct Held {
+        filters: Vec<config::Filter>,
+        samples: Vec<config::Sample>,
+        redacts: Vec<transform::CompiledRedact>,
+        batch_lines: usize,
+        watermark_every: u64,
+        max_inflight: usize,
+        rpo_every: Duration,
+    }
+    impl Held {
+        fn from(cfg: &Config) -> Held {
+            let s = cfg.sources.first().unwrap();
+            Held {
+                filters: s.filter.clone(),
+                samples: s.sample.clone(),
+                redacts: transform::compile_redacts(&s.redact).unwrap(),
+                batch_lines: cfg.output.batch_lines,
+                watermark_every: cfg.output.watermark_every_secs,
+                max_inflight: cfg.output.max_inflight,
+                rpo_every: Duration::from_secs(0),
+            }
+        }
+        fn reloadable(&mut self) -> Reloadable<'_> {
+            Reloadable {
+                filters: &mut self.filters,
+                samples: &mut self.samples,
+                redacts: &mut self.redacts,
+                batch_lines: &mut self.batch_lines,
+                watermark_every: &mut self.watermark_every,
+                max_inflight: &mut self.max_inflight,
+                rpo_every: &mut self.rpo_every,
+            }
+        }
+    }
+
+    #[test]
+    fn reload_hot_swaps_transforms_and_a_bad_config_is_refused_keeping_last_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), V1);
+        let cfg = Config::load(&p).unwrap();
+        let source = cfg.sources.first().unwrap();
+        let mut held = Held::from(&cfg);
+        let tel = telemetry::Telemetry::new(std::sync::Arc::new(ship::Counters::default()));
+        assert_eq!(held.redacts.len(), 0, "v1 declares no redaction");
+
+        // A valid reload of the SAME source: transforms and knobs go live.
+        write(dir.path(), V2);
+        reload_config(&p, source, &cfg, &mut held.reloadable(), &tel);
+        assert_eq!(tel.config_reloads.load(Relaxed), 1);
+        assert!(tel.config_last_reload_ok.load(Relaxed));
+        assert_eq!(held.redacts.len(), 1, "the new redaction rule is live");
+        assert_eq!(held.batch_lines, 123, "batch_lines retuned live");
+
+        // A config that fails validation is refused; the last-good stays.
+        write(dir.path(), BAD);
+        reload_config(&p, source, &cfg, &mut held.reloadable(), &tel);
+        assert_eq!(tel.config_reloads_refused.load(Relaxed), 1);
+        assert!(!tel.config_last_reload_ok.load(Relaxed));
+        assert_eq!(held.batch_lines, 123, "a refused reload changes nothing");
+        assert_eq!(
+            held.redacts.len(),
+            1,
+            "a refused reload keeps the last-good transforms"
+        );
+    }
+
+    #[test]
+    fn a_different_source_path_is_restart_required_not_a_live_retail() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), V1);
+        let cfg = Config::load(&p).unwrap();
+        let source = cfg.sources.first().unwrap();
+        let mut held = Held::from(&cfg);
+
+        write(dir.path(), V3);
+        let new = Config::load(&p).unwrap();
+        let report = apply_reload(source, &cfg, new, &mut held.reloadable()).unwrap();
+
+        assert!(
+            report
+                .restart_required
+                .iter()
+                .any(|s| s.contains("source identity")),
+            "a changed source path must be flagged restart-required: {:?}",
+            report.restart_required
+        );
+        assert_eq!(
+            held.redacts.len(),
+            0,
+            "a different source must NOT graft its transforms onto the running tail"
+        );
+    }
 }

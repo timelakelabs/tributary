@@ -3,6 +3,22 @@
 All notable changes to Tributary are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+
+- **Config reload without a restart** (`SIGHUP`, T-5, #10). Re-reads the
+  `--config` file and hot-applies the transform stage (`filter`/`sample`/
+  `redact`) and the output knobs (`batch_lines`, `max_inflight`,
+  `watermark_every_secs`, `rpo_report_secs`) on the running tail — checkpoint,
+  queue and in-flight batches untouched. Validate-before-swap: a file that will
+  not load or validate is refused and the last-good config keeps running, with
+  `tributary_config_reloads_total`, `tributary_config_reloads_refused_total`
+  and `tributary_config_last_reload_ok` making the outcome visible. Changes to
+  the source's identity/schema or to bound resources (`output.url`, TLS, the
+  listeners) are reported as restart-required rather than silently ignored.
+  Unix-only. Single-source per process still holds (#49).
+
 ## [0.3.0] — 2026-08-26
 
 Tributary becomes a full **Telegraf + log-agent replacement**: four new

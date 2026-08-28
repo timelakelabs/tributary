@@ -294,6 +294,42 @@ defence in depth, not a guarantee the app can't log a secret in a shape the
 pattern misses (the real answer to that is not logging it) — and it operates on
 **string fields only**, since a numeric field has no substring to scrub.
 
+## Reloading config without a restart (SIGHUP)
+
+Send `SIGHUP` and the agent re-reads its `--config` file and applies what it
+can on the running tail — the checkpoint is not dropped, the file is not
+re-opened, in-flight batches finish on the old rules, and the queue is
+untouched:
+
+```bash
+kill -HUP "$(pidof tributary)"     # or wire it to `systemctl reload`
+```
+
+**Hot-reloaded**, effective on the next loop pass:
+
+- the transform stage — `filter`, `sample`, `redact` (add a redaction, tighten
+  a sample rate, drop a newly-noisy pattern)
+- `output.batch_lines`, `output.max_inflight`, `output.watermark_every_secs`,
+  `output.rpo_report_secs`
+
+**Restart-required** — a change here is logged and the running value is kept:
+`output.url`, `output.tls`, `output.database`, `output.queue_max_bytes`, the
+watermark floor/ceiling, the log sink, the bound listeners (`[telemetry]`,
+`[otlp]`, `[metrics]`), and the **source's identity or schema** (`name`,
+`path`, `parser`, `table`, `tags`, `fields`, `timestamp`). Pointing the agent
+at a different file — or changing what a column means — is a restart, not a
+live re-tail: the checkpoint is keyed to the source, and re-seeking a tail the
+change never touched is how you drop or re-ship data.
+
+A reload that fails to load or validate is **refused**: the last-good config
+keeps running and `tributary_config_reloads_refused_total` counts it — the same
+validate-before-swap contract as the L4 certificate reload. `SIGHUP` is
+Unix-only; on Windows the agent restarts through its service manager.
+
+> One agent tails one file today. Adding a second `[[source]]` needs a restart
+> and, in fact, only the first is read at all — see
+> [timelakelabs/tributary#49](https://github.com/timelakelabs/tributary/issues/49).
+
 ## Host metrics (Telegraf-compatible)
 
 For a migration off InfluxDB + Telegraf: sample the machine on an interval and

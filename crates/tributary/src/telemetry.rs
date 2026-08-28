@@ -76,6 +76,14 @@ pub struct Telemetry {
     pub cert_healthy: AtomicBool,
     pub cert_renewals_refused: AtomicU64,
 
+    /// Config reload (#10, T-5). The same shape as the credential trio: a
+    /// total applied, a refused count for a reload that failed validation and
+    /// kept the last-good config, and a health gauge that drops to 0 after a
+    /// refusal so a rejected change is visible, not mysterious.
+    pub config_reloads: AtomicU64,
+    pub config_reloads_refused: AtomicU64,
+    pub config_last_reload_ok: AtomicBool,
+
     /// Epoch millis of the last main-loop tick. `/healthz` uses this and
     /// nothing else to decide liveness.
     pub last_tick_ms: AtomicU64,
@@ -110,6 +118,9 @@ impl Telemetry {
             cert_expires_in_secs: AtomicI64::new(-1),
             cert_healthy: AtomicBool::new(true),
             cert_renewals_refused: AtomicU64::new(0),
+            config_reloads: AtomicU64::new(0),
+            config_reloads_refused: AtomicU64::new(0),
+            config_last_reload_ok: AtomicBool::new(true),
             last_tick_ms: AtomicU64::new(now),
             started_ms: now,
         })
@@ -344,6 +355,31 @@ impl Telemetry {
             "counter",
             "Certificate renewals refused because they failed validation.",
             g(&self.cert_renewals_refused).to_string(),
+        );
+
+        // -- config reload (#10) ---------------------------------------
+        m(
+            "tributary_config_reloads_total",
+            "counter",
+            "Config reloads applied without a restart (SIGHUP).",
+            g(&self.config_reloads).to_string(),
+        );
+        m(
+            "tributary_config_reloads_refused_total",
+            "counter",
+            "Config reloads refused because the new file failed to load or validate. The last-good config keeps running — this counting apart is how a rejected change is visible instead of silently ignored.",
+            g(&self.config_reloads_refused).to_string(),
+        );
+        m(
+            "tributary_config_last_reload_ok",
+            "gauge",
+            "0 after a reload was refused by the validate-before-swap gate; back to 1 on the next reload that applies. Distinct from credential health.",
+            if self.config_last_reload_ok.load(Ordering::Relaxed) {
+                "1"
+            } else {
+                "0"
+            }
+            .into(),
         );
 
         // -- process ---------------------------------------------------
