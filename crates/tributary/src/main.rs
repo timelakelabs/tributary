@@ -203,38 +203,6 @@ async fn main() -> anyhow::Result<()> {
         .first()
         .expect("load() guarantees a source when there is no [otlp]");
 
-    // The transform stage (#42/#43/#44) is the reloadable part of the source
-    // (#10): held in its own locals, not read off `source`, so a SIGHUP can
-    // swap the rules on the running tail while the source's identity and
-    // schema stay frozen. Compiled once here — config validation already
-    // checked the regexes parse, so this does not fail in practice.
-    let mut filters = source.filter.clone();
-    let mut samples = source.sample.clone();
-    let mut redacts = transform::compile_redacts(&source.redact)?;
-
-    let cp_path = Checkpoint::path_for(&args.state_dir, &source.name);
-    let restored = Checkpoint::load(&cp_path)?;
-
-    let mut stamper = stamp::Stamper::new(source.resolution());
-    if let Some(cp) = &restored
-        && let (Some(tick), seq) = (cp.last_tick_ns, cp.next_seq)
-    {
-        stamper.restore(tick, seq);
-        tracing::info!(tick, next_seq = seq, "restored stamper state");
-    }
-
-    let mut wm = watermark::Watermark::new(
-        cfg.output.watermark_floor_ms as i64 * 1_000_000,
-        cfg.output.watermark_ceiling_ms as i64 * 1_000_000,
-    );
-    if let Some(cp) = &restored
-        && let Some(l) = cp.lateness_ns
-    {
-        // Resume the converged estimate rather than re-learning it from
-        // the ceiling on every restart.
-        wm.restore(l);
-    }
-
     let shipper = build_shipper(&cfg.output)?;
     // A one-line, secret-free statement of posture: an operator can tell from
     // the log whether this agent is presenting a credential, without it ever
@@ -299,6 +267,77 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!(error = %e, "OTLP receiver stopped");
             }
         });
+    }
+
+    // #10 (T-5): SIGHUP requests a config reload. A dedicated listener sets a
+    // flag the loop drains once per pass — the same shape as the L4 cert check
+    // below, so a reload cannot race the shutdown or checkpoint path and a
+    // burst of HUPs collapses to one reload. Unix only: there is no SIGHUP on
+    // Windows (a winlog agent restarts via its service manager), and the flag
+    // simply never sets there.
+    let reload_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        let flag = std::sync::Arc::clone(&reload_flag);
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut hup = match signal(SignalKind::hangup()) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(error = %e, "could not install SIGHUP handler — config reload disabled");
+                    return;
+                }
+            };
+            while hup.recv().await.is_some() {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
+
+    run_file_source(source, &cfg, &args, shipper, tel, reload_flag).await
+}
+
+/// One file-tail source's whole pipeline: per-source setup, the tail loop,
+/// and the drain on shutdown. Phase 1 of #49 extracts it verbatim so phase 2
+/// can spawn one per `[[source]]`; single-source behaviour is unchanged.
+async fn run_file_source(
+    source: &config::Source,
+    cfg: &config::Config,
+    args: &Args,
+    shipper: ship::Shipper,
+    tel: std::sync::Arc<telemetry::Telemetry>,
+    reload_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
+    // The transform stage (#42/#43/#44) is the reloadable part of the source
+    // (#10): held in its own locals, not read off `source`, so a SIGHUP can
+    // swap the rules on the running tail while the source's identity and
+    // schema stay frozen. Compiled once here — config validation already
+    // checked the regexes parse, so this does not fail in practice.
+    let mut filters = source.filter.clone();
+    let mut samples = source.sample.clone();
+    let mut redacts = transform::compile_redacts(&source.redact)?;
+
+    let cp_path = Checkpoint::path_for(&args.state_dir, &source.name);
+    let restored = Checkpoint::load(&cp_path)?;
+
+    let mut stamper = stamp::Stamper::new(source.resolution());
+    if let Some(cp) = &restored
+        && let (Some(tick), seq) = (cp.last_tick_ns, cp.next_seq)
+    {
+        stamper.restore(tick, seq);
+        tracing::info!(tick, next_seq = seq, "restored stamper state");
+    }
+
+    let mut wm = watermark::Watermark::new(
+        cfg.output.watermark_floor_ms as i64 * 1_000_000,
+        cfg.output.watermark_ceiling_ms as i64 * 1_000_000,
+    );
+    if let Some(cp) = &restored
+        && let Some(l) = cp.lateness_ns
+    {
+        // Resume the converged estimate rather than re-learning it from
+        // the ceiling on every restart.
+        wm.restore(l);
     }
 
     let mut pipe = Pipeline {
@@ -368,31 +407,6 @@ async fn main() -> anyhow::Result<()> {
             .map(|t| t.refresh_secs)
             .unwrap_or(u64::MAX),
     );
-
-    // #10 (T-5): SIGHUP requests a config reload. A dedicated listener sets a
-    // flag the loop drains once per pass — the same shape as the L4 cert check
-    // below, so a reload cannot race the shutdown or checkpoint path and a
-    // burst of HUPs collapses to one reload. Unix only: there is no SIGHUP on
-    // Windows (a winlog agent restarts via its service manager), and the flag
-    // simply never sets there.
-    let reload_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    #[cfg(unix)]
-    {
-        let flag = std::sync::Arc::clone(&reload_flag);
-        tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut hup = match signal(SignalKind::hangup()) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::error!(error = %e, "could not install SIGHUP handler — config reload disabled");
-                    return;
-                }
-            };
-            while hup.recv().await.is_some() {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-    }
 
     let shutdown = async {
         #[cfg(unix)]
@@ -505,7 +519,7 @@ async fn main() -> anyhow::Result<()> {
         // Publish the completeness claim as ordinary rows, so a dashboard
         // can tell "this window is empty" from "not complete yet".
         if last_wm_write.elapsed() >= Duration::from_secs(watermark_every) {
-            write_watermark(&mut pipe, &cfg, &source.name).await?;
+            write_watermark(&mut pipe, cfg, &source.name).await?;
             last_wm_write = Instant::now();
         }
 
@@ -605,7 +619,7 @@ async fn main() -> anyhow::Result<()> {
             reload_config(
                 &args.config,
                 source,
-                &cfg,
+                cfg,
                 &mut Reloadable {
                     filters: &mut filters,
                     samples: &mut samples,
@@ -661,7 +675,7 @@ async fn main() -> anyhow::Result<()> {
     flush(&mut pipe, &mut batch, &mut batch_max_ts).await?;
     checkpoint_now(&mut pipe, &tailer, &stamper).await?;
     drain_queue(&mut pipe, source, &tailer, &stamper).await?;
-    write_watermark(&mut pipe, &cfg, &source.name).await.ok();
+    write_watermark(&mut pipe, cfg, &source.name).await.ok();
 
     if stamper.out_of_window > 0 {
         tracing::warn!(
