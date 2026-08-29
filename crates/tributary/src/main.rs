@@ -265,14 +265,16 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // #10/#49 (T-5): SIGHUP bumps a generation counter; every source reloads
-    // when it sees a newer generation than it last applied. A shared swap-flag
-    // would let only the first source that checked it ever see the reload.
-    // Unix only — there is no SIGHUP on Windows.
+    // #10/#49 (T-5): SIGHUP triggers a reload. The listener notifies the
+    // coordinator below, which re-reads the config, diffs the source SET —
+    // starting a task for an added [[source]], stopping one for a removed
+    // source — and bumps a generation so every unchanged source reloads its
+    // own transforms. Unix only — there is no SIGHUP on Windows.
     let reload_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reload_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     #[cfg(unix)]
     {
-        let hup_gen = std::sync::Arc::clone(&reload_gen);
+        let notify = std::sync::Arc::clone(&reload_notify);
         tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
             let mut hup = match signal(SignalKind::hangup()) {
@@ -283,34 +285,36 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             while hup.recv().await.is_some() {
-                hup_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                notify.notify_one();
             }
         });
     }
 
     // #49: one tail task per [[source]]. Each owns its stamper, watermark,
     // checkpoint and queue; all share this shipper (one connection pool) and
-    // telemetry (summed per source). A shared shutdown lets one source's
-    // failure take the whole agent down loudly rather than leave it half-dead.
+    // telemetry (summed per source). Each has its OWN shutdown channel, held in
+    // `running` by source name, so the coordinator can stop one source (a
+    // reload removed it) without stopping the others; a global stop signals all.
     let cfg = std::sync::Arc::new(cfg);
     let args = std::sync::Arc::new(args);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut set: tokio::task::JoinSet<anyhow::Result<()>> = tokio::task::JoinSet::new();
+    let mut running: std::collections::HashMap<String, tokio::sync::watch::Sender<bool>> =
+        std::collections::HashMap::new();
+    let mut set: tokio::task::JoinSet<(String, anyhow::Result<()>)> = tokio::task::JoinSet::new();
     for idx in 0..cfg.sources.len() {
-        set.spawn(run_file_source(
+        spawn_source(
+            &mut set,
+            &mut running,
             std::sync::Arc::clone(&cfg),
             idx,
             std::sync::Arc::clone(&args),
             shipper.clone(),
             std::sync::Arc::clone(&tel),
             std::sync::Arc::clone(&reload_gen),
-            shutdown_rx.clone(),
-        ));
+        );
     }
-    drop(shutdown_rx);
-    drop(shipper);
 
-    // Coordinate: the OS stop signal, or any source finishing/failing.
+    // Coordinate: an OS stop signal, a SIGHUP reload of the source set, or any
+    // source finishing/failing.
     let stop = async {
         #[cfg(unix)]
         {
@@ -328,25 +332,39 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             _ = &mut stop, if !signalled => {
                 tracing::info!("shutting down — signalling every source");
-                let _ = shutdown_tx.send(true);
+                for tx in running.values() {
+                    let _ = tx.send(true);
+                }
                 signalled = true;
+            }
+            _ = reload_notify.notified(), if !signalled => {
+                reload_source_set(&mut set, &mut running, &args, &shipper, &tel, &reload_gen);
             }
             joined = set.join_next() => match joined {
                 None => break,
-                Some(Ok(Ok(()))) => {}
-                Some(Ok(Err(e))) => {
-                    tracing::error!(error = %e, "a source failed — stopping the agent");
+                Some(Ok((name, Ok(())))) => {
+                    // Clean exit: a removed source finished its drain, or --once
+                    // completed. Drop it from the running set.
+                    running.remove(&name);
+                }
+                Some(Ok((name, Err(e)))) => {
+                    tracing::error!(source = %name, error = %e, "a source failed — stopping the agent");
+                    running.remove(&name);
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
-                    let _ = shutdown_tx.send(true);
+                    for tx in running.values() {
+                        let _ = tx.send(true);
+                    }
                     signalled = true;
                 }
                 Some(Err(e)) => {
                     if first_err.is_none() {
                         first_err = Some(anyhow::anyhow!(e));
                     }
-                    let _ = shutdown_tx.send(true);
+                    for tx in running.values() {
+                        let _ = tx.send(true);
+                    }
                     signalled = true;
                 }
             }
@@ -356,6 +374,111 @@ async fn main() -> anyhow::Result<()> {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Diff the running source names against the configured ones (#53). Returns the
+/// names to stop (running but no longer configured) and the indices into
+/// `configured` to start (configured but not running). A name present in both is
+/// unchanged — left alone here; it reloads its own transforms off the gen bump.
+/// The add indices come out in config order; the remove list is sorted so a
+/// caller (and a test) sees a deterministic sequence out of the hashed running
+/// set.
+fn diff_source_set<'a>(
+    running: impl Iterator<Item = &'a str>,
+    configured: &[String],
+) -> (Vec<String>, Vec<usize>) {
+    let running: std::collections::HashSet<&str> = running.collect();
+    let configured_names: std::collections::HashSet<&str> =
+        configured.iter().map(String::as_str).collect();
+    let mut to_remove: Vec<String> = running
+        .iter()
+        .filter(|n| !configured_names.contains(*n))
+        .map(|n| n.to_string())
+        .collect();
+    to_remove.sort();
+    let to_add: Vec<usize> = (0..configured.len())
+        .filter(|&i| !running.contains(configured[i].as_str()))
+        .collect();
+    (to_remove, to_add)
+}
+
+/// Spawn one source task with its own shutdown channel, recording its sender in
+/// `running` keyed by name so the coordinator can stop it individually.
+#[allow(clippy::too_many_arguments)]
+fn spawn_source(
+    set: &mut tokio::task::JoinSet<(String, anyhow::Result<()>)>,
+    running: &mut std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>,
+    cfg: std::sync::Arc<config::Config>,
+    idx: usize,
+    args: std::sync::Arc<Args>,
+    shipper: ship::Shipper,
+    tel: std::sync::Arc<telemetry::Telemetry>,
+    reload_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    let name = cfg.sources[idx].name.clone();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    running.insert(name.clone(), tx);
+    set.spawn(async move {
+        let r = run_file_source(cfg, idx, args, shipper, tel, reload_gen, rx).await;
+        (name, r)
+    });
+}
+
+/// Re-read the config on SIGHUP and diff the source SET (#49/#53): stop a
+/// removed source (gracefully — its drain flushes the checkpoint and leaves the
+/// queue on disk, not orphaned), start an added one, and bump the reload
+/// generation so every unchanged source reloads its own transforms. A config
+/// that will not load is refused and the running set is kept, exactly like the
+/// per-source transform reload.
+fn reload_source_set(
+    set: &mut tokio::task::JoinSet<(String, anyhow::Result<()>)>,
+    running: &mut std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>,
+    args: &std::sync::Arc<Args>,
+    shipper: &ship::Shipper,
+    tel: &std::sync::Arc<telemetry::Telemetry>,
+    reload_gen: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let new = match Config::load(&args.config) {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            tel.config_reloads_refused.fetch_add(1, Relaxed);
+            tel.config_last_reload_ok.store(false, Relaxed);
+            tracing::error!(error = %e, "config reload REFUSED — keeping the running source set");
+            return;
+        }
+    };
+    let configured: Vec<String> = new.sources.iter().map(|s| s.name.clone()).collect();
+    let (removed, added) = diff_source_set(running.keys().map(String::as_str), &configured);
+
+    // Remove: a running source no longer in the config. Signal it to stop; its
+    // drain flushes the checkpoint and leaves the queue on disk.
+    for name in removed {
+        if let Some(tx) = running.remove(&name) {
+            tracing::info!(source = %name, "config reload: source removed — stopping it");
+            let _ = tx.send(true);
+        }
+    }
+
+    // Add: a configured source not currently running.
+    for idx in added {
+        tracing::info!(source = %new.sources[idx].name, "config reload: source added — tailing it");
+        spawn_source(
+            set,
+            running,
+            std::sync::Arc::clone(&new),
+            idx,
+            std::sync::Arc::clone(args),
+            shipper.clone(),
+            std::sync::Arc::clone(tel),
+            std::sync::Arc::clone(reload_gen),
+        );
+    }
+
+    // Unchanged sources reload their own transforms from the file next pass;
+    // each counts its own tributary_config_reloads_total, so this does not.
+    reload_gen.fetch_add(1, Relaxed);
+    tel.config_last_reload_ok.store(true, Relaxed);
 }
 
 /// One file-tail source's whole pipeline: per-source setup, the tail loop,
@@ -1722,5 +1845,33 @@ mod reload_tests {
             0,
             "a different source must NOT graft its transforms onto the running tail"
         );
+    }
+
+    #[test]
+    fn a_source_set_reload_stops_the_gone_starts_the_new_and_leaves_the_kept() {
+        // Running: alpha, beta. New config: beta, gamma. So alpha goes, gamma
+        // arrives, beta is untouched (neither stopped nor re-spawned — it
+        // reloads its own transforms off the generation bump instead).
+        let running = ["alpha", "beta"];
+        let configured = vec!["beta".to_string(), "gamma".to_string()];
+        let (removed, added) = diff_source_set(running.iter().copied(), &configured);
+        assert_eq!(
+            removed,
+            vec!["alpha".to_string()],
+            "alpha is no longer configured"
+        );
+        assert_eq!(added, vec![1usize], "gamma is new, at config index 1");
+        assert!(
+            !added.contains(&0),
+            "beta is unchanged and must not be re-spawned onto its own running tail"
+        );
+
+        // An empty config stops everything; adding to an empty agent starts all.
+        let (all_gone, none) = diff_source_set(running.iter().copied(), &[]);
+        assert_eq!(all_gone, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(none.is_empty());
+        let (nothing, all_new) = diff_source_set(std::iter::empty(), &configured);
+        assert!(nothing.is_empty());
+        assert_eq!(all_new, vec![0usize, 1usize]);
     }
 }

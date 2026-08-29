@@ -7,17 +7,31 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Added
 
+- **Multiple sources per agent** (#49). One process now tails many `[[source]]`
+  blocks concurrently — each with its own tail, framer, watermark, checkpoint
+  and durable queue, namespaced on disk by source name (`queue-<name>/`,
+  `<name>.checkpoint`, `dead-letter-<name>.lp`) — over one shared connection
+  pool and one telemetry endpoint whose counters carry per-source labels. A
+  pre-existing single-source `queue/` is migrated to `queue-<name>/` in place.
+  Source names must be unique (they key the on-disk state); `journald` and
+  `winlog` stay one-per-agent, being single-cursor pull loops, not file tails.
+  One source failing stops the whole agent, loudly. Landed over #50 (extract the
+  per-source pipeline), #56 (per-source telemetry), #52 (concurrent tasks) and
+  #53 (live source-set reload); the end-to-end exactness drill is #54.
 - **Config reload without a restart** (`SIGHUP`, T-5, #10). Re-reads the
   `--config` file and hot-applies the transform stage (`filter`/`sample`/
   `redact`) and the output knobs (`batch_lines`, `max_inflight`,
-  `watermark_every_secs`, `rpo_report_secs`) on the running tail — checkpoint,
-  queue and in-flight batches untouched. Validate-before-swap: a file that will
-  not load or validate is refused and the last-good config keeps running, with
-  `tributary_config_reloads_total`, `tributary_config_reloads_refused_total`
-  and `tributary_config_last_reload_ok` making the outcome visible. Changes to
-  the source's identity/schema or to bound resources (`output.url`, TLS, the
-  listeners) are reported as restart-required rather than silently ignored.
-  Unix-only. Single-source per process still holds (#49).
+  `watermark_every_secs`, `rpo_report_secs`) on every running tail — checkpoint,
+  queue and in-flight batches untouched. The reload also diffs the **source
+  set**: an added `[[source]]` starts tailing and a removed one stops and
+  drains, without disturbing the sources that stayed (#53). Validate-before-swap:
+  a file that will not load or validate is refused and the last-good config
+  keeps running, with `tributary_config_reloads_total`,
+  `tributary_config_reloads_refused_total` and
+  `tributary_config_last_reload_ok` making the outcome visible. Changes to an
+  existing source's identity/schema or to bound resources (`output.url`, TLS,
+  the listeners) are reported as restart-required rather than silently ignored.
+  Unix-only.
 
 ## [0.3.0] — 2026-08-26
 

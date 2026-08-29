@@ -366,6 +366,41 @@ command instead of buffering it. A non-zero exit ships nothing. Windows gets a
 best-effort child kill (no process groups), and `static_fields` injection into
 arbitrary line protocol is a v1 gap; `global_tags` are applied.
 
+### 4.7 Many sources in one agent
+
+A deployment rarely has exactly one log to ship. Rather than run a process per
+file — a supervisor entry, a state directory and a scrape target each — one
+agent tails every `[[source]]` it is given (#49). Each is a full copy of §4.1–
+4.4: its own tailer, framer, stamper, watermark and checkpoint, and its own
+durable queue. What they share is deliberately only the expensive, safe-to-
+share things — one `reqwest` connection pool (the `Shipper` is `Clone`, an
+`Arc` over the pool and the counters) and one `[telemetry]` listener. Per-source
+state is namespaced on disk by name (`queue-<name>/`, `<name>.checkpoint`,
+`dead-letter-<name>.lp`), so a crash resumes each source at its own position
+with no chance of one source reading another's checkpoint. The single-source
+layout that predates this — a bare `queue/` — is renamed in place the first
+time a one-source agent starts under the new code.
+
+Telemetry had to go per-source *before* concurrency did (#56 before #52): the
+Prometheus exposition is one endpoint, so N tasks writing one flat counter set
+would clobber each other's numbers. Each source owns a `SourceSnap`; the
+exposition sums them and also labels them, so the completeness invariant holds
+per source and in aggregate.
+
+The tasks run under one `JoinSet` with a coordinator that owns three things: an
+OS stop signal, a `SIGHUP` reload, and `join_next()`. A per-source `watch`
+channel lets the coordinator stop *one* source — the case a reload that dropped
+a `[[source]]` needs — while a global stop signals them all. `SIGHUP` re-reads
+the config and diffs the running set by name (§4.7 is why the name is the key):
+a name gone from the file is signalled to stop and drain, a new name is spawned,
+and a name in both is left running and picks up its own transform changes off a
+generation counter — a shared flag would let only one of N tasks observe the
+signal. One source returning `Err` fails the whole agent on purpose: a
+half-collecting agent behind a green process is the outage you find out about
+from the gap in the data, which is exactly the failure mode this project exists
+to refuse. `journald` and `winlog` are excluded from the set at load time —
+they are one-cursor subsystem pulls, not tails, and belong to their own agent.
+
 ---
 
 ## 5. Configuration
