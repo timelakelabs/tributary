@@ -517,6 +517,7 @@ bugs and rotation gaps simultaneously. Every scenario below asserts it.
 | Database stopped 60 s, then restarted | Queue absorbs; nothing lost; no hammering (§4.5) |
 | File growing faster than the network for 10 min | RSS stays bounded; lag is visible |
 | Same file replayed from an old checkpoint | Row count **unchanged** — replay is idempotent (§3) |
+| Two `[[source]]` files under one agent | Each stream exact; a `SIGKILL` resumes each source from its own checkpoint; a live `SIGHUP` adds and removes a source (§4.7). `docs/evidence/multi-source-drill.log` |
 
 Results land in `bench/results/` with the run recorded, in the same
 format as the database's own evidence. A claim without a run behind it

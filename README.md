@@ -367,6 +367,11 @@ The set is live under `SIGHUP` (above). One source failing takes the whole
 agent down — on purpose, and loudly, rather than leaving a green process that
 quietly stopped collecting half your logs.
 
+All of this is drilled end to end by `bench/multi_source_drill.sh` (transcript
+in `docs/evidence/multi-source-drill.log`): two streams tailed to exact
+per-stream counts, a `SIGKILL` that resumes each source from its own
+checkpoint, and a live add/remove that leaves the other source flowing.
+
 ## Host metrics (Telegraf-compatible)
 
 For a migration off InfluxDB + Telegraf: sample the machine on an interval and

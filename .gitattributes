@@ -1,0 +1,8 @@
+# The bench drills run in Linux containers through the Windows bind mount. A
+# CRLF shebang or any `\r`-terminated line breaks bash outright, and autocrlf
+# would otherwise hand a Windows checkout CRLF scripts that fail only there —
+# the worst kind, since CI on Linux stays green. Pin LF for the things that get
+# executed or parsed as bytes.
+*.sh                text eol=lf
+*.py                text eol=lf
+docs/evidence/*.log text eol=lf

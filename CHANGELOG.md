@@ -17,7 +17,10 @@ All notable changes to Tributary are recorded here. This project adheres to
   `winlog` stay one-per-agent, being single-cursor pull loops, not file tails.
   One source failing stops the whole agent, loudly. Landed over #50 (extract the
   per-source pipeline), #56 (per-source telemetry), #52 (concurrent tasks) and
-  #53 (live source-set reload); the end-to-end exactness drill is #54.
+  #53 (live source-set reload), and drilled end to end in #54 —
+  `bench/multi_source_drill.sh`, evidence in
+  `docs/evidence/multi-source-drill.log`: two streams each exact, a SIGKILL that
+  resumes each source from its own checkpoint, and a live SIGHUP add/remove.
 - **Config reload without a restart** (`SIGHUP`, T-5, #10). Re-reads the
   `--config` file and hot-applies the transform stage (`filter`/`sample`/
   `redact`) and the output knobs (`batch_lines`, `max_inflight`,

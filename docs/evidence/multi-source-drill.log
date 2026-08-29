@@ -1,0 +1,105 @@
+=== multi-source end-to-end drill (2026-08-29T20:27:44Z) ===
+workdir=/tmp/tmp.6W9YnF7py9  alpha=6000 beta=4000 extra=1500
+-- build --
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.33s
+
+### LEG 1 — STEADY: two sources, exact per-stream counts ###
+  delivered distinct: alpha=6000 beta=4000
+  per-source state on disk: alpha.checkpoint beta.checkpoint queue-alpha queue-beta 
+{
+  "alpha": {
+    "expect": 6000,
+    "distinct": 6000,
+    "total_delivered": 6000,
+    "min": 0,
+    "max": 5999,
+    "replayed": 0,
+    "exact": true
+  },
+  "beta": {
+    "expect": 4000,
+    "distinct": 4000,
+    "total_delivered": 4000,
+    "min": 0,
+    "max": 3999,
+    "replayed": 0,
+    "exact": true
+  }
+}
+  [PASS] stream alpha: distinct 6000/6000, min 0, max 5999, replayed-then-deduped 0
+  [PASS] stream beta: distinct 4000/4000, min 0, max 3999, replayed-then-deduped 0
+  [PASS] leg1 both streams exact (0)
+
+### LEG 2 — RESUME: SIGKILL mid-stream, resume from each source's own checkpoint ###
+  burst 1 shipped and quiesced; checkpoints on disk: alpha=yes (141B) beta=yes (141B)
+  [PASS] leg2 alpha checkpoint written before the crash (yes)
+  [PASS] leg2 beta checkpoint written before the crash (yes)
+  SIGKILLed mid burst-2: alpha=4500/6000 beta=3500/4000 distinct shipped before the kill
+  [PASS] leg2 alpha crashed past its checkpoint but before EOF (>3000, <6000) (yes)
+  after resume distinct: alpha=6000 beta=4000 ; replayed: alpha=1501 beta=1501
+  (a replay far below the pre-kill count means the restart resumed from the checkpoint, not from zero)
+  [PASS] leg2 alpha resumed from its checkpoint (replayed 1501 < half 3000) (yes)
+  [PASS] leg2 beta resumed from its checkpoint (replayed 1501 < half 2000) (yes)
+{
+  "alpha": {
+    "expect": 6000,
+    "distinct": 6000,
+    "total_delivered": 7500,
+    "min": 0,
+    "max": 5999,
+    "replayed": 1500,
+    "exact": true
+  },
+  "beta": {
+    "expect": 4000,
+    "distinct": 4000,
+    "total_delivered": 5500,
+    "min": 0,
+    "max": 3999,
+    "replayed": 1500,
+    "exact": true
+  }
+}
+  [PASS] stream alpha: distinct 6000/6000, min 0, max 5999, replayed-then-deduped 1500
+  [PASS] stream beta: distinct 4000/4000, min 0, max 3999, replayed-then-deduped 1500
+  [PASS] leg2 both streams exact after resume (0)
+
+### LEG 3 — RECONFIG: live SIGHUP add + remove, the other keeps flowing ###
+  [t0] alpha-only running; alpha delivered=6000  beta delivered=0 (beta not configured yet)
+  [PASS] leg3 beta silent before it is added (0)
+  [t1] SIGHUP add beta; beta delivered=4000  alpha still=6000
+    log: config reload: source added — tailing it source=beta
+  [t2] SIGHUP remove alpha; agent alive=yes
+    log: config reload: source removed — stopping it source=alpha
+    alpha state preserved: checkpoint=yes queue=yes
+  [PASS] leg3 agent survived remove (yes)
+  [PASS] leg3 removed source's checkpoint preserved (yes)
+  [PASS] leg3 removed source's queue not orphaned (yes)
+  [t3] beta kept flowing after the remove; beta delivered=5500 (target 5500)
+{
+  "alpha": {
+    "expect": 6000,
+    "distinct": 6000,
+    "total_delivered": 6000,
+    "min": 0,
+    "max": 5999,
+    "replayed": 0,
+    "exact": true
+  },
+  "beta": {
+    "expect": 5500,
+    "distinct": 5500,
+    "total_delivered": 5500,
+    "min": 0,
+    "max": 5499,
+    "replayed": 0,
+    "exact": true
+  }
+}
+  [PASS] stream alpha: distinct 6000/6000, min 0, max 5999, replayed-then-deduped 0
+  [PASS] stream beta: distinct 5500/5500, min 0, max 5499, replayed-then-deduped 0
+  [PASS] leg3 alpha exact up to removal, beta exact across the whole run (0)
+
+=== PASS: one agent tails many sources — exact per stream, independent
+          checkpoints across a crash, and a live add/remove that leaves
+          the other sources flowing. ===
