@@ -308,6 +308,11 @@ async fn run_file_source(
     tel: std::sync::Arc<telemetry::Telemetry>,
     reload_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
+    // #49: this source's slice of /metrics. The loop below writes it, and
+    // Telemetry::aggregate sums it with the other sources at render time, so N
+    // sources cannot clobber each other's numbers.
+    let snap = tel.register_source();
+
     // The transform stage (#42/#43/#44) is the reloadable part of the source
     // (#10): held in its own locals, not read off `source`, so a SIGHUP can
     // swap the rules on the running tail while the source's identity and
@@ -529,28 +534,28 @@ async fn run_file_source(
         {
             use std::sync::atomic::Ordering::Relaxed;
             tel.tick();
-            tel.lines_read.store(read_total, Relaxed);
-            tel.quarantined.store(pipe.quarantined, Relaxed);
-            tel.records_dropped_filter
+            snap.lines_read.store(read_total, Relaxed);
+            snap.quarantined.store(pipe.quarantined, Relaxed);
+            snap.records_dropped_filter
                 .store(pipe.dropped_filter, Relaxed);
-            tel.records_dropped_sample
+            snap.records_dropped_sample
                 .store(pipe.dropped_sample, Relaxed);
-            tel.queue_bytes.store(pipe.queue.bytes(), Relaxed);
-            tel.queue_segments.store(pipe.queue.len() as u64, Relaxed);
-            tel.queue_full.store(pipe.queue.full, Relaxed);
-            tel.spilled_total.store(pipe.queue.spilled_total, Relaxed);
-            tel.drained_total.store(pipe.queue.drained_total, Relaxed);
-            tel.pending_lines.store(batch.len() as u64, Relaxed);
-            tel.inflight_batches
+            snap.queue_bytes.store(pipe.queue.bytes(), Relaxed);
+            snap.queue_segments.store(pipe.queue.len() as u64, Relaxed);
+            snap.queue_full.store(pipe.queue.full, Relaxed);
+            snap.spilled_total.store(pipe.queue.spilled_total, Relaxed);
+            snap.drained_total.store(pipe.queue.drained_total, Relaxed);
+            snap.pending_lines.store(batch.len() as u64, Relaxed);
+            snap.inflight_batches
                 .store(pipe.inflight.len() as u64, Relaxed);
-            tel.unread_bytes.store(tailer.unread_bytes(), Relaxed);
-            tel.files_open.store(tailer.marks().len() as u64, Relaxed);
-            tel.files_lost.store(tailer.files_lost, Relaxed);
-            tel.rotations.store(tailer.rotations, Relaxed);
-            tel.watermark_violations
+            snap.unread_bytes.store(tailer.unread_bytes(), Relaxed);
+            snap.files_open.store(tailer.marks().len() as u64, Relaxed);
+            snap.files_lost.store(tailer.files_lost, Relaxed);
+            snap.rotations.store(tailer.rotations, Relaxed);
+            snap.watermark_violations
                 .store(pipe.watermark.violations, Relaxed);
-            tel.out_of_window.store(stamper.out_of_window, Relaxed);
-            tel.read_ns.store(pipe.read_ns, Relaxed);
+            snap.out_of_window.store(stamper.out_of_window, Relaxed);
+            snap.read_ns.store(pipe.read_ns, Relaxed);
             tel.cert_expires_in_secs.store(
                 pipe.shipper.credential_expires_in_secs().unwrap_or(-1),
                 Relaxed,

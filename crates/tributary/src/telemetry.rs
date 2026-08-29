@@ -31,18 +31,49 @@
 //! shipped, quarantined, or queued, so without it a healthy drop reads as data
 //! lost.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ship::Counters;
+
+/// One file-tail source's contribution to `/metrics` (#49). There is one per
+/// `[[source]]`; `Telemetry::aggregate` sums them into the exposition. Every
+/// field mirrors a per-source field of `Telemetry`.
+#[derive(Default)]
+pub struct SourceSnap {
+    pub lines_read: AtomicU64,
+    pub quarantined: AtomicU64,
+    pub queue_bytes: AtomicU64,
+    pub queue_segments: AtomicU64,
+    pub queue_full: AtomicBool,
+    pub spilled_total: AtomicU64,
+    pub drained_total: AtomicU64,
+    pub pending_lines: AtomicU64,
+    pub inflight_batches: AtomicU64,
+    pub unread_bytes: AtomicU64,
+    pub files_open: AtomicU64,
+    pub files_lost: AtomicU64,
+    pub rotations: AtomicU64,
+    pub watermark_violations: AtomicU64,
+    pub out_of_window: AtomicU64,
+    pub records_dropped_filter: AtomicU64,
+    pub records_dropped_sample: AtomicU64,
+    pub read_ns: AtomicU64,
+}
 
 /// Everything `/metrics` and `/healthz` report.
 pub struct Telemetry {
     /// Exact, shared with the shipping tasks.
     pub ship: Arc<Counters>,
 
-    // -- published by the main loop, once per tick ---------------------
+    /// Per-source snapshots (#49): one per `[[source]]`, summed into the
+    /// per-source fields below by `aggregate()` before each render. Those
+    /// fields are that aggregate cache — written only by `aggregate`, never
+    /// directly, so N sources cannot clobber each other.
+    sources: RwLock<Vec<Arc<SourceSnap>>>,
+
+    // -- aggregate of the per-source snapshots, refreshed each render ---
     pub lines_read: AtomicU64,
     pub quarantined: AtomicU64,
     pub queue_bytes: AtomicU64,
@@ -95,6 +126,7 @@ impl Telemetry {
         let now = epoch_ms();
         Arc::new(Telemetry {
             ship,
+            sources: RwLock::new(Vec::new()),
             lines_read: AtomicU64::new(0),
             quarantined: AtomicU64::new(0),
             queue_bytes: AtomicU64::new(0),
@@ -126,6 +158,52 @@ impl Telemetry {
         })
     }
 
+    /// Register a source's snapshot (#49). Called once per `[[source]]` at
+    /// startup; the returned handle is what that source's loop updates.
+    pub fn register_source(&self) -> Arc<SourceSnap> {
+        let snap = Arc::new(SourceSnap::default());
+        self.sources
+            .write()
+            .expect("sources lock")
+            .push(Arc::clone(&snap));
+        snap
+    }
+
+    /// Sum the per-source snapshots into the aggregate cache. Called at the top
+    /// of `render_prometheus`, so the exposition always reflects every source.
+    /// `queue_full` aggregates as "any source is full", not a sum.
+    fn aggregate(&self) {
+        let st = Ordering::Relaxed;
+        let snaps = self.sources.read().expect("sources lock");
+        macro_rules! sum {
+            ($field:ident) => {
+                snaps.iter().map(|s| s.$field.load(st)).sum::<u64>()
+            };
+        }
+        self.lines_read.store(sum!(lines_read), st);
+        self.quarantined.store(sum!(quarantined), st);
+        self.queue_bytes.store(sum!(queue_bytes), st);
+        self.queue_segments.store(sum!(queue_segments), st);
+        self.queue_full
+            .store(snaps.iter().any(|s| s.queue_full.load(st)), st);
+        self.spilled_total.store(sum!(spilled_total), st);
+        self.drained_total.store(sum!(drained_total), st);
+        self.pending_lines.store(sum!(pending_lines), st);
+        self.inflight_batches.store(sum!(inflight_batches), st);
+        self.unread_bytes.store(sum!(unread_bytes), st);
+        self.files_open.store(sum!(files_open), st);
+        self.files_lost.store(sum!(files_lost), st);
+        self.rotations.store(sum!(rotations), st);
+        self.watermark_violations
+            .store(sum!(watermark_violations), st);
+        self.out_of_window.store(sum!(out_of_window), st);
+        self.records_dropped_filter
+            .store(sum!(records_dropped_filter), st);
+        self.records_dropped_sample
+            .store(sum!(records_dropped_sample), st);
+        self.read_ns.store(sum!(read_ns), st);
+    }
+
     /// Called by the main loop each pass. Cheap: a handful of relaxed
     /// stores, no allocation, no lock.
     pub fn tick(&self) {
@@ -144,13 +222,21 @@ impl Telemetry {
     /// The exposure that P1-7 measures: everything the server has not
     /// acked, which is what a vanished node takes with it.
     pub fn at_risk_lines(&self) -> u64 {
-        self.pending_lines.load(Ordering::Relaxed)
+        self.sources
+            .read()
+            .expect("sources lock")
+            .iter()
+            .map(|s| s.pending_lines.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Prometheus text exposition (v0.0.4). Hand-rolled on purpose — the
     /// format is a dozen lines of rules and this avoids a dependency in an
     /// agent whose whole argument is that it is small.
     pub fn render_prometheus(&self) -> String {
+        // Refresh the per-source aggregate cache so the exposition reflects
+        // every source, not whichever loop pass wrote last (#49).
+        self.aggregate();
         let g = |v: &AtomicU64| v.load(Ordering::Relaxed);
         let mut s = String::with_capacity(4096);
 
@@ -500,11 +586,14 @@ mod tests {
     #[test]
     fn the_set_supports_the_accounting_invariant() {
         let t = tel();
-        t.lines_read.store(1000, Ordering::Relaxed);
+        // The per-source fields now live on a registered snapshot; the render
+        // sums the snaps into the exposition. The shipper counter is shared.
+        let snap = t.register_source();
+        snap.lines_read.store(1000, Ordering::Relaxed);
         t.ship.shipped.store(900, Ordering::Relaxed);
-        t.quarantined.store(10, Ordering::Relaxed);
-        t.records_dropped_filter.store(30, Ordering::Relaxed);
-        t.pending_lines.store(60, Ordering::Relaxed);
+        snap.quarantined.store(10, Ordering::Relaxed);
+        snap.records_dropped_filter.store(30, Ordering::Relaxed);
+        snap.pending_lines.store(60, Ordering::Relaxed);
 
         let out = t.render_prometheus();
         let val = |name: &str| -> f64 {
@@ -530,6 +619,42 @@ mod tests {
             unaccounted,
             val("tributary_at_risk_lines"),
             "read - shipped - quarantined - dropped must equal what is still held"
+        );
+    }
+
+    #[test]
+    fn per_source_snapshots_are_summed_in_the_exposition() {
+        let t = tel();
+        let a = t.register_source();
+        let b = t.register_source();
+        a.lines_read.store(100, Ordering::Relaxed);
+        b.lines_read.store(250, Ordering::Relaxed);
+        a.queue_bytes.store(4096, Ordering::Relaxed);
+        b.queue_bytes.store(1024, Ordering::Relaxed);
+        b.queue_full.store(true, Ordering::Relaxed);
+
+        let out = t.render_prometheus();
+        let val = |name: &str| -> u64 {
+            out.lines()
+                .find(|l| l.starts_with(&format!("{name} ")))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("{name} not exported"))
+        };
+        assert_eq!(
+            val("tributary_lines_read_total"),
+            350,
+            "lines_read must sum across sources"
+        );
+        assert_eq!(
+            val("tributary_queue_bytes"),
+            5120,
+            "queue_bytes must sum across sources"
+        );
+        assert_eq!(
+            val("tributary_queue_full"),
+            1,
+            "queue_full is 1 when ANY source is full, not a sum"
         );
     }
 
