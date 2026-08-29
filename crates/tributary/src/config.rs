@@ -473,6 +473,31 @@ impl Config {
                 anyhow::bail!("source '{}' has no `path` to tail", src.name);
             }
         }
+        // #49: multi-source is file tails only for now — journald and winlog
+        // are one-per-agent pull loops. And two sources sharing a name would
+        // share a checkpoint and queue, silently interleaving two streams.
+        if cfg.sources.len() > 1 {
+            for s in &cfg.sources {
+                if matches!(s.parser, Parser::Journald | Parser::Winlog) {
+                    anyhow::bail!(
+                        "source '{}' is {:?}: journald and winlog sources cannot be combined \
+                         with other sources yet — run one agent per such source",
+                        s.name,
+                        s.parser
+                    );
+                }
+            }
+            let mut names = std::collections::BTreeSet::new();
+            for s in &cfg.sources {
+                if !names.insert(s.name.as_str()) {
+                    anyhow::bail!(
+                        "two sources share the name '{}' — names must be unique; they key the \
+                         checkpoint and queue",
+                        s.name
+                    );
+                }
+            }
+        }
         if let Some(tls) = &cfg.output.tls {
             tls.validate()?;
             // A client certificate over plain HTTP is never presented — the
@@ -766,6 +791,28 @@ mod tests {
         .expect("an OTLP-only agent is a valid configuration");
         assert!(cfg.sources.is_empty());
         assert_eq!(cfg.otlp.unwrap().table, "logs");
+    }
+
+    #[test]
+    fn multiple_file_sources_load_but_duplicate_names_are_refused() {
+        // Two file sources — the whole point of #49.
+        let cfg = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [[source]]\nname = \"a\"\npath = \"/var/log/a.log\"\ntable = \"logs\"\n\n\
+             [[source]]\nname = \"b\"\npath = \"/var/log/b.log\"\ntable = \"logs\"\n",
+        )
+        .expect("two file sources are a valid multi-source config");
+        assert_eq!(cfg.sources.len(), 2);
+
+        // Two sources with the same name would share a checkpoint and queue.
+        let err = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [[source]]\nname = \"dup\"\npath = \"/var/log/a.log\"\ntable = \"logs\"\n\n\
+             [[source]]\nname = \"dup\"\npath = \"/var/log/b.log\"\ntable = \"logs\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("share the name"), "{err}");
     }
 
     #[test]
