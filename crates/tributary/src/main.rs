@@ -198,11 +198,6 @@ async fn main() -> anyhow::Result<()> {
     if cfg.sources.is_empty() {
         return run_sourceless(cfg, &args).await;
     }
-    let source = cfg
-        .sources
-        .first()
-        .expect("load() guarantees a source when there is no [otlp]");
-
     let shipper = build_shipper(&cfg.output)?;
     // A one-line, secret-free statement of posture: an operator can tell from
     // the log whether this agent is presenting a credential, without it ever
@@ -234,20 +229,21 @@ async fn main() -> anyhow::Result<()> {
     // returns so it runs regardless of which source path this config takes.
     spawn_metrics(&cfg, &args)?;
 
-    // #23: a journald source reads the journal via the sd-journal cursor, not
-    // a file — its own pull loop, reusing this shipper and the same
-    // queue/stamper/checkpoint machinery. Returns instead of falling into the
-    // file-tail setup below.
-    if source.parser == config::Parser::Journald {
-        return run_journald_source(source, shipper, &args, &cfg).await;
-    }
-
-    // #11: a winlog source reads a Windows Event Log channel via wevtapi and
-    // its bookmark, not a file — its own pull loop, reusing this shipper and
-    // the same queue/stamper/checkpoint machinery. Returns instead of falling
-    // into the file-tail setup below.
-    if source.parser == config::Parser::Winlog {
-        return run_winlog_source(source, shipper, &args, &cfg).await;
+    // #23/#11: journald and winlog are single-source pull loops (Config::load
+    // rejects them alongside other sources), so they keep their early-return
+    // path. Scoped so `source` is dropped before the config moves into an Arc
+    // for the file-tail tasks below.
+    {
+        let source = cfg
+            .sources
+            .first()
+            .expect("load() guarantees a source when there is no [otlp]");
+        if source.parser == config::Parser::Journald {
+            return run_journald_source(source, shipper, &args, &cfg).await;
+        }
+        if source.parser == config::Parser::Winlog {
+            return run_winlog_source(source, shipper, &args, &cfg).await;
+        }
     }
 
     // #12: run the OTLP receiver alongside the file tail when configured. Its
@@ -269,16 +265,14 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // #10 (T-5): SIGHUP requests a config reload. A dedicated listener sets a
-    // flag the loop drains once per pass — the same shape as the L4 cert check
-    // below, so a reload cannot race the shutdown or checkpoint path and a
-    // burst of HUPs collapses to one reload. Unix only: there is no SIGHUP on
-    // Windows (a winlog agent restarts via its service manager), and the flag
-    // simply never sets there.
-    let reload_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // #10/#49 (T-5): SIGHUP bumps a generation counter; every source reloads
+    // when it sees a newer generation than it last applied. A shared swap-flag
+    // would let only the first source that checked it ever see the reload.
+    // Unix only — there is no SIGHUP on Windows.
+    let reload_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     #[cfg(unix)]
     {
-        let flag = std::sync::Arc::clone(&reload_flag);
+        let hup_gen = std::sync::Arc::clone(&reload_gen);
         tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
             let mut hup = match signal(SignalKind::hangup()) {
@@ -289,25 +283,102 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             while hup.recv().await.is_some() {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                hup_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         });
     }
 
-    run_file_source(source, &cfg, &args, shipper, tel, reload_flag).await
+    // #49: one tail task per [[source]]. Each owns its stamper, watermark,
+    // checkpoint and queue; all share this shipper (one connection pool) and
+    // telemetry (summed per source). A shared shutdown lets one source's
+    // failure take the whole agent down loudly rather than leave it half-dead.
+    let cfg = std::sync::Arc::new(cfg);
+    let args = std::sync::Arc::new(args);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut set: tokio::task::JoinSet<anyhow::Result<()>> = tokio::task::JoinSet::new();
+    for idx in 0..cfg.sources.len() {
+        set.spawn(run_file_source(
+            std::sync::Arc::clone(&cfg),
+            idx,
+            std::sync::Arc::clone(&args),
+            shipper.clone(),
+            std::sync::Arc::clone(&tel),
+            std::sync::Arc::clone(&reload_gen),
+            shutdown_rx.clone(),
+        ));
+    }
+    drop(shutdown_rx);
+    drop(shipper);
+
+    // Coordinate: the OS stop signal, or any source finishing/failing.
+    let stop = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    tokio::pin!(stop);
+    let mut first_err: Option<anyhow::Error> = None;
+    let mut signalled = false;
+    loop {
+        tokio::select! {
+            _ = &mut stop, if !signalled => {
+                tracing::info!("shutting down — signalling every source");
+                let _ = shutdown_tx.send(true);
+                signalled = true;
+            }
+            joined = set.join_next() => match joined {
+                None => break,
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => {
+                    tracing::error!(error = %e, "a source failed — stopping the agent");
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    let _ = shutdown_tx.send(true);
+                    signalled = true;
+                }
+                Some(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(anyhow::anyhow!(e));
+                    }
+                    let _ = shutdown_tx.send(true);
+                    signalled = true;
+                }
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// One file-tail source's whole pipeline: per-source setup, the tail loop,
 /// and the drain on shutdown. Phase 1 of #49 extracts it verbatim so phase 2
 /// can spawn one per `[[source]]`; single-source behaviour is unchanged.
 async fn run_file_source(
-    source: &config::Source,
-    cfg: &config::Config,
-    args: &Args,
+    cfg: std::sync::Arc<config::Config>,
+    source_idx: usize,
+    args: std::sync::Arc<Args>,
     shipper: ship::Shipper,
     tel: std::sync::Arc<telemetry::Telemetry>,
-    reload_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // #49: SIGHUP bumps this generation; the loop reloads when it sees a newer
+    // one than it last applied. A shared swap-flag would let only the first
+    // source that checked it ever see a reload.
+    reload_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    // Broadcast by main: any source failing, or an OS stop signal, sets it.
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    // The Arcs keep the shared config/args alive for the task; the body reads
+    // them as plain references, so nothing below this changes.
+    let cfg: &config::Config = &cfg;
+    let args: &Args = &args;
+    let source = &cfg.sources[source_idx];
     // #49: this source's slice of /metrics. The loop below writes it, and
     // Telemetry::aggregate sums it with the other sources at render time, so N
     // sources cannot clobber each other's numbers.
@@ -345,15 +416,32 @@ async fn run_file_source(
         wm.restore(l);
     }
 
+    // #49: each source gets its own queue and dead-letter, keyed by name, so
+    // two sources cannot share one spool. Migrate a single-source deployment's
+    // legacy `state_dir/queue` to the per-source name on upgrade so it does not
+    // strand spooled lines; a multi-source config is new and has no legacy dir.
+    let queue_dir = args.state_dir.join(format!("queue-{}", source.name));
+    if cfg.sources.len() == 1 {
+        let legacy = args.state_dir.join("queue");
+        if legacy.exists()
+            && !queue_dir.exists()
+            && let Err(e) = std::fs::rename(&legacy, &queue_dir)
+        {
+            tracing::warn!(error = %e, "could not migrate the legacy queue dir; starting fresh");
+        }
+    }
+
     let mut pipe = Pipeline {
         shipper,
         inflight: tokio::task::JoinSet::new(),
         max_inflight: cfg.output.max_inflight,
         read_ns: 0,
-        queue: queue::Queue::open(&args.state_dir.join("queue"), cfg.output.queue_max_bytes)?,
+        queue: queue::Queue::open(&queue_dir, cfg.output.queue_max_bytes)?,
         watermark: wm,
         cp_path,
-        dead_letter: args.state_dir.join("dead-letter.lp"),
+        dead_letter: args
+            .state_dir
+            .join(format!("dead-letter-{}.lp", source.name)),
         quarantined: 0,
         dropped_filter: 0,
         dropped_sample: 0,
@@ -414,19 +502,19 @@ async fn run_file_source(
     );
 
     let shutdown = async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
+        // Complete when main broadcasts a shutdown — an OS stop signal, or a
+        // sibling source failing. The channel starts false, so `changed()`
+        // returns only once it flips to true.
+        while shutdown_rx.changed().await.is_ok() {
+            if *shutdown_rx.borrow() {
+                break;
             }
         }
-        #[cfg(not(unix))]
-        let _ = tokio::signal::ctrl_c().await;
     };
     tokio::pin!(shutdown);
+    // #49: the reload generation this source has applied; the loop reloads when
+    // the shared generation moves past it.
+    let mut seen_reload_gen = reload_gen.load(std::sync::atomic::Ordering::Relaxed);
 
     loop {
         // Anything a previous run or a previous outage left queued ships
@@ -620,7 +708,9 @@ async fn run_file_source(
         // refused and the last-good config keeps running, exactly like the
         // credential reload above. The checkpoint and queue are untouched; the
         // in-flight batch finishes on the old rules.
-        if reload_flag.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let cur_reload_gen = reload_gen.load(std::sync::atomic::Ordering::Relaxed);
+        if cur_reload_gen != seen_reload_gen {
+            seen_reload_gen = cur_reload_gen;
             reload_config(
                 &args.config,
                 source,
@@ -1216,7 +1306,9 @@ fn apply_reload(
 ) -> anyhow::Result<ReloadReport> {
     let mut report = ReloadReport::default();
 
-    match new.sources.into_iter().next() {
+    // #49: match THIS source by name in the new config, not the first one —
+    // with several sources, reloading each must apply its own rules.
+    match new.sources.into_iter().find(|s| s.name == source.name) {
         None => report
             .restart_required
             .push("the source was removed".into()),
