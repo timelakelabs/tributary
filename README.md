@@ -308,27 +308,64 @@ kill -HUP "$(pidof tributary)"     # or wire it to `systemctl reload`
 **Hot-reloaded**, effective on the next loop pass:
 
 - the transform stage — `filter`, `sample`, `redact` (add a redaction, tighten
-  a sample rate, drop a newly-noisy pattern)
+  a sample rate, drop a newly-noisy pattern), per source
 - `output.batch_lines`, `output.max_inflight`, `output.watermark_every_secs`,
   `output.rpo_report_secs`
+- the **source set** — add a `[[source]]` and the agent starts tailing it, or
+  delete one and its task stops and drains; the other sources' checkpoints and
+  queues are untouched either way
 
 **Restart-required** — a change here is logged and the running value is kept:
 `output.url`, `output.tls`, `output.database`, `output.queue_max_bytes`, the
 watermark floor/ceiling, the log sink, the bound listeners (`[telemetry]`,
-`[otlp]`, `[metrics]`), and the **source's identity or schema** (`name`,
-`path`, `parser`, `table`, `tags`, `fields`, `timestamp`). Pointing the agent
-at a different file — or changing what a column means — is a restart, not a
-live re-tail: the checkpoint is keyed to the source, and re-seeking a tail the
-change never touched is how you drop or re-ship data.
+`[otlp]`, `[metrics]`), and an **existing source's identity or schema** (`name`,
+`path`, `parser`, `table`, `tags`, `fields`, `timestamp`). Pointing an existing
+source at a different file — or changing what a column means — is a restart, not
+a live re-tail: the checkpoint is keyed to the source, and re-seeking a tail the
+change never touched is how you drop or re-ship data. (Adding or removing a
+whole `[[source]]` *is* live — that is the source set, above; the restart-only
+rule is about mutating one that stays.)
 
 A reload that fails to load or validate is **refused**: the last-good config
 keeps running and `tributary_config_reloads_refused_total` counts it — the same
 validate-before-swap contract as the L4 certificate reload. `SIGHUP` is
 Unix-only; on Windows the agent restarts through its service manager.
 
-> One agent tails one file today. Adding a second `[[source]]` needs a restart
-> and, in fact, only the first is read at all — see
-> [timelakelabs/tributary#49](https://github.com/timelakelabs/tributary/issues/49).
+## Multiple sources
+
+One agent tails as many files as you give it `[[source]]` blocks for:
+
+```toml
+[[source]]
+name  = "nginx"
+path  = "/var/log/nginx/access.log"
+table = "http"
+
+[[source]]
+name  = "app"
+path  = "/var/log/app/*.log"
+table = "app"
+```
+
+Each source runs its own tail, framer, watermark, checkpoint and durable queue;
+they share one connection pool to TimeLakeDB and one `[telemetry]` endpoint,
+whose counters are summed across sources and also broken out per source. State
+on disk is namespaced by source name — `queue-<name>/`, `<name>.checkpoint`,
+`dead-letter-<name>.lp` under `--state-dir` — so each source crash-resumes on
+its own. An agent that predates this and has a bare `queue/` is migrated to
+`queue-<name>/` in place on first start; nothing to do by hand.
+
+Two rules the loader enforces at startup:
+
+- **Names must be unique.** They key the on-disk state — a collision would put
+  two sources on one checkpoint, fighting over it.
+- **`journald` and `winlog` stay solo.** They are whole-subsystem pull loops
+  with a single cursor each, not file tails, so they cannot share a process
+  with other sources. Run one agent per such source.
+
+The set is live under `SIGHUP` (above). One source failing takes the whole
+agent down — on purpose, and loudly, rather than leaving a green process that
+quietly stopped collecting half your logs.
 
 ## Host metrics (Telegraf-compatible)
 
