@@ -14,6 +14,7 @@ mod glob;
 #[cfg(feature = "journald")]
 mod journald;
 mod k8s;
+mod k8s_labels;
 mod logfile;
 mod lp;
 mod map;
@@ -1012,6 +1013,15 @@ async fn run_glob_source(
         "glob source: discovering container logs"
     );
 
+    // #66: the pod-label resolver, built once per glob source and shared by
+    // every child (so the containers of one pod resolve it once). Disabled
+    // unless the kubernetes `labels` allowlist is non-empty; a bad `label_file`
+    // fails the source here rather than silently stamping nothing.
+    let resolver = std::sync::Arc::new(match template.kubernetes.as_ref() {
+        Some(k) => k8s_labels::LabelResolver::from_kubernetes(k)?,
+        None => k8s_labels::LabelResolver::Disabled,
+    });
+
     // stream name -> its stop-sender. Present means a child is running (or
     // draining), keyed by the stable per-file id so a rescan tells a file it
     // already tails from a newly-appeared one.
@@ -1034,6 +1044,7 @@ async fn run_glob_source(
             &shipper,
             &tel,
             &reload_gen,
+            &resolver,
             name,
             path,
         );
@@ -1086,7 +1097,7 @@ async fn run_glob_source(
                     if !running.contains_key(&name) {
                         tracing::info!(stream = %name, path = %path.display(), "glob source: new container log — tailing it");
                         spawn_glob_child(
-                            &mut set, &mut running, &cfg, &template, &args, &shipper, &tel, &reload_gen, name, path,
+                            &mut set, &mut running, &cfg, &template, &args, &shipper, &tel, &reload_gen, &resolver, name, path,
                         );
                     }
                 }
@@ -1146,6 +1157,7 @@ fn spawn_glob_child(
     shipper: &ship::Shipper,
     tel: &std::sync::Arc<telemetry::Telemetry>,
     reload_gen: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    resolver: &std::sync::Arc<k8s_labels::LabelResolver>,
     name: String,
     path: std::path::PathBuf,
 ) {
@@ -1163,16 +1175,36 @@ fn spawn_glob_child(
         .then(|| k8s::stream_label(&synth.path))
         .flatten()
         .unwrap_or_else(|| name.clone());
-    let synth = std::sync::Arc::new(synth);
 
     let (tx, rx) = tokio::sync::watch::channel(false);
     running.insert(name.clone(), tx);
     let (cfg, args, tel, reload_gen) = (cfg.clone(), args.clone(), tel.clone(), reload_gen.clone());
     let shipper = shipper.clone();
+    let resolver = resolver.clone();
     set.spawn(async move {
+        // #66: resolve this pod's allowlisted labels ONCE, here at child startup
+        // — never per line, which would rate-limit the agent off the node. They
+        // merge into the static tags, so they ride the existing stamping at no
+        // per-record cost. When the file disappears this child retires and the
+        // labels go with it — that is the cache invalidation.
+        let allowlist = synth
+            .kubernetes
+            .as_ref()
+            .map(|k| k.labels.clone())
+            .unwrap_or_default();
+        if !allowlist.is_empty()
+            && let Some(meta) = k8s::parse_cri_path(&synth.path)
+        {
+            let labels = resolver
+                .resolve_allowlisted(&meta.namespace, &meta.pod, &allowlist)
+                .await;
+            for (key, val) in labels {
+                synth.tags_static.insert(key, val);
+            }
+        }
         let r = run_file_source(
             cfg,
-            synth,
+            std::sync::Arc::new(synth),
             name.clone(),
             false,
             args,

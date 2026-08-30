@@ -1,9 +1,12 @@
   [PASS] Namespace has apiVersion/kind/metadata.name
   [PASS] ServiceAccount has apiVersion/kind/metadata.name
+  [PASS] ClusterRole has apiVersion/kind/metadata.name
+  [PASS] ClusterRoleBinding has apiVersion/kind/metadata.name
   [PASS] ConfigMap has apiVersion/kind/metadata.name
   [PASS] DaemonSet has apiVersion/kind/metadata.name
-  [PASS] has exactly the four resources (Namespace, ServiceAccount, ConfigMap, DaemonSet)
-  [PASS] no RBAC objects (none needed to tail host files)
+  [PASS] has the six resources (Namespace, SA, ClusterRole(+Binding), ConfigMap, DaemonSet)
+  [PASS] RBAC is read-only pods only (get/list/watch, no writes, no other resources)
+  [PASS] the binding points the ClusterRole at the tributary ServiceAccount
   [PASS] DaemonSet uses the tributary ServiceAccount
   [PASS] container passes --config and --state-dir
   [PASS] NODE_NAME comes from the Downward API (spec.nodeName)
@@ -15,4 +18,5 @@
   [PASS] config tails the CRI glob /var/log/containers/*.log
   [PASS] config enables kubernetes CRI enrichment ([source.kubernetes])
   [PASS] config stamps the node from the environment (node = "${NODE_NAME}")
+  [PASS] config declares a pod-label allowlist (#66)
 ALL PASS

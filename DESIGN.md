@@ -101,8 +101,16 @@ parses `pod`, `namespace` and `container` out of the CRI log path
 (`/var/log/containers/<pod>_<namespace>_<container>-<id>.log`) and stamps
 them as tags — no apiserver call, no sidecar. These three stay inside the
 allowlist rule because they are bounded by the node's pod count, not by
-message content; pod *labels*, which are unbounded, are a separate
-opt-in allowlist rather than blanket enrichment.
+message content.
+
+Pod *labels* are the same principle taken further. They live in the API
+server, not the path, and they are the cardinality bomb — a
+default-everything enrichment turns one Deployment rollout into thousands
+of dead series through the unbounded `pod-template-hash` label. So they
+are allowlist-first: `[source.kubernetes].labels` names the subset that
+becomes tags, and nothing else is stamped. They are resolved once per pod
+(never per line, which would rate-limit the agent off the node) and
+cached, with the cache invalidated when the pod's log file disappears.
 
 ---
 
