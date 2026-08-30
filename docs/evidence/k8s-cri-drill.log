@@ -1,0 +1,18 @@
+=== CRI text-parser drill (2026-08-30T21:59:53Z) ===
+workdir=/tmp/tmp.TcV48LK0Kh  file=/tmp/tmp.TcV48LK0Kh/containers/web-7d9c8b_shop_server-1111111111111111111111111111111111111111111111111111111111111111.log  lines=200 + one 40KB split line
+-- build --
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.46s
+  wrote 203 physical lines (49627 bytes)
+-- run (parser=cri) --
+  delivered 201 kube records (expected 201: 200 small + 1 reassembled)
+  [PASS] record count (201)
+
+### CRI PARSER ASSERTION ###
+  [PASS] all 201 records stamped at event time (2026-01-01), not ingest (0 out of window)
+  [PASS] stream tag carries stdout and stderr: ['stderr', 'stdout']
+  [PASS] the >16KB P/F split reassembled to ONE record (BIGSTART records=1, has BIGEND=True)
+  [PASS] every record enriched pod=web-7d9c8b ns=shop container=server
+  RESULT: PASS
+  [PASS] cri: event-time, stream tag, P/F reassembly, enrichment (0)
+
+=== ALL PASS ===

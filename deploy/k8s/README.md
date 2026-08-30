@@ -55,16 +55,17 @@ out of every tag. A deployment that rolls a hundred times is a hundred files and
 deployments collapse to 2 series, with zero 64-hex tag values
 (`docs/evidence/k8s-cardinality-drill.log`).
 
-## Known gap: the CRI text format
+## The CRI text format
 
 containerd and CRI-O write the CRI **text** format —
-`2024-01-01T00:00:00.000000000Z stdout F the message`. This manifest uses
-`parser = "plain"`, which ships each line whole as `message`: correct and
-lossless, but the record timestamp is ingestion time and the `stdout`/`stderr`
-stream and the partial-line (`P`/`F`) markers are not split out. A structured
-CRI parser that does that is a worthwhile follow-up. Nodes still on the Docker
-json-file format can set `parser = "dockerjson"` today, which Tributary already
-reassembles.
+`2024-01-01T00:00:00.000000000Z stdout F the message`. The manifest uses
+`parser = "cri"` (#71): it extracts the log's own timestamp (so records are
+stamped at event time, not ingestion time), promotes `stdout`/`stderr` to the
+`stream` tag, and reassembles the `P`/`F` splits the kubelet makes at ~16 KB
+back into one record. `bench/k8s_cri_drill.sh` proves it end to end
+(`docs/evidence/k8s-cri-drill.log`). Nodes on the Docker json-file driver set
+`parser = "docker_json"` instead — the config is otherwise identical, since both
+parsers emit the same `{log, stream, time}` envelope.
 
 ## Label enrichment offline
 

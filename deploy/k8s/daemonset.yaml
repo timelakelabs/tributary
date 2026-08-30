@@ -83,15 +83,18 @@ data:
     # come and go (#64).
     path = "/var/log/containers/*.log"
     table = "kube_logs"
-    # NOTE: containerd/CRI-O write the CRI TEXT format
-    # (`<ts> stdout F <msg>`); this ships each line whole as `message`. A
-    # structured CRI parser that splits out the timestamp and stdout/stderr is
-    # a follow-up — see deploy/k8s/README.md. Docker-json nodes can set
-    # parser = "dockerjson" instead.
-    parser = "plain"
+    # containerd/CRI-O write the CRI TEXT format
+    # `<RFC3339Nano> <stdout|stderr> <F|P> <message>` (#71). The `cri` parser
+    # pulls the timestamp and stream out and reassembles >16 KB `P`/`F` splits,
+    # so records carry the log's OWN time, not ingestion time. Nodes still on the
+    # Docker json-file driver set parser = "docker_json" instead — the config is
+    # otherwise identical (both emit the same {log, stream, time} envelope).
+    parser = "cri"
+    timestamp = { field = "time", format = "rfc3339", resolution = "ns" }
+    tags = ["stream"]
 
     [source.fields]
-    message = "string"
+    log = "string"
 
     # Stamp the node name from the Downward API (see env: NODE_NAME below).
     [source.tags_static]

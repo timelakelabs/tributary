@@ -7,6 +7,18 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Added
 
+- **CRI text-log parser** (`parser = "cri"`, #71). containerd and CRI-O — the
+  default Kubernetes runtimes — write `<RFC3339Nano> <stdout|stderr> <F|P>
+  <message>`, not JSON. Shipping that with `parser = "plain"` buried the real
+  timestamp and stream in the message and stamped records at ingestion time. The
+  new parser extracts the log's own timestamp, promotes `stdout`/`stderr` to the
+  `stream` tag, and reassembles the `P`/`F` splits the kubelet makes at ~16 KB
+  back into one record — reusing the same `{log, stream, time}` envelope the
+  `docker_json` reassembler emits, so a config works for either runtime. The
+  DaemonSet manifest now uses it. Drilled end to end
+  (`bench/k8s_cri_drill.sh`, `docs/evidence/k8s-cri-drill.log`): 200 lines plus
+  a 40 KB `P`/`F` split, all stamped at event time (not ingest), stdout/stderr
+  on the `stream` tag, the split reassembled to one record, enrichment intact.
 - **Allowlisted pod-label enrichment** (#8, phase 4, #66). `[source.kubernetes]`
   gains a `labels` allowlist: a pod label becomes a tag only if named there,
   resolved once per pod (never per line — that would rate-limit the agent off

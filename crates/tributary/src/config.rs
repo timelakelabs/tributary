@@ -405,6 +405,11 @@ pub enum Parser {
     /// parsed as JSON — see [`crate::docker`].
     #[serde(rename = "docker_json")]
     DockerJson,
+    /// The CRI text format (#71) that containerd and CRI-O write:
+    /// `<RFC3339Nano> <stdout|stderr> <F|P> <message>`, with >16 KB lines split
+    /// across `P` entries. Reassembled upstream into the same envelope as
+    /// `docker_json`, then parsed as JSON — see [`crate::cri`].
+    Cri,
     /// systemd journal entries (#23) — parsed as JSON after the journald
     /// source turns each entry into a JSON object.
     Journald,
@@ -580,10 +585,11 @@ impl Config {
             }
         }
         for s in &cfg.sources {
-            if s.parser == Parser::DockerJson && s.multiline.is_some() {
+            if matches!(s.parser, Parser::DockerJson | Parser::Cri) && s.multiline.is_some() {
                 anyhow::bail!(
-                    "source '{}': parser = \"docker_json\" cannot also set \n                     [source.multiline] — the docker reassembler owns framing",
-                    s.name
+                    "source '{}': parser = {:?} cannot also set [source.multiline] — its \n                     reassembler owns framing",
+                    s.name,
+                    s.parser
                 );
             }
             if crate::stamp::Resolution::parse(&s.resolution_str()).is_none() {
