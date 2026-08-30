@@ -346,7 +346,7 @@ mod tests {
         s.path = "/var/log/containers/checkout-6c98bcbf89-2xk4p_shop_\
                   server-3f8b2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c.log"
             .into();
-        s.kubernetes = Some(crate::config::Kubernetes {});
+        s.kubernetes = Some(crate::config::Kubernetes::default());
         let (r, _) = map_line(&s, r#"{"ts":1,"message":"x","idx":1}"#).unwrap();
         let get = |k: &str| r.tags.iter().find(|(t, _)| t == k).map(|(_, v)| v.as_str());
         assert_eq!(get("namespace"), Some("shop"));
@@ -360,7 +360,7 @@ mod tests {
         // parse fails closed rather than stamping a garbage pod/container.
         let mut s = src();
         s.path = "/var/log/app.log".into();
-        s.kubernetes = Some(crate::config::Kubernetes {});
+        s.kubernetes = Some(crate::config::Kubernetes::default());
         let (r, _) = map_line(&s, r#"{"ts":1,"message":"x","idx":1}"#).unwrap();
         assert!(!r.tags.iter().any(|(k, _)| k == "pod" || k == "container"));
     }

@@ -27,6 +27,36 @@ metadata:
   labels:
     app.kubernetes.io/name: tributary
 ---
+# The ONLY RBAC this needs, and only because of pod-label enrichment (#66):
+# read-only access to pods so labels can be resolved. get/list/watch and
+# nothing else — no writes, no other resources, no secrets. Drop the `labels`
+# allowlist from the ConfigMap and this can go too.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tributary-pod-reader
+  labels:
+    app.kubernetes.io/name: tributary
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tributary-pod-reader
+  labels:
+    app.kubernetes.io/name: tributary
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tributary-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: tributary
+    namespace: tributary
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -70,7 +100,14 @@ data:
     # Presence enables CRI path enrichment (#63): pod / namespace / container
     # are parsed from each file's path. Bounded by the node's pod count, so
     # they are safe as tags; the container id is deliberately NOT one.
+    #
+    # `labels` is the pod-LABEL allowlist (#66): only these labels become tags,
+    # resolved once per pod from the API server and cached. Everything else is
+    # dropped — a label like `pod-template-hash` is unbounded and would blow up
+    # cardinality, which is why enrichment is allowlist-first. Change this list
+    # to the labels you actually query by. An empty/absent list contacts no API.
     [source.kubernetes]
+    labels = ["app", "version"]
 ---
 apiVersion: apps/v1
 kind: DaemonSet

@@ -7,6 +7,19 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Added
 
+- **Allowlisted pod-label enrichment** (#8, phase 4, #66). `[source.kubernetes]`
+  gains a `labels` allowlist: a pod label becomes a tag only if named there,
+  resolved once per pod (never per line — that would rate-limit the agent off
+  the node) and cached, with the child's held labels dropped when its log file
+  disappears. Nothing is stamped by default, because a label like
+  `pod-template-hash` is unbounded and would blow up cardinality — the FR-2
+  failure, reintroduced at the shipper where TimeLakeDB can't defend against it.
+  Labels come from the in-cluster API server (a read-only `pods` Role, the only
+  RBAC the DaemonSet needs) or a static `label_file` for air-gapped clusters and
+  the offline drill. `bench/k8s_labels_drill.sh` proves it: 100 files carrying
+  `app`/`team`/`pod-template-hash` collapse to 2 series with `app` and `team`
+  stamped and `pod-template-hash` never a tag
+  (`docs/evidence/k8s-labels-drill.log`). This completes the DaemonSet epic (#8).
 - **Kubernetes DaemonSet manifest** (#8, phase 3, #65). `deploy/k8s/daemonset.yaml`
   runs one Tributary per node tailing `/var/log/containers/*.log`, with the node
   name stamped from the Downward API, host logs mounted read-only, checkpoints on

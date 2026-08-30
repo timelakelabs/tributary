@@ -33,13 +33,22 @@ for d in docs:
           bool(d.get("apiVersion") and d.get("kind") and d.get("metadata", {}).get("name")))
     by_kind.setdefault(d.get("kind"), []).append(d)
 
-check("has exactly the four resources (Namespace, ServiceAccount, ConfigMap, DaemonSet)",
-      set(by_kind) == {"Namespace", "ServiceAccount", "ConfigMap", "DaemonSet"})
-# No RBAC in phase 3 — tailing host files needs no apiserver access. Pod-label
-# enrichment (phase 4) is what adds a Role; asserting its absence now keeps the
-# "scoped to what it needs and no more" claim honest.
-check("no RBAC objects (none needed to tail host files)",
-      not ({"Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding"} & set(by_kind)))
+check("has the six resources (Namespace, SA, ClusterRole(+Binding), ConfigMap, DaemonSet)",
+      set(by_kind) == {"Namespace", "ServiceAccount", "ClusterRole",
+                       "ClusterRoleBinding", "ConfigMap", "DaemonSet"})
+# The RBAC is read-only pods and nothing more — that is the "scoped to what it
+# needs and no more" claim, now that phase 4 reads pod labels from the API.
+cr = by_kind.get("ClusterRole", [{}])[0]
+rules = cr.get("rules", [])
+check("RBAC is read-only pods only (get/list/watch, no writes, no other resources)",
+      len(rules) == 1
+      and rules[0].get("resources") == ["pods"]
+      and set(rules[0].get("verbs", [])) == {"get", "list", "watch"})
+crb = by_kind.get("ClusterRoleBinding", [{}])[0]
+subj = (crb.get("subjects") or [{}])[0]
+check("the binding points the ClusterRole at the tributary ServiceAccount",
+      crb.get("roleRef", {}).get("name") == "tributary-pod-reader"
+      and subj.get("kind") == "ServiceAccount" and subj.get("name") == "tributary")
 
 ds = by_kind.get("DaemonSet", [{}])[0]
 spec = ds.get("spec", {}).get("template", {}).get("spec", {})
@@ -81,6 +90,8 @@ check("config enables kubernetes CRI enrichment ([source.kubernetes])",
       "[source.kubernetes]" in toml)
 check("config stamps the node from the environment (node = \"${NODE_NAME}\")",
       'node = "${NODE_NAME}"' in toml)
+check("config declares a pod-label allowlist (#66)",
+      "labels = [" in toml)
 
 print("ALL PASS" if fail == 0 else "FAILURES")
 sys.exit(fail)

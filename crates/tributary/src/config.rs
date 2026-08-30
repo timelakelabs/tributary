@@ -304,10 +304,27 @@ pub struct Source {
     pub kubernetes: Option<Kubernetes>,
 }
 
-/// Kubernetes source options (#8). Empty for now — its presence alone enables
-/// CRI path enrichment. Phase 4 (#66) adds the pod-label allowlist here.
+/// Kubernetes source options (#8). Its presence enables CRI path enrichment
+/// (pod/namespace/container from the log path, #63). `labels` opts into
+/// pod-LABEL enrichment (#66): a label named here becomes a tag, resolved once
+/// per pod from the API server (or `label_file`) and cached. Nothing is stamped
+/// by default — a label the operator did not name never becomes a tag, because
+/// labels like `pod-template-hash` are unbounded and would blow up cardinality.
 #[derive(Debug, Deserialize, Clone, Default)]
-pub struct Kubernetes {}
+pub struct Kubernetes {
+    /// The pod-label ALLOWLIST. A label becomes a tag only if it is named here;
+    /// everything else is dropped. Empty (the default) means no label
+    /// enrichment at all — the API server is not even contacted.
+    #[serde(default)]
+    pub labels: Vec<String>,
+
+    /// Resolve labels from this static `namespace/pod -> {label: value}` JSON
+    /// file instead of the API server. For air-gapped deployments, and the only
+    /// way the offline cardinality drill can supply labels. Absent = the
+    /// in-cluster API server.
+    #[serde(default)]
+    pub label_file: Option<std::path::PathBuf>,
+}
 
 /// A sample rule for the transform stage (#43). With `field`/`equals` it
 /// applies only to records where that tag or field equals the value (so a

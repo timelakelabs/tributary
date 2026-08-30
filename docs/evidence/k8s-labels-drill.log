@@ -1,0 +1,17 @@
+=== k8s pod-label allowlist drill (2026-08-30T21:44:04Z) ===
+workdir=/tmp/tmp.BmHHOboT8A  deployments=2  restarts_each=50  files=100  allowlist=[app,team]  node=node-1
+-- build --
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.56s
+  created 100 CRI files
+-- run (NODE_NAME=node-1, labels allowlist=[app,team]) --
+
+### LABEL ALLOWLIST ASSERTION ###
+  distinct series (full tag-set) = 2 (expected 2)
+  [PASS] allowlisted label 'app' is a tag: ['api', 'web']
+  [PASS] allowlisted label 'team' is a tag: ['ops', 'pay']
+  [PASS] non-allowlisted label 'pod-template-hash' never became a tag (values seen=0)
+  [PASS] no 64-hex id tags (values seen=0)
+  RESULT: PASS
+  [PASS] labels allowlist: app/team stamped, pod-template-hash excluded, series bounded (0)
+
+=== ALL PASS ===

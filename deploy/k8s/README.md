@@ -31,10 +31,16 @@ python3 deploy/k8s/validate.py deploy/k8s/daemonset.yaml
 - **State** (checkpoints + queue) lives on a `hostPath` (`/var/lib/tributary`),
   so a restarted agent resumes exactly where it stopped instead of re-shipping
   the world or losing its queue.
-- **Permissions** are a ServiceAccount and nothing else — tailing host files
-  needs no apiserver access. `/var/log` is mounted **read-only**; the agent runs
-  as root only to read root-owned pod logs, with no privilege escalation, all
-  capabilities dropped, and a read-only root filesystem.
+- **Labels** (`app`, `version`, …) are opt-in via the `labels` allowlist (#66):
+  a label becomes a tag only if named, resolved once per pod from the API server
+  and cached. A label the operator did not name — the unbounded
+  `pod-template-hash` — never becomes a tag. Drop the allowlist and no API call
+  is made.
+- **Permissions** are a ServiceAccount plus **read-only pods** (`get`/`list`/
+  `watch`) — the only RBAC here, and only because of label enrichment. Nothing
+  writes, no other resource, no secrets. `/var/log` is mounted **read-only**;
+  the agent runs as root only to read root-owned pod logs, with no privilege
+  escalation, all capabilities dropped, and a read-only root filesystem.
 
 ## Cardinality — the thing that makes this safe
 
@@ -60,7 +66,12 @@ CRI parser that does that is a worthwhile follow-up. Nodes still on the Docker
 json-file format can set `parser = "dockerjson"` today, which Tributary already
 reassembles.
 
-## Coming in phase 4 (#66)
+## Label enrichment offline
 
-Allowlisted pod **labels** as tags. That reads pod metadata from the apiserver,
-so it will add a read-only `pods` Role — the first and only RBAC this needs.
+Labels normally come from the API server, but a `label_file` under
+`[source.kubernetes]` resolves them from a static `namespace/pod -> {label:
+value}` JSON map instead — for air-gapped clusters, and the only way the offline
+drill can supply labels. `bench/k8s_labels_drill.sh` uses it to prove the
+allowlist: 100 files carrying `app`/`team`/`pod-template-hash` collapse to 2
+series with `app` and `team` stamped and `pod-template-hash` never a tag
+(`docs/evidence/k8s-labels-drill.log`).
