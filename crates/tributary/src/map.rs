@@ -192,7 +192,17 @@ pub(crate) fn build_record(
         tags.push(("pod".into(), meta.pod));
         tags.push(("container".into(), meta.container));
     }
-    tags.sort_by(|a, b| a.0.cmp(&b.0));
+    // Dedup by key, LAST-WINS, then emit sorted. A tag promoted from the parsed
+    // line (stdout/stderr on the `stream` key from a container-log envelope)
+    // overrides the source-identity default that was seeded first, rather than
+    // emitting the key twice — a duplicate tag key is not representable in line
+    // protocol and TimeLakeDB rejects it. `BTreeMap` keeps the last insert per
+    // key and iterates in key order, so this replaces the sort too.
+    let tags: Vec<(String, String)> = tags
+        .into_iter()
+        .collect::<std::collections::BTreeMap<String, String>>()
+        .into_iter()
+        .collect();
 
     // Fields: declared types only. An undeclared key is dropped rather
     // than guessed, because a guess becomes permanent on first write.
@@ -283,8 +293,16 @@ mod tests {
             rec.fields,
             vec![("log".into(), Value::Str("disk full".into()))]
         );
-        // stdout/stderr rides the `stream` tag (last-wins over the source name).
-        assert!(rec.tags.iter().any(|(k, v)| k == "stream" && v == "stderr"));
+        // stdout/stderr rides the `stream` tag (last-wins over the source name)
+        // — and there is exactly ONE `stream` tag, not the identity plus the
+        // envelope's, which would be a duplicate key line protocol can't hold.
+        let streams: Vec<&str> = rec
+            .tags
+            .iter()
+            .filter(|(k, _)| k == "stream")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(streams, vec!["stderr"], "one stream tag, the envelope's");
         assert_eq!(ts, 1_704_067_200_000_000_000); // 2024-01-01T00:00:00Z in ns
     }
 
@@ -338,6 +356,23 @@ mod tests {
     fn empty_tag_values_are_dropped_to_keep_the_key_stable() {
         let (r, _) = map_line(&src(), r#"{"ts":1,"level":"","message":"x","idx":1}"#).unwrap();
         assert!(!r.tags.iter().any(|(k, _)| k == "level"));
+    }
+
+    #[test]
+    fn a_promoted_tag_overrides_the_identity_of_the_same_key_no_duplicate() {
+        // The source is named "app" (seeds stream=app); allowlisting `stream`
+        // and feeding a value promotes it, last-wins, with NO duplicate key —
+        // the container-log case a live k8s smoke test caught (#72).
+        let mut s = src();
+        s.tags.push("stream".into());
+        let (r, _) = map_line(&s, r#"{"ts":1,"stream":"stderr","message":"x","idx":1}"#).unwrap();
+        let streams: Vec<&str> = r
+            .tags
+            .iter()
+            .filter(|(k, _)| k == "stream")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(streams, vec!["stderr"], "promoted value wins, exactly once");
     }
 
     #[test]

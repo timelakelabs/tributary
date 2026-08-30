@@ -66,14 +66,29 @@ node = env.get("NODE_NAME", {}).get("valueFrom", {}).get("fieldRef", {}).get("fi
 check("NODE_NAME comes from the Downward API (spec.nodeName)", node == "spec.nodeName")
 
 mounts = {m.get("name"): m for m in c.get("volumeMounts", [])}
-check("/var/log is mounted READ-ONLY (never write to tailed logs)",
-      mounts.get("varlog", {}).get("mountPath") == "/var/log" and mounts["varlog"].get("readOnly") is True)
+# The symlinks and their targets are mounted SEPARATELY read-only — mounting
+# all of /var/log instead nests the agent's own log volume under a read-only
+# mount, which containerd can't create a mount point inside (a live kind smoke
+# test, #72, caught exactly that as a CrashLoopBackOff).
+check("/var/log/containers is mounted READ-ONLY (the symlinks the glob matches)",
+      mounts.get("varlogcontainers", {}).get("mountPath") == "/var/log/containers"
+      and mounts["varlogcontainers"].get("readOnly") is True)
+check("/var/log/pods is mounted READ-ONLY (the symlink targets, the bytes)",
+      mounts.get("varlogpods", {}).get("mountPath") == "/var/log/pods"
+      and mounts["varlogpods"].get("readOnly") is True)
 check("a writable state mount exists (checkpoints + queue)",
       "state" in mounts and not mounts["state"].get("readOnly"))
+# The image declares VOLUME /var/log/tributary; with a read-only rootfs it needs
+# a writable backing or the container never starts.
+check("the image's /var/log/tributary volume has a writable emptyDir backing",
+      mounts.get("agent-log", {}).get("mountPath") == "/var/log/tributary")
 
 volumes = {v.get("name"): v for v in spec.get("volumes", [])}
-check("/var/log is a hostPath (the node's real logs)",
-      volumes.get("varlog", {}).get("hostPath", {}).get("path") == "/var/log")
+check("/var/log/containers and /var/log/pods are hostPaths (the node's real logs)",
+      volumes.get("varlogcontainers", {}).get("hostPath", {}).get("path") == "/var/log/containers"
+      and volumes.get("varlogpods", {}).get("hostPath", {}).get("path") == "/var/log/pods")
+check("agent-log is an emptyDir (not a hostPath, nothing to persist)",
+      "emptyDir" in volumes.get("agent-log", {}))
 check("state is a hostPath (survives a pod restart, so resume is exact)",
       "hostPath" in volumes.get("state", {}))
 

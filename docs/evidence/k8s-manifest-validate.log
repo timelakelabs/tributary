@@ -10,9 +10,12 @@
   [PASS] DaemonSet uses the tributary ServiceAccount
   [PASS] container passes --config and --state-dir
   [PASS] NODE_NAME comes from the Downward API (spec.nodeName)
-  [PASS] /var/log is mounted READ-ONLY (never write to tailed logs)
+  [PASS] /var/log/containers is mounted READ-ONLY (the symlinks the glob matches)
+  [PASS] /var/log/pods is mounted READ-ONLY (the symlink targets, the bytes)
   [PASS] a writable state mount exists (checkpoints + queue)
-  [PASS] /var/log is a hostPath (the node's real logs)
+  [PASS] the image's /var/log/tributary volume has a writable emptyDir backing
+  [PASS] /var/log/containers and /var/log/pods are hostPaths (the node's real logs)
+  [PASS] agent-log is an emptyDir (not a hostPath, nothing to persist)
   [PASS] state is a hostPath (survives a pod restart, so resume is exact)
   [PASS] no privilege escalation and all capabilities dropped
   [PASS] config tails the CRI glob /var/log/containers/*.log

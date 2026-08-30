@@ -182,24 +182,44 @@ spec:
             - name: config
               mountPath: /etc/tributary
               readOnly: true
-            # /var/log covers both /var/log/containers (the symlinks the glob
-            # matches) and /var/log/pods (their targets, where the bytes are).
-            # Read-only: the shipper never writes to the logs it tails.
-            - name: varlog
-              mountPath: /var/log
+            # The glob matches the symlinks in /var/log/containers; they point
+            # at the real bytes in /var/log/pods. Mount BOTH — mounting all of
+            # /var/log instead would nest the agent's own log volume (below)
+            # under a read-only mount, which containerd cannot create a mount
+            # point inside. Read-only: the shipper never writes to what it tails.
+            - name: varlogcontainers
+              mountPath: /var/log/containers
+              readOnly: true
+            - name: varlogpods
+              mountPath: /var/log/pods
               readOnly: true
             # Checkpoints and the durable queue. On the host, so a pod restart
             # resumes exactly instead of re-shipping or losing the queue.
             - name: state
               mountPath: /var/lib/tributary
+            # The agent image declares VOLUME /var/log/tributary (its optional
+            # log-file sink). With readOnlyRootFilesystem the runtime can't back
+            # that with the read-only rootfs, so give it a writable emptyDir —
+            # without it the container CrashLoopBackOffs on containerd before it
+            # reads a single log. The agent writes here only if a [log] sink is
+            # configured; it just has to exist. (This path is NOT under the two
+            # read-only mounts above, which is why the mount point can be made.)
+            - name: agent-log
+              mountPath: /var/log/tributary
       volumes:
         - name: config
           configMap:
             name: tributary-config
-        - name: varlog
+        - name: agent-log
+          emptyDir: {}
+        - name: varlogcontainers
           hostPath:
-            path: /var/log
-            type: Directory
+            path: /var/log/containers
+            type: DirectoryOrCreate
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+            type: DirectoryOrCreate
         - name: state
           hostPath:
             path: /var/lib/tributary

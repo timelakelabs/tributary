@@ -7,6 +7,16 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Added
 
+- **Live pod-label smoke test on kind** (#72). `deploy/k8s/kind-smoke.sh` stands
+  up a real cluster and runs the actual `deploy/k8s/daemonset.yaml` against it
+  (only the image, pull policy and output URL are overridden for the test box —
+  the RBAC, ServiceAccount, security context and Downward API are exactly what
+  ships), then proves the one path the offline drills cannot reach: the
+  DaemonSet's ServiceAccount + read-only `pods` ClusterRole actually resolve a
+  workload pod's labels from the API server, `app` lands as a tag and the
+  API-injected `pod-template-hash` does not. kind uses containerd, so it also
+  exercises `parser = "cri"` against genuine runtime logs. Runnable by hand (CI
+  is billing-blocked); evidence `docs/evidence/k8s-kind-smoke.log`.
 - **CRI text-log parser** (`parser = "cri"`, #71). containerd and CRI-O — the
   default Kubernetes runtimes — write `<RFC3339Nano> <stdout|stderr> <F|P>
   <message>`, not JSON. Shipping that with `parser = "plain"` buried the real
@@ -100,6 +110,20 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Fixed
 
+- **The DaemonSet no longer CrashLoopBackOffs on containerd** (#72). The agent
+  image declares `VOLUME /var/log/tributary`; with `readOnlyRootFilesystem` and
+  all of `/var/log` mounted read-only, containerd could not create that mount
+  point and the container never started. The manifest now mounts only
+  `/var/log/containers` and `/var/log/pods` (so the agent's own log volume isn't
+  nested under a read-only mount) and gives `/var/log/tributary` a writable
+  emptyDir. Caught by the live kind smoke test, not by any static check.
+- **No more duplicate `stream` tag on container logs** (#72). A container-log
+  source seeds `stream` with the source identity AND promotes the envelope's
+  `stdout`/`stderr` onto the same key — two `stream=` tags on one line, which is
+  not representable in line protocol and TimeLakeDB rejects. Tags are now
+  deduplicated last-wins (the docker path always documented this intent but never
+  enforced it), so the promoted `stdout`/`stderr` value wins and the key appears
+  once. Latent since the docker reassembler shipped; surfaced by the smoke test.
 - **A glob child's `stream` tag no longer carries the container id** (#65,
   fixing #64 before release). The per-file stream identity includes the 64-hex
   container id so each container instance keeps its own checkpoint — but that id

@@ -76,3 +76,21 @@ drill can supply labels. `bench/k8s_labels_drill.sh` uses it to prove the
 allowlist: 100 files carrying `app`/`team`/`pod-template-hash` collapse to 2
 series with `app` and `team` stamped and `pod-template-hash` never a tag
 (`docs/evidence/k8s-labels-drill.log`).
+
+## Live smoke test
+
+`kind-smoke.sh` runs this exact manifest on a throwaway `kind` cluster and
+proves the one thing the offline drills can't: labels resolved **live** from the
+API server through the ServiceAccount + read-only `pods` ClusterRole. It applies
+the real manifest (only the image, pull policy and output URL are overridden),
+runs a labelled workload, and asserts `app` lands as a tag while the
+API-injected `pod-template-hash` does not — end to end, including the CRI parser
+on genuine containerd logs. Needs `docker`, `kind` and `kubectl`, and a host
+that can nest containers.
+
+```sh
+deploy/k8s/kind-smoke.sh            # creates + tears down the cluster
+deploy/k8s/kind-smoke.sh --keep     # leaves it up to inspect
+```
+
+Evidence: `docs/evidence/k8s-kind-smoke.log`.
