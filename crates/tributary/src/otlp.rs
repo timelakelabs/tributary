@@ -497,6 +497,7 @@ mod tests {
             filter: Vec::new(),
             sample: Vec::new(),
             redact: Vec::new(),
+            kubernetes: None,
         }
     }
 

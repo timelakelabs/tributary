@@ -96,6 +96,14 @@ at ingest — per source, or extracted from the log itself. No other log
 agent can do this, because no other target enforces labels inside the
 scan.
 
+Not every tag comes from the line. A `[source.kubernetes]` source (#8)
+parses `pod`, `namespace` and `container` out of the CRI log path
+(`/var/log/containers/<pod>_<namespace>_<container>-<id>.log`) and stamps
+them as tags — no apiserver call, no sidecar. These three stay inside the
+allowlist rule because they are bounded by the node's pod count, not by
+message content; pod *labels*, which are unbounded, are a separate
+opt-in allowlist rather than blanket enrichment.
+
 ---
 
 ## 3. Delivery semantics: at-least-once, made exactly-once

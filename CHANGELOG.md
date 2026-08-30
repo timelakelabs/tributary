@@ -7,6 +7,16 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Added
 
+- **Kubernetes CRI path enrichment** (#8, phase 1). A source that sets
+  `[source.kubernetes]` and tails a CRI container log parses `pod`,
+  `namespace` and `container` out of the filename
+  (`/var/log/containers/<pod>_<namespace>_<container>-<id>.log`) and stamps
+  them as tags — no apiserver call and no sidecar. The three are bounded by
+  the node's pod count, so they stay inside the FR-2 allowlist rule; pod
+  labels, which are not bounded, wait for a later opt-in allowlist. A source
+  whose path is not a CRI log (a plain `/var/log/app.log`) is left exactly as
+  before — the parse fails closed rather than inventing tags. Phase 1 of the
+  DaemonSet epic; glob tailing, the manifest and the label allowlist follow.
 - **Multiple sources per agent** (#49). One process now tails many `[[source]]`
   blocks concurrently — each with its own tail, framer, watermark, checkpoint
   and durable queue, namespaced on disk by source name (`queue-<name>/`,

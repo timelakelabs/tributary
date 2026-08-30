@@ -179,6 +179,19 @@ pub(crate) fn build_record(
     if let Some(vis) = &src.visibility {
         tags.push(("_visibility".into(), vis.clone()));
     }
+    // Kubernetes enrichment (#8): when the source opted in, the pod, namespace
+    // and container are parsed straight out of the CRI log path and stamped as
+    // tags. A non-CRI path yields None and is left alone — enabling the mode on
+    // a source whose path isn't a container log is a no-op, not an error. These
+    // three are bounded by the node's pod count (FR-2); pod labels are not, and
+    // wait for the phase-4 allowlist.
+    if src.kubernetes.is_some()
+        && let Some(meta) = crate::k8s::parse_cri_path(&src.path)
+    {
+        tags.push(("namespace".into(), meta.namespace));
+        tags.push(("pod".into(), meta.pod));
+        tags.push(("container".into(), meta.container));
+    }
     tags.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Fields: declared types only. An undeclared key is dropped rather
@@ -230,6 +243,7 @@ mod tests {
             filter: Vec::new(),
             sample: Vec::new(),
             redact: Vec::new(),
+            kubernetes: None,
         }
     }
 
@@ -261,6 +275,7 @@ mod tests {
             filter: Vec::new(),
             sample: Vec::new(),
             redact: Vec::new(),
+            kubernetes: None,
         };
         let (rec, ts) = map_line(&src, &envelope).unwrap();
         assert_eq!(rec.table, "container_logs");
@@ -323,6 +338,31 @@ mod tests {
     fn empty_tag_values_are_dropped_to_keep_the_key_stable() {
         let (r, _) = map_line(&src(), r#"{"ts":1,"level":"","message":"x","idx":1}"#).unwrap();
         assert!(!r.tags.iter().any(|(k, _)| k == "level"));
+    }
+
+    #[test]
+    fn kubernetes_mode_stamps_pod_namespace_container_from_the_path() {
+        let mut s = src();
+        s.path = "/var/log/containers/checkout-6c98bcbf89-2xk4p_shop_\
+                  server-3f8b2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c.log"
+            .into();
+        s.kubernetes = Some(crate::config::Kubernetes {});
+        let (r, _) = map_line(&s, r#"{"ts":1,"message":"x","idx":1}"#).unwrap();
+        let get = |k: &str| r.tags.iter().find(|(t, _)| t == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("namespace"), Some("shop"));
+        assert_eq!(get("pod"), Some("checkout-6c98bcbf89-2xk4p"));
+        assert_eq!(get("container"), Some("server"));
+    }
+
+    #[test]
+    fn kubernetes_mode_on_a_non_cri_path_stamps_nothing() {
+        // Opting in but pointing at a plain file must not invent tags — the
+        // parse fails closed rather than stamping a garbage pod/container.
+        let mut s = src();
+        s.path = "/var/log/app.log".into();
+        s.kubernetes = Some(crate::config::Kubernetes {});
+        let (r, _) = map_line(&s, r#"{"ts":1,"message":"x","idx":1}"#).unwrap();
+        assert!(!r.tags.iter().any(|(k, _)| k == "pod" || k == "container"));
     }
 
     #[test]

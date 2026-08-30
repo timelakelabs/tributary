@@ -12,6 +12,7 @@ mod credential;
 mod docker;
 #[cfg(feature = "journald")]
 mod journald;
+mod k8s;
 mod logfile;
 mod lp;
 mod map;
@@ -1225,6 +1226,7 @@ fn run_winlog_dump(raw: &[String]) -> anyhow::Result<()> {
             filter: Vec::new(),
             sample: Vec::new(),
             redact: Vec::new(),
+            kubernetes: None,
         };
 
         let cp_path = Checkpoint::path_for(&state_dir, &stream);
