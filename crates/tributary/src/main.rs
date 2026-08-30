@@ -9,6 +9,7 @@ mod auth;
 mod checkpoint;
 mod config;
 mod credential;
+mod cri;
 mod docker;
 mod glob;
 #[cfg(feature = "journald")]
@@ -41,6 +42,7 @@ mod winlog;
 enum Framer {
     Multiline(multiline::Joiner),
     Docker(docker::Reassembler),
+    Cri(cri::Reassembler),
 }
 
 impl Framer {
@@ -48,30 +50,35 @@ impl Framer {
         match self {
             Framer::Multiline(j) => Ok(j.push(line.to_string())),
             Framer::Docker(r) => r.push(line),
+            Framer::Cri(r) => r.push(line),
         }
     }
     fn expire(&mut self) -> Option<String> {
         match self {
             Framer::Multiline(j) => j.expire(),
             Framer::Docker(r) => r.expire(),
+            Framer::Cri(r) => r.expire(),
         }
     }
     fn drain(&mut self) -> Option<String> {
         match self {
             Framer::Multiline(j) => j.drain(),
             Framer::Docker(r) => r.drain(),
+            Framer::Cri(r) => r.drain(),
         }
     }
     fn has_pending(&self) -> bool {
         match self {
             Framer::Multiline(j) => j.has_pending(),
             Framer::Docker(r) => r.has_pending(),
+            Framer::Cri(r) => r.has_pending(),
         }
     }
     fn truncated(&self) -> u64 {
         match self {
             Framer::Multiline(j) => j.truncated,
             Framer::Docker(r) => r.truncated,
+            Framer::Cri(r) => r.truncated,
         }
     }
 }
@@ -606,6 +613,8 @@ async fn run_file_source(
         // A docker json-file line is >16 KB by design (that is the split it
         // reassembles), so allow a generous single message before the cap.
         config::Parser::DockerJson => Framer::Docker(docker::Reassembler::new(1 << 20, 1000)),
+        // CRI (containerd/CRI-O) splits at ~16 KB the same way; same cap.
+        config::Parser::Cri => Framer::Cri(cri::Reassembler::new(1 << 20, 1000)),
         _ => {
             let ml = source.multiline.as_ref();
             Framer::Multiline(multiline::Joiner::new(

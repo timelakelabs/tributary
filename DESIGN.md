@@ -649,7 +649,12 @@ sources were plausible v2 when this was written and have since shipped as
 push/pull additions on the same map -> queue -> ship path — each behind a
 feature (`docker_json` needs none, `journald` links libsystemd, `winlog`
 links wevtapi on Windows), so the default build stays as small and portable
-as v1 was. Still out: metric extraction, fan-out, a transformation DSL.
+as v1 was. The `cri` parser (#71) joined them for the Kubernetes DaemonSet
+(#8): containerd/CRI-O write the CRI text format
+(`<RFC3339Nano> <stdout|stderr> <F|P> <message>`), and it reassembles the
+`P`/`F` splits into the same `{log, stream, time}` envelope `docker_json`
+uses, so a container-log config is runtime-agnostic. Still out: metric
+extraction, fan-out, a transformation DSL.
 
 Refusing to become Vector is what keeps this small enough to prove.
 
