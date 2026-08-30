@@ -226,15 +226,30 @@ discover → tail → decode → parse → map → validate → batch → ship �
 
 ### 4.1 Discover and tail
 
-Globs resolve to files; files are tracked by `(device, inode)`, not by
-path, so a rotation does not look like a truncation. The tailer handles
-the three rotation styles — rename-and-recreate, copy-and-truncate, and
-create-new-with-suffix — plus the case that matters most in practice:
-**finishing the tail of a rotated-away file before following the new
-one**, so the last few kilobytes before a rotation are not lost.
+Files are tracked by `(device, inode)`, not by path, so a rotation does
+not look like a truncation. The tailer handles the three rotation styles —
+rename-and-recreate, copy-and-truncate, and create-new-with-suffix — plus
+the case that matters most in practice: **finishing the tail of a
+rotated-away file before following the new one**, so the last few
+kilobytes before a rotation are not lost.
 
 A file whose inode disappears while unread bytes remain is a named,
 counted event (`tributary_files_lost_total`), never a silent gap.
+
+A source whose `path` carries a wildcard in its last segment
+(`/var/log/containers/*.log`, #8/#64) is a **glob source**: one supervisor
+tailing a whole directory of files, discovered and retired as they come
+and go. Each matched file is a full independent tail — its own stamper,
+watermark, checkpoint and queue — because a stamper shared across files
+would break the per-stream replay dedup of §3.1. They share only the
+source's shipper and telemetry. A file appearing (a pod starting) is
+adopted on the next rescan without a restart; a file vanishing (a pod
+dying) stops that tail and retires its checkpoint — and its queue too,
+but *only once it has drained*, because leftover segments are lines that
+never reached the server, and dropping them is the loss §4.5 exists to
+prevent. The per-file identity is derived from the filename, which for a
+CRI symlink includes the container id, so a restarted container correctly
+becomes a new stream rather than resuming a dead one's offset.
 
 ### 4.2 Decode and parse
 
