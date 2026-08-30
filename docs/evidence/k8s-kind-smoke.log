@@ -1,0 +1,48 @@
+== cluster
+Creating cluster "trib-smoke" ...
+ • Ensuring node image (kindest/node:v1.31.0) 🖼  ...
+ ✓ Ensuring node image (kindest/node:v1.31.0) 🖼
+ • Preparing nodes 📦   ...
+ ✓ Preparing nodes 📦 
+ • Writing configuration 📜  ...
+ ✓ Writing configuration 📜
+ • Starting control-plane 🕹️  ...
+ ✓ Starting control-plane 🕹️
+ • Installing CNI 🔌  ...
+ ✓ Installing CNI 🔌
+ • Installing StorageClass 💾  ...
+ ✓ Installing StorageClass 💾
+ • Waiting ≤ 2m0s for control-plane = Ready ⏳  ...
+ ✓ Waiting ≤ 2m0s for control-plane = Ready ⏳
+ • Ready after 16s 💚
+Set kubectl context to "kind-trib-smoke"
+You can now use your cluster with:
+kubectl cluster-info --context kind-trib-smoke
+Thanks for using kind! 😊
+== build + load the agent image
+== mock write sink (records bodies to a file, so its own stdout is NOT tailed
+==      back into itself — a stdout recorder would feed the DaemonSet a loop)
+Waiting for deployment "mock" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "mock" rollout to finish: 0 of 1 updated replicas are available...
+deployment "mock" successfully rolled out
+== the REAL DaemonSet manifest, overridden only for this cluster
+Waiting for daemon set spec update to be observed...
+Waiting for daemon set "tributary" rollout to finish: 0 of 1 updated pods are available...
+daemon set "tributary" successfully rolled out
+== a labelled workload: app=labeltest (allowlisted), and the pod-template-hash
+==      kubernetes adds itself (NOT allowlisted, the cardinality bomb)
+Waiting for deployment "labeltest" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "labeltest" rollout to finish: 0 of 1 updated replicas are available...
+deployment "labeltest" successfully rolled out
+== wait for the workload's LABELLED lines to reach the mock (label resolution
+==      happens once at child startup, a beat after the line first ships)
+== ASSERTIONS (on the delivered line protocol for the workload)
+  [PASS] the workload's lines were delivered at all (yes)
+  [PASS] allowlisted label app=labeltest is a tag (yes)
+  [PASS] non-allowlisted pod-template-hash is NOT a tag (absent)
+  [PASS] namespace=smoke-app enriched from the CRI path (yes)
+  [PASS] container=chatter enriched from the CRI path (yes)
+  [PASS] stream=stdout from the cri parser (yes)
+  sample delivered line:
+    kube_logs,app=labeltest,container=chatter,namespace=smoke-app,node=trib-smoke-control-plane,pod=labeltest-844f69bcf8-8gmts,stream=stdout log="SMOKELINE-0" 1788128709454303146
+== ALL PASS
