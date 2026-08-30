@@ -7,6 +7,17 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Added
 
+- **Kubernetes DaemonSet manifest** (#8, phase 3, #65). `deploy/k8s/daemonset.yaml`
+  runs one Tributary per node tailing `/var/log/containers/*.log`, with the node
+  name stamped from the Downward API, host logs mounted read-only, checkpoints on
+  a hostPath so a restart resumes exactly, and a ServiceAccount with no RBAC
+  (tailing host files needs no apiserver access — pod labels in phase 4 will).
+  `deploy/k8s/validate.py` checks it structurally without a cluster.
+- **`${VAR}` expansion in static tag values** (#65). A static tag value may
+  reference the environment — `node = "${NODE_NAME}"` — so the DaemonSet can
+  stamp the node name from the Downward API. Scoped to tag values (not the whole
+  file, which would eat a redact rule's `$1` capture refs); an unset variable is
+  a startup error, not a silently blank tag.
 - **Glob tailing for a directory of container logs** (#8, phase 2, #64). A
   source whose `path` has a wildcard in its last segment
   (`/var/log/containers/*.log`) becomes a supervisor that tails the whole
@@ -61,6 +72,16 @@ All notable changes to Tributary are recorded here. This project adheres to
   existing source's identity/schema or to bound resources (`output.url`, TLS,
   the listeners) are reported as restart-required rather than silently ignored.
   Unix-only.
+
+### Fixed
+
+- **A glob child's `stream` tag no longer carries the container id** (#65,
+  fixing #64 before release). The per-file stream identity includes the 64-hex
+  container id so each container instance keeps its own checkpoint — but that id
+  was also going into the `stream` TAG, which would have made every pod restart
+  a brand-new series and blown up cardinality exactly the way pod labels would.
+  The state key keeps the id; the tag is now the bounded label with it stripped
+  (`pod_namespace_container`). Caught by the phase-3 cardinality drill.
 
 ## [0.3.0] — 2026-08-26
 

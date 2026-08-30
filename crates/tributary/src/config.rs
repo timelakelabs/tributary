@@ -436,10 +436,48 @@ impl Default for Timestamp {
     }
 }
 
+/// Expand `${VAR}` references in a string against the environment (#65). Only
+/// this braced syntax is touched — a bare `$VAR` is left as-is, so a value that
+/// merely contains a dollar sign is not mangled. An unset variable is an error
+/// that names it, so a misconfigured DaemonSet fails loudly at startup rather
+/// than shipping a blank tag.
+fn expand_env(s: &str) -> anyhow::Result<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("${") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| anyhow::anyhow!("unterminated ${{...}} in a tag value: {s:?}"))?;
+        let var = &after[..end];
+        let val = std::env::var(var).map_err(|_| {
+            anyhow::anyhow!(
+                "tag value references ${{{var}}} but that environment variable is not set"
+            )
+        })?;
+        out.push_str(&val);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Config> {
         let text = std::fs::read_to_string(path)?;
-        let cfg: Config = toml::from_str(&text)?;
+        let mut cfg: Config = toml::from_str(&text)?;
+        // #65: static tag VALUES may reference the environment (`${VAR}`), so a
+        // Kubernetes DaemonSet can stamp the node name from the Downward API —
+        // `node = "${NODE_NAME}"`. Scoped to tag values on purpose: expanding
+        // the whole file would eat the `$1` capture refs in a redact rule. An
+        // unset variable is a hard error, not an empty tag, because a silently
+        // blank `node` tag is worse than a startup failure.
+        for src in &mut cfg.sources {
+            for v in src.tags_static.values_mut() {
+                *v = expand_env(v)?;
+            }
+        }
         if cfg.sources.is_empty() && cfg.otlp.is_none() && cfg.metrics.is_none() {
             anyhow::bail!(
                 "nothing to do: configure at least one [[source]], an [otlp] receiver, or [metrics]"
@@ -795,6 +833,45 @@ mod tests {
         let path = dir.path().join("t.toml");
         std::fs::write(&path, toml).unwrap();
         Config::load(&path)
+    }
+
+    #[test]
+    fn expand_env_replaces_braced_vars_and_errors_on_unset() {
+        assert_eq!(expand_env("plain").unwrap(), "plain");
+        // A bare `$` is left alone — only `${...}` is a reference.
+        assert_eq!(expand_env("keep$1this").unwrap(), "keep$1this");
+        assert!(
+            expand_env("${TRIBUTARY_TEST_DEFINITELY_UNSET_XYZ}").is_err(),
+            "an unset variable must fail loudly, not blank the tag"
+        );
+        // SAFETY: single-threaded test, a uniquely-named var not read elsewhere.
+        unsafe {
+            std::env::set_var("TRIBUTARY_TEST_NODE", "node-7");
+        }
+        assert_eq!(expand_env("${TRIBUTARY_TEST_NODE}").unwrap(), "node-7");
+        assert_eq!(
+            expand_env("k8s-${TRIBUTARY_TEST_NODE}-x").unwrap(),
+            "k8s-node-7-x"
+        );
+    }
+
+    #[test]
+    fn a_static_tag_value_expands_the_environment_at_load() {
+        // SAFETY: single-threaded test, uniquely-named var.
+        unsafe {
+            std::env::set_var("TRIBUTARY_TEST_NODENAME", "worker-3");
+        }
+        let cfg = load_str(
+            "[output]\nurl = \"http://localhost:1963\"\n\n\
+             [[source]]\nname = \"k8s\"\npath = \"/var/log/containers/*.log\"\n\
+             table = \"kube\"\nparser = \"json\"\n\
+             [source.tags_static]\nnode = \"${TRIBUTARY_TEST_NODENAME}\"\n",
+        )
+        .expect("a config with an env-referencing tag loads");
+        assert_eq!(
+            cfg.sources[0].tags_static.get("node").map(String::as_str),
+            Some("worker-3")
+        );
     }
 
     #[test]

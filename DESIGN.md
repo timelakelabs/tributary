@@ -251,6 +251,14 @@ prevent. The per-file identity is derived from the filename, which for a
 CRI symlink includes the container id, so a restarted container correctly
 becomes a new stream rather than resuming a dead one's offset.
 
+That container id keys the checkpoint on disk, but it is **stripped from
+the `stream` tag** (#65). The id is unbounded — a new one every restart —
+and a tag carrying it makes every restart a fresh series, the FR-2 blowup
+of §2. So a glob child's tag identity is the bounded label
+(`pod_namespace_container`), while its on-disk state keeps the id. The two
+identities are deliberately different: state is per container *instance*,
+the series is per container *name*.
+
 ### 4.2 Decode and parse
 
 Bytes are decoded as UTF-8 **lossily** (invalid sequences become U+FFFD)
