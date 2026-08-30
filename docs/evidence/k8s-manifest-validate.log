@@ -1,0 +1,18 @@
+  [PASS] Namespace has apiVersion/kind/metadata.name
+  [PASS] ServiceAccount has apiVersion/kind/metadata.name
+  [PASS] ConfigMap has apiVersion/kind/metadata.name
+  [PASS] DaemonSet has apiVersion/kind/metadata.name
+  [PASS] has exactly the four resources (Namespace, ServiceAccount, ConfigMap, DaemonSet)
+  [PASS] no RBAC objects (none needed to tail host files)
+  [PASS] DaemonSet uses the tributary ServiceAccount
+  [PASS] container passes --config and --state-dir
+  [PASS] NODE_NAME comes from the Downward API (spec.nodeName)
+  [PASS] /var/log is mounted READ-ONLY (never write to tailed logs)
+  [PASS] a writable state mount exists (checkpoints + queue)
+  [PASS] /var/log is a hostPath (the node's real logs)
+  [PASS] state is a hostPath (survives a pod restart, so resume is exact)
+  [PASS] no privilege escalation and all capabilities dropped
+  [PASS] config tails the CRI glob /var/log/containers/*.log
+  [PASS] config enables kubernetes CRI enrichment ([source.kubernetes])
+  [PASS] config stamps the node from the environment (node = "${NODE_NAME}")
+ALL PASS

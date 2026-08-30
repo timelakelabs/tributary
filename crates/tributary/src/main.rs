@@ -425,13 +425,18 @@ fn spawn_source(
     // before.
     let is_glob = glob::is_glob(&source.path);
     let source = std::sync::Arc::new(source);
+    // A plain source keys its state by its own name — nothing changes.
+    let state_key = name.clone();
     let (tx, rx) = tokio::sync::watch::channel(false);
     running.insert(name.clone(), tx);
     set.spawn(async move {
         let r = if is_glob {
             run_glob_source(cfg, source, args, shipper, tel, reload_gen, rx).await
         } else {
-            run_file_source(cfg, source, true, args, shipper, tel, reload_gen, rx).await
+            run_file_source(
+                cfg, source, state_key, true, args, shipper, tel, reload_gen, rx,
+            )
+            .await
         };
         (name, r)
     });
@@ -504,6 +509,13 @@ async fn run_file_source(
     // entry; for a glob's per-file child it's a synthetic source the supervisor
     // built with the concrete file path and a stable per-file stream name.
     source: std::sync::Arc<config::Source>,
+    // #65: the on-disk state key — names this tail's checkpoint, queue and
+    // dead-letter. For a `[[source]]` it's just the source name. For a glob
+    // child it's the per-FILE id (with the container id), so each container
+    // instance resumes independently — DELIBERATELY different from the `stream`
+    // TAG (`source.name`), which is the bounded label with the id stripped, or
+    // the container id would make every pod restart a new series (FR-2).
+    state_key: String,
     // #64: whether this tail owns a config entry it can hot-reload on SIGHUP. A
     // glob child does not — it's synthetic, absent from the file — so it skips
     // the reload path and the single-source legacy-queue migration.
@@ -537,7 +549,7 @@ async fn run_file_source(
     let mut samples = source.sample.clone();
     let mut redacts = transform::compile_redacts(&source.redact)?;
 
-    let cp_path = Checkpoint::path_for(&args.state_dir, &source.name);
+    let cp_path = Checkpoint::path_for(&args.state_dir, &state_key);
     let restored = Checkpoint::load(&cp_path)?;
 
     let mut stamper = stamp::Stamper::new(source.resolution());
@@ -564,7 +576,7 @@ async fn run_file_source(
     // two sources cannot share one spool. Migrate a single-source deployment's
     // legacy `state_dir/queue` to the per-source name on upgrade so it does not
     // strand spooled lines; a multi-source config is new and has no legacy dir.
-    let queue_dir = args.state_dir.join(format!("queue-{}", source.name));
+    let queue_dir = args.state_dir.join(format!("queue-{state_key}"));
     if self_reload && cfg.sources.len() == 1 {
         let legacy = args.state_dir.join("queue");
         if legacy.exists()
@@ -583,9 +595,7 @@ async fn run_file_source(
         queue: queue::Queue::open(&queue_dir, cfg.output.queue_max_bytes)?,
         watermark: wm,
         cp_path,
-        dead_letter: args
-            .state_dir
-            .join(format!("dead-letter-{}.lp", source.name)),
+        dead_letter: args.state_dir.join(format!("dead-letter-{state_key}.lp")),
         quarantined: 0,
         dropped_filter: 0,
         dropped_sample: 0,
@@ -1140,8 +1150,19 @@ fn spawn_glob_child(
     path: std::path::PathBuf,
 ) {
     let mut synth = (**template).clone();
-    synth.name = name.clone();
     synth.path = path.to_string_lossy().into_owned();
+    // `name` is the per-file STATE key (it carries the container id, so each
+    // container instance resumes independently). The `stream` TAG is the
+    // bounded label — the id stripped off — because putting the id in a tag
+    // makes every pod restart a brand-new series (#65, the cardinality trap).
+    // A non-CRI glob (no kubernetes mode, or a stray file) has no id to strip,
+    // so it falls back to the state key, which is bounded by the file count.
+    synth.name = template
+        .kubernetes
+        .is_some()
+        .then(|| k8s::stream_label(&synth.path))
+        .flatten()
+        .unwrap_or_else(|| name.clone());
     let synth = std::sync::Arc::new(synth);
 
     let (tx, rx) = tokio::sync::watch::channel(false);
@@ -1149,7 +1170,18 @@ fn spawn_glob_child(
     let (cfg, args, tel, reload_gen) = (cfg.clone(), args.clone(), tel.clone(), reload_gen.clone());
     let shipper = shipper.clone();
     set.spawn(async move {
-        let r = run_file_source(cfg, synth, false, args, shipper, tel, reload_gen, rx).await;
+        let r = run_file_source(
+            cfg,
+            synth,
+            name.clone(),
+            false,
+            args,
+            shipper,
+            tel,
+            reload_gen,
+            rx,
+        )
+        .await;
         (name, r)
     });
 }

@@ -77,6 +77,17 @@ pub fn parse_cri_path(path: &str) -> Option<CriMeta> {
     })
 }
 
+/// The BOUNDED stream label for a CRI path: `pod_namespace_container`, i.e. the
+/// CRI stem with the unbounded container-id stripped off. A glob child stamps
+/// this as its `stream` tag. The per-file STATE key deliberately keeps the id
+/// (so each container instance resumes on its own), but a TAG carrying the id
+/// would make every pod restart a new series — the exact cardinality blowup the
+/// allowlist exists to prevent (#65). `None` for a non-CRI path, so the caller
+/// can fall back to something else.
+pub fn stream_label(path: &str) -> Option<String> {
+    parse_cri_path(path).map(|m| format!("{}_{}_{}", m.pod, m.namespace, m.container))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +136,24 @@ mod tests {
         let path = format!("/var/log/containers/shop-abc_default_web-cafe-{ID}.log");
         let m = parse_cri_path(&path).unwrap();
         assert_eq!(m.container, "web-cafe");
+    }
+
+    #[test]
+    fn stream_label_strips_the_container_id() {
+        // Two restarts of the same pod (two ids) must yield the SAME label, or
+        // every restart is a fresh series.
+        let id2 = "aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999";
+        let base = "/var/log/containers/web-7d9_shop_server";
+        assert_eq!(
+            stream_label(&format!("{base}-{ID}.log")).as_deref(),
+            Some("web-7d9_shop_server")
+        );
+        assert_eq!(
+            stream_label(&format!("{base}-{id2}.log")),
+            stream_label(&format!("{base}-{ID}.log")),
+            "the label is stable across container-id churn"
+        );
+        assert_eq!(stream_label("/var/log/app.log"), None);
     }
 
     #[test]

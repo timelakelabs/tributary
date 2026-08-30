@@ -1,0 +1,21 @@
+=== k8s cardinality drill (2026-08-30T18:05:01Z) ===
+workdir=/tmp/tmp.k8IoyS7LBJ  deployments=2  restarts_each=50  files=100  lines/rev=200  node=node-1
+-- build --
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.32s
+  created 100 CRI files across 50 restarts of 2 deployments
+-- run (NODE_NAME=node-1) --
+  per-file state on disk: 100 checkpoints (one per container instance)
+  [PASS] one checkpoint per file (state is per-instance, deliberately) (100)
+
+### CARDINALITY ASSERTION ###
+  files on disk (id churn)       = 100
+  distinct series (full tag-set) = 2
+  distinct (pod,ns,container)    = 2
+  distinct stream tag values     = 2  ['api-7b3d2_billing_worker', 'web-59f8c_shop_server']
+  distinct node tag values       = ['node-1']
+  watermark-table series         = 2 (bounded too, same stripped label)
+  tag values that are 64-hex ids = 0
+  [PASS] series=2 tracks bounded identity (expected 2), not the 100 files; id-tags=0; nodes=['node-1']
+  [PASS] series tracks bounded identity, not the file count (0)
+
+=== ALL PASS ===

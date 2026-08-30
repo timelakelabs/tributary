@@ -1,0 +1,166 @@
+# Tributary as a Kubernetes DaemonSet (#8, phase 3).
+#
+# One pod per node, tailing every container log on that node
+# (/var/log/containers/*.log) as a glob source (#64), each line stamped with
+# the pod / namespace / container parsed from its path (#63) and the node name
+# from the Downward API. State (checkpoints + queue) lives on a hostPath so a
+# restarted agent resumes exactly where it stopped rather than re-shipping.
+#
+# No RBAC beyond a ServiceAccount: tailing host files needs no apiserver access.
+# Reading pod LABELS (phase 4, #66) is what will add a read-only pods Role.
+#
+# Apply:   kubectl apply -f deploy/k8s/daemonset.yaml
+# Dry-run: kubectl apply --dry-run=client -f deploy/k8s/daemonset.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tributary
+  labels:
+    app.kubernetes.io/name: tributary
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tributary
+  namespace: tributary
+  labels:
+    app.kubernetes.io/name: tributary
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tributary-config
+  namespace: tributary
+  labels:
+    app.kubernetes.io/name: tributary
+data:
+  tributary.toml: |
+    [output]
+    # The TimeLakeDB write endpoint. Point this at your service.
+    url = "http://timelakedb.timelakedb.svc:1963"
+    database = "logs"
+    gzip = true
+    # SEC-4 data-plane token, if the server requires one. Mounted from the
+    # `tributary-token` secret into this env var (optional: the agent runs
+    # without it when the server's data auth is off).
+    # token_file = "/var/run/secrets/tributary/token"
+
+    [[source]]
+    name = "k8s"
+    # The glob is what makes this a DaemonSet source: one supervisor tails
+    # every container log on the node, discovering and retiring them as pods
+    # come and go (#64).
+    path = "/var/log/containers/*.log"
+    table = "kube_logs"
+    # NOTE: containerd/CRI-O write the CRI TEXT format
+    # (`<ts> stdout F <msg>`); this ships each line whole as `message`. A
+    # structured CRI parser that splits out the timestamp and stdout/stderr is
+    # a follow-up — see deploy/k8s/README.md. Docker-json nodes can set
+    # parser = "dockerjson" instead.
+    parser = "plain"
+
+    [source.fields]
+    message = "string"
+
+    # Stamp the node name from the Downward API (see env: NODE_NAME below).
+    [source.tags_static]
+    node = "${NODE_NAME}"
+
+    # Presence enables CRI path enrichment (#63): pod / namespace / container
+    # are parsed from each file's path. Bounded by the node's pod count, so
+    # they are safe as tags; the container id is deliberately NOT one.
+    [source.kubernetes]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tributary
+  namespace: tributary
+  labels:
+    app.kubernetes.io/name: tributary
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tributary
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tributary
+    spec:
+      serviceAccountName: tributary
+      # A log shipper should not be the first thing evicted under pressure.
+      priorityClassName: system-node-critical
+      # Run on every node, control-plane included — those logs matter too.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: tributary
+          image: ghcr.io/timelakelabs/tributary:latest
+          args:
+            - "--config"
+            - "/etc/tributary/tributary.toml"
+            - "--state-dir"
+            - "/var/lib/tributary"
+          env:
+            # Downward API: the node this pod landed on, stamped as the `node`
+            # tag via ${NODE_NAME} in the config above.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Optional data-plane token (SEC-4). optional: true so the agent
+            # starts on clusters where the server's data auth is off.
+            - name: TRIBUTARY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: tributary-token
+                  key: token
+                  optional: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          securityContext:
+            # Container logs under /var/log/pods are root-owned, so the agent
+            # reads as root — but nothing else: no privilege escalation, no
+            # capabilities, and its own root filesystem is read-only (all writes
+            # go to the state hostPath).
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tributary
+              readOnly: true
+            # /var/log covers both /var/log/containers (the symlinks the glob
+            # matches) and /var/log/pods (their targets, where the bytes are).
+            # Read-only: the shipper never writes to the logs it tails.
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+            # Checkpoints and the durable queue. On the host, so a pod restart
+            # resumes exactly instead of re-shipping or losing the queue.
+            - name: state
+              mountPath: /var/lib/tributary
+      volumes:
+        - name: config
+          configMap:
+            name: tributary-config
+        - name: varlog
+          hostPath:
+            path: /var/log
+            type: Directory
+        - name: state
+          hostPath:
+            path: /var/lib/tributary
+            type: DirectoryOrCreate
