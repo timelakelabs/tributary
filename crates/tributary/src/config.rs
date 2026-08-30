@@ -293,7 +293,21 @@ pub struct Source {
     /// never leaves the host.
     #[serde(default)]
     pub redact: Vec<Redact>,
+
+    /// Kubernetes enrichment (#8). Present (`[source.kubernetes]`) turns on
+    /// CRI log-path parsing: the pod, namespace and container encoded in
+    /// `/var/log/containers/<pod>_<ns>_<container>-<id>.log` are stamped as
+    /// tags. Absent, the source is tailed exactly as before. The three
+    /// stamped tags are bounded by the node's pod count; unbounded pod labels
+    /// wait for the phase-4 allowlist.
+    #[serde(default)]
+    pub kubernetes: Option<Kubernetes>,
 }
+
+/// Kubernetes source options (#8). Empty for now — its presence alone enables
+/// CRI path enrichment. Phase 4 (#66) adds the pod-label allowlist here.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct Kubernetes {}
 
 /// A sample rule for the transform stage (#43). With `field`/`equals` it
 /// applies only to records where that tag or field equals the value (so a
@@ -626,6 +640,7 @@ impl Otlp {
             filter: Vec::new(),
             sample: Vec::new(),
             redact: Vec::new(),
+            kubernetes: None,
         }
     }
 }
