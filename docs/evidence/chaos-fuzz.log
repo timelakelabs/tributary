@@ -1,0 +1,21 @@
+### CHAOS: crash-resume fuzzer — 12 random SIGKILLs across one run (N=12000) ###
+  survived 12 random kills; final drain
+  distinct=12000 delivered=47200
+{
+  "app": {
+    "expect": 12000,
+    "distinct": 12000,
+    "total_delivered": 47200,
+    "min": 0,
+    "max": 11999,
+    "replayed": 35200,
+    "exact": true
+  }
+}
+  [PASS] stream app: distinct 12000/12000, min 0, max 11999, replayed-then-deduped 35200
+  [PASS] exactly complete across 12 random crashes (no gap; dupes collapse by idx) (0)
+  [PASS] the kills hit in-flight batches (replays present) (yes)
+  [PASS] the final agent is running (yes)
+
+=== chaos 'fuzz': 3 passed, 0 failed ===
+=== PASS ===

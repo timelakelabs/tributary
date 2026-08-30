@@ -1,0 +1,44 @@
+### CHAOS: multi-source — rotation + SIGHUP add/remove + SIGKILL, concurrent (a=9000 b=9000 g=9000) ###
+  [fault] rotate beta mid-stream (the dribble recreates beta.log)
+  [fault] SIGHUP: remove gamma while it is streaming
+  [fault] SIGHUP: re-add gamma
+  [fault] SIGKILL the whole agent; restart
+  distinct: alpha=9000 beta=9000 gamma=9000
+{
+  "alpha": {
+    "expect": 9000,
+    "distinct": 9000,
+    "total_delivered": 15400,
+    "min": 0,
+    "max": 8999,
+    "replayed": 6400,
+    "exact": true
+  },
+  "beta": {
+    "expect": 9000,
+    "distinct": 9000,
+    "total_delivered": 13900,
+    "min": 0,
+    "max": 8999,
+    "replayed": 4900,
+    "exact": true
+  },
+  "gamma": {
+    "expect": 9000,
+    "distinct": 9000,
+    "total_delivered": 12200,
+    "min": 0,
+    "max": 8999,
+    "replayed": 3200,
+    "exact": true
+  }
+}
+  [PASS] stream alpha: distinct 9000/9000, min 0, max 8999, replayed-then-deduped 6400
+  [PASS] stream beta: distinct 9000/9000, min 0, max 8999, replayed-then-deduped 4900
+  [PASS] stream gamma: distinct 9000/9000, min 0, max 8999, replayed-then-deduped 3200
+  [PASS] every stream exactly complete despite rotation + reconfig + crash (0)
+  [PASS] each source kept its own isolated checkpoint on disk (yes)
+  [PASS] agent survived the storm and is running (yes)
+
+=== chaos 'multisource': 3 passed, 0 failed ===
+=== PASS ===

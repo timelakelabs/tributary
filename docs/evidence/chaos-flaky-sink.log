@@ -1,0 +1,24 @@
+### CHAOS: flaky sink — reset / 5xx / latency / ambiguous-ack (N=30000) ###
+  after the storm: queue_bytes=0 distinct=30000 delivered=36500
+{
+  "app": {
+    "expect": 30000,
+    "distinct": 30000,
+    "total_delivered": 36500,
+    "min": 0,
+    "max": 29999,
+    "replayed": 6500,
+    "exact": true
+  }
+}
+  [PASS] stream app: distinct 30000/30000, min 0, max 29999, replayed-then-deduped 6500
+  [PASS] delivered set is exactly complete under chaos (0)
+  [PASS] at-least-once duplicates were delivered (6500, deduped by idx) (yes)
+  [PASS] agent still running after the storm (yes)
+  metrics: read=30000 shipped=30000 queue_bytes=0
+  [PASS] read == N (30000)
+  [PASS] shipped == read (acked once each, retries did not over-count) (30000)
+  [PASS] queue fully drained (0)
+
+=== chaos 'flaky': 6 passed, 0 failed ===
+=== PASS ===

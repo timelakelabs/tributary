@@ -1600,10 +1600,22 @@ async fn reap_one(pipe: &mut Pipeline) -> anyhow::Result<()> {
             if pipe.queue.push(&body)? {
                 tracing::info!(error = %err, bytes = body.len(), "spooled to the queue");
             } else {
-                // The queue is full AND the database is unreachable.
-                // Refuse to drop: put it back in front of the queue by
-                // failing loudly rather than silently losing it.
-                tracing::error!(error = %err, "queue full and shipping failed; reads are paused");
+                // The queue is at its soft cap AND the database is unreachable.
+                // These lines were already read off the source, so refusing
+                // them here is data LOSS, not backpressure — backpressure is
+                // the paused read loop, which does not read past a full queue.
+                // Force them onto the queue past the cap rather than dropping
+                // them; reads stay paused, so the overshoot is bounded to the
+                // in-flight set. The old code only logged and let the batch
+                // fall out of scope — the #61 backpressure chaos drill caught
+                // it losing ~376 lines when the queue filled under an outage.
+                pipe.queue.push_forced(&body)?;
+                tracing::warn!(
+                    error = %err,
+                    bytes = body.len(),
+                    "over the queue soft cap; force-spooled a failed in-flight batch \
+                     rather than dropping it — reads stay paused until it drains"
+                );
             }
         }
         Err(join) => return Err(anyhow::anyhow!("ship task panicked: {join}")),

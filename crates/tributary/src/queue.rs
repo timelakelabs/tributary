@@ -70,9 +70,11 @@ impl Queue {
         })
     }
 
-    /// Spool a batch. `Ok(false)` means the queue is at its cap and the
-    /// caller must stop reading — the batch is NOT accepted, so nothing
-    /// is lost by refusing it.
+    /// Spool a batch not yet read off the source. `Ok(false)` means the queue
+    /// is at its cap and the caller must stop reading — the batch is NOT
+    /// accepted, and nothing is lost by refusing it because the source file
+    /// still holds those bytes. This is the backpressure path; for an
+    /// already-read batch that failed to ship, see [`Self::push_forced`].
     pub fn push(&mut self, body: &str) -> anyhow::Result<bool> {
         let len = body.len() as u64;
         if self.bytes + len > self.max_bytes {
@@ -87,7 +89,25 @@ impl Queue {
             self.full = true;
             return Ok(false);
         }
+        self.spool(body)
+    }
 
+    /// Spool a batch that MUST be kept even though the queue is over its soft
+    /// cap: an in-flight batch that failed to ship *after* its lines were
+    /// already read off the source. Refusing it here would be data loss, not
+    /// backpressure — the read loop is already paused while `full`, so the
+    /// overshoot is bounded to the in-flight set (`max_inflight` batches). The
+    /// cap bounds READING; it must never license losing bytes already taken.
+    pub fn push_forced(&mut self, body: &str) -> anyhow::Result<()> {
+        self.spool(body)?;
+        // Stay full: reads remain paused until this genuinely drains below the
+        // resume mark (see `pop`'s hysteresis).
+        self.full = true;
+        Ok(())
+    }
+
+    fn spool(&mut self, body: &str) -> anyhow::Result<bool> {
+        let len = body.len() as u64;
         let path = self.dir.join(format!("{:012}.lp", self.next_seq));
         let tmp = path.with_extension("tmp");
         {
@@ -197,6 +217,23 @@ mod tests {
         assert!(!q.push("0123456789").unwrap());
         assert!(q.full);
         assert_eq!(q.len(), 2, "a refused batch must not be spooled");
+    }
+
+    #[test]
+    fn a_failed_in_flight_batch_is_force_spooled_not_dropped_when_full() {
+        // Regression for #61 (backpressure chaos): the read-loop backpressure
+        // refuses a NEW read at the cap (that batch is still in the file), but
+        // an already-read batch that failed to ship must NOT be dropped — it is
+        // forced past the cap, because refusing it is loss, not backpressure.
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::open(dir.path(), 20).unwrap();
+        assert!(q.push("0123456789").unwrap());
+        assert!(q.push("0123456789").unwrap());
+        assert!(!q.push("x").unwrap(), "a new read is refused at the cap");
+
+        q.push_forced("already-read-bytes").unwrap();
+        assert_eq!(q.len(), 3, "the failed in-flight batch is kept, not lost");
+        assert!(q.full, "still full: reads stay paused until it drains");
     }
 
     #[test]
