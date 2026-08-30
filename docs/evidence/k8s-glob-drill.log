@@ -1,0 +1,48 @@
+=== k8s glob end-to-end drill (2026-08-30T17:06:04Z) ===
+workdir=/tmp/tmp.mLOyanc0sM  glob=/tmp/tmp.mLOyanc0sM/containers/*.log  web=6000 api=4000 cache=3000
+-- build --
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.05s
+
+### LEG 1 — DISCOVER: two container logs, each enriched, exact ###
+  delivered distinct: web=6000 api=4000
+  per-file state on disk: k8s.api-6c98bc_billing_worker-2222222222222222222222222222222222222222222222222222222222222222.checkpoint k8s.web-7d9c8b_shop_server-1111111111111111111111111111111111111111111111111111111111111111.checkpoint queue-k8s.api-6c98bc_billing_worker-2222222222222222222222222222222222222222222222222222222222222222 queue-k8s.web-7d9c8b_shop_server-1111111111111111111111111111111111111111111111111111111111111111 
+  [PASS] leg1 two checkpoints (one per file) (2)
+  [PASS] leg1 two queue dirs (one per file) (2)
+  [PASS] pod=web-7d9c8b ns=shop ctr=server: records=6000 distinct=6000/6000 enrich_bad=0 missing=0 extra=0
+  [PASS] pod=api-6c98bc ns=billing ctr=worker: records=4000 distinct=4000/4000 enrich_bad=0 missing=0 extra=0
+  [PASS] leg1 both pods complete and correctly enriched (0)
+
+### LEG 2 — APPEAR: a third container log created mid-run is picked up ###
+  [t0] web running, delivered=6000 ; cache not created yet (delivered=0)
+  [PASS] leg2 cache silent before its file exists (0)
+  [t1] created /tmp/tmp.mLOyanc0sM/containers/cache-abc123_shop_redis-3333333333333333333333333333333333333333333333333333333333333333.log — waiting for the rescan to discover it
+  cache delivered after discovery: 3000
+  [PASS] pod=web-7d9c8b ns=shop ctr=server: records=6000 distinct=6000/6000 enrich_bad=0 missing=0 extra=0
+  [PASS] pod=cache-abc123 ns=shop ctr=redis: records=3000 distinct=3000/3000 enrich_bad=0 missing=0 extra=0
+  [PASS] leg2 a pod that appeared mid-run is discovered and exact (0)
+
+### LEG 3 — RESUME: SIGKILL mid-stream, each file resumes from its own checkpoint ###
+  burst 1 quiesced; checkpoints: web=yes api=yes
+  [PASS] leg3 web checkpoint written before the crash (yes)
+  [PASS] leg3 api checkpoint written before the crash (yes)
+  SIGKILLed mid burst-2: web=5000/6000 distinct shipped before the kill
+  [PASS] leg3 web crashed past its checkpoint but before EOF (yes)
+  after resume distinct: web=6000 api=4000 ; replayed: web=2000 api=1500
+  [PASS] leg3 web resumed from its checkpoint (replayed 2000 < half 3000) (yes)
+  [PASS] leg3 api resumed from its checkpoint (replayed 1500 < half 2000) (yes)
+  [PASS] pod=web-7d9c8b ns=shop ctr=server: records=8000 distinct=6000/6000 enrich_bad=0 missing=0 extra=0
+  [PASS] pod=api-6c98bc ns=billing ctr=worker: records=5500 distinct=4000/4000 enrich_bad=0 missing=0 extra=0
+  [PASS] leg3 both files exact after resume (0)
+
+### LEG 4 — RETIRE: a deleted container log stops its tail and retires its state ###
+  both shipped and quiesced; web state present=yes
+  [PASS] leg4 web checkpoint present before the pod dies (yes)
+  [t1] deleted /tmp/tmp.mLOyanc0sM/containers/web-7d9c8b_shop_server-1111111111111111111111111111111111111111111111111111111111111111.log — waiting for the rescan (5 s) to retire it
+  after retire: web checkpoint gone=yes  web queue gone=yes  api checkpoint kept=yes
+  [PASS] leg4 retired web's checkpoint (yes)
+  [PASS] leg4 retired web's queue dir (yes)
+  [PASS] leg4 api untouched by web's retirement (yes)
+  [PASS] pod=api-6c98bc ns=billing ctr=worker: records=4000 distinct=4000/4000 enrich_bad=0 missing=0 extra=0
+  [PASS] leg4 api still complete after the sibling retired (0)
+
+=== ALL PASS ===

@@ -7,6 +7,22 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Added
 
+- **Glob tailing for a directory of container logs** (#8, phase 2, #64). A
+  source whose `path` has a wildcard in its last segment
+  (`/var/log/containers/*.log`) becomes a supervisor that tails the whole
+  directory: one independent per-file pipeline each — its own stamper,
+  watermark, checkpoint and queue — sharing only the shipper and telemetry.
+  A file appearing (a pod starting) is picked up on the next rescan without a
+  restart; a file vanishing (a pod dying) stops that tail and retires its
+  checkpoint, and its queue once it has drained (a queue still holding
+  undelivered lines is kept, not dropped). Each file carries ITS pod/namespace/
+  container from phase 1, so one source distinguishes every pod on the node.
+  Per-file crash-resume is exact — each file resumes from its own offset. This
+  is what makes a DaemonSet possible; the manifest and cardinality drill are
+  phase 3. Drilled end to end over discovered files
+  (`bench/k8s_glob_drill.sh`, `docs/evidence/k8s-glob-drill.log`): discovery +
+  enrichment, a pod appearing mid-run, a SIGKILL that resumes each file from
+  its own checkpoint, and a pod dying that retires only its own state.
 - **Kubernetes CRI path enrichment** (#8, phase 1). A source that sets
   `[source.kubernetes]` and tails a CRI container log parses `pod`,
   `namespace` and `container` out of the filename

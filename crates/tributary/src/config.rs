@@ -240,7 +240,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Source {
     /// Stream identity. Becomes the `stream` tag, and scopes the
     /// timestamp sequence (DESIGN.md §3.1).
@@ -352,7 +352,7 @@ pub struct Filter {
     pub drop: bool,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Clone)]
 pub struct Multiline {
     /// A line matching this begins a record; anything else continues the
     /// one above it.
@@ -406,7 +406,7 @@ pub enum FieldType {
     Boolean,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Clone)]
 pub struct Timestamp {
     /// Parsed key holding the timestamp. Absent means "stamp on read".
     #[serde(default)]

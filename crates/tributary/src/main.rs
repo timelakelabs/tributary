@@ -10,6 +10,7 @@ mod checkpoint;
 mod config;
 mod credential;
 mod docker;
+mod glob;
 #[cfg(feature = "journald")]
 mod journald;
 mod k8s;
@@ -416,11 +417,22 @@ fn spawn_source(
     tel: std::sync::Arc<telemetry::Telemetry>,
     reload_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
-    let name = cfg.sources[idx].name.clone();
+    let source = cfg.sources[idx].clone();
+    let name = source.name.clone();
+    // #64: a path with a wildcard in its last segment is a glob source — one
+    // supervisor that tails a directory of files (a k8s node's container logs)
+    // and fans out a per-file child. A plain path is the single-file tail as
+    // before.
+    let is_glob = glob::is_glob(&source.path);
+    let source = std::sync::Arc::new(source);
     let (tx, rx) = tokio::sync::watch::channel(false);
     running.insert(name.clone(), tx);
     set.spawn(async move {
-        let r = run_file_source(cfg, idx, args, shipper, tel, reload_gen, rx).await;
+        let r = if is_glob {
+            run_glob_source(cfg, source, args, shipper, tel, reload_gen, rx).await
+        } else {
+            run_file_source(cfg, source, true, args, shipper, tel, reload_gen, rx).await
+        };
         (name, r)
     });
 }
@@ -485,9 +497,17 @@ fn reload_source_set(
 /// One file-tail source's whole pipeline: per-source setup, the tail loop,
 /// and the drain on shutdown. Phase 1 of #49 extracts it verbatim so phase 2
 /// can spawn one per `[[source]]`; single-source behaviour is unchanged.
+#[allow(clippy::too_many_arguments)]
 async fn run_file_source(
     cfg: std::sync::Arc<config::Config>,
-    source_idx: usize,
+    // #64: the source to tail. For a `[[source]]` this is a clone of the config
+    // entry; for a glob's per-file child it's a synthetic source the supervisor
+    // built with the concrete file path and a stable per-file stream name.
+    source: std::sync::Arc<config::Source>,
+    // #64: whether this tail owns a config entry it can hot-reload on SIGHUP. A
+    // glob child does not — it's synthetic, absent from the file — so it skips
+    // the reload path and the single-source legacy-queue migration.
+    self_reload: bool,
     args: std::sync::Arc<Args>,
     shipper: ship::Shipper,
     tel: std::sync::Arc<telemetry::Telemetry>,
@@ -502,7 +522,7 @@ async fn run_file_source(
     // them as plain references, so nothing below this changes.
     let cfg: &config::Config = &cfg;
     let args: &Args = &args;
-    let source = &cfg.sources[source_idx];
+    let source: &config::Source = &source;
     // #49: this source's slice of /metrics. The loop below writes it, and
     // Telemetry::aggregate sums it with the other sources at render time, so N
     // sources cannot clobber each other's numbers.
@@ -545,7 +565,7 @@ async fn run_file_source(
     // legacy `state_dir/queue` to the per-source name on upgrade so it does not
     // strand spooled lines; a multi-source config is new and has no legacy dir.
     let queue_dir = args.state_dir.join(format!("queue-{}", source.name));
-    if cfg.sources.len() == 1 {
+    if self_reload && cfg.sources.len() == 1 {
         let legacy = args.state_dir.join("queue");
         if legacy.exists()
             && !queue_dir.exists()
@@ -833,7 +853,7 @@ async fn run_file_source(
         // credential reload above. The checkpoint and queue are untouched; the
         // in-flight batch finishes on the old rules.
         let cur_reload_gen = reload_gen.load(std::sync::atomic::Ordering::Relaxed);
-        if cur_reload_gen != seen_reload_gen {
+        if self_reload && cur_reload_gen != seen_reload_gen {
             seen_reload_gen = cur_reload_gen;
             reload_config(
                 &args.config,
@@ -952,6 +972,217 @@ async fn run_file_source(
         pipe.shipper.requests(),
     );
     Ok(())
+}
+
+/// A glob source (#8/#64): tail a directory of container logs, one per-file
+/// child pipeline, discovered and retired as pods come and go on the node.
+///
+/// This mirrors the top-level source coordinator, one level down. Each matched
+/// file is a full independent tail — its own stamper, watermark, checkpoint and
+/// queue (DESIGN §3.1: a shared stamper across files would break replay dedup) —
+/// sharing only this source's shipper and telemetry. The CRI pod/namespace/
+/// container each child stamps comes from its own path (phase 1, #63), so lines
+/// from different pods get different identity for free. A node with no pods
+/// matches nothing and simply waits; a pod starting is picked up on the next
+/// rescan, a pod dying stops that child and retires its state.
+async fn run_glob_source(
+    cfg: std::sync::Arc<config::Config>,
+    template: std::sync::Arc<config::Source>,
+    args: std::sync::Arc<Args>,
+    shipper: ship::Shipper,
+    tel: std::sync::Arc<telemetry::Telemetry>,
+    reload_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let pattern = template.path.clone();
+    tracing::info!(
+        stream = %template.name,
+        pattern = %pattern,
+        follow = !args.once,
+        "glob source: discovering container logs"
+    );
+
+    // stream name -> its stop-sender. Present means a child is running (or
+    // draining), keyed by the stable per-file id so a rescan tells a file it
+    // already tails from a newly-appeared one.
+    let mut running: std::collections::HashMap<String, tokio::sync::watch::Sender<bool>> =
+        std::collections::HashMap::new();
+    // Children stopped because their file vanished; when one joins cleanly its
+    // on-disk state is retired. A global shutdown does NOT populate this — a
+    // still-live container's checkpoint must survive a node restart.
+    let mut retiring: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut set: tokio::task::JoinSet<(String, anyhow::Result<()>)> = tokio::task::JoinSet::new();
+
+    for path in glob::matches(&pattern) {
+        let name = glob::stream_id(&template.name, &path);
+        spawn_glob_child(
+            &mut set,
+            &mut running,
+            &cfg,
+            &template,
+            &args,
+            &shipper,
+            &tel,
+            &reload_gen,
+            name,
+            path,
+        );
+    }
+    if running.is_empty() {
+        tracing::info!(
+            pattern = %pattern,
+            "glob source: nothing matches yet — waiting for the first container log"
+        );
+    }
+
+    let shutdown = async {
+        while shutdown_rx.changed().await.is_ok() {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+        }
+    };
+    tokio::pin!(shutdown);
+
+    let rescan_every = Duration::from_secs(5);
+    let mut stopping = false;
+    let mut first_err: Option<anyhow::Error> = None;
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown, if !stopping => {
+                tracing::info!(stream = %template.name, "glob source: shutting down — stopping every file tail");
+                for tx in running.values() { let _ = tx.send(true); }
+                stopping = true;
+            }
+            // Rescan only while following and healthy: a shutdown or a failure
+            // must not spawn new children on top of the ones it's draining.
+            _ = tokio::time::sleep(rescan_every), if !stopping && !args.once => {
+                let found = glob::matches(&pattern);
+                let found_names: std::collections::HashSet<String> =
+                    found.iter().map(|p| glob::stream_id(&template.name, p)).collect();
+                // Retire: a file we tail is gone. Signal it now; retire its
+                // state when it has drained and joins.
+                for name in running.keys().cloned().collect::<Vec<_>>() {
+                    if !found_names.contains(&name) && !retiring.contains(&name) {
+                        tracing::info!(stream = %name, "glob source: container log vanished — draining and retiring it");
+                        if let Some(tx) = running.get(&name) { let _ = tx.send(true); }
+                        retiring.insert(name);
+                    }
+                }
+                // Adopt: a newly-appeared file.
+                for path in found {
+                    let name = glob::stream_id(&template.name, &path);
+                    if !running.contains_key(&name) {
+                        tracing::info!(stream = %name, path = %path.display(), "glob source: new container log — tailing it");
+                        spawn_glob_child(
+                            &mut set, &mut running, &cfg, &template, &args, &shipper, &tel, &reload_gen, name, path,
+                        );
+                    }
+                }
+            }
+            joined = set.join_next(), if !set.is_empty() => match joined {
+                None => {}
+                Some(Ok((name, res))) => {
+                    running.remove(&name);
+                    let was_retiring = retiring.remove(&name);
+                    match res {
+                        Ok(()) => if was_retiring {
+                            retire_stream_state(&args.state_dir, &name);
+                        },
+                        Err(e) => {
+                            tracing::error!(stream = %name, error = %e, "a container tail failed — stopping the glob source");
+                            if first_err.is_none() { first_err = Some(e); }
+                            for tx in running.values() { let _ = tx.send(true); }
+                            stopping = true;
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    if first_err.is_none() { first_err = Some(anyhow::anyhow!(e)); }
+                    for tx in running.values() { let _ = tx.send(true); }
+                    stopping = true;
+                }
+            }
+        }
+        // Exit once we're winding down (shutdown, --once complete, or a child
+        // failed) AND every child has drained. In follow mode with no matches
+        // this is never true, so a DaemonSet on an idle node keeps rescanning
+        // rather than exiting.
+        if set.is_empty() && (stopping || args.once) {
+            break;
+        }
+    }
+
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Spawn one per-file child of a glob source. The child is a normal file tail
+/// against a SYNTHETIC source: the template's schema and options, but this
+/// file's concrete path and a stable per-file stream name. That path is what
+/// phase 1 parses the CRI pod/namespace/container out of, and what keys the
+/// child's checkpoint and queue on disk. `self_reload = false`: a synthetic
+/// source is not in the config file, so it never tries to hot-reload itself.
+#[allow(clippy::too_many_arguments)]
+fn spawn_glob_child(
+    set: &mut tokio::task::JoinSet<(String, anyhow::Result<()>)>,
+    running: &mut std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>,
+    cfg: &std::sync::Arc<config::Config>,
+    template: &std::sync::Arc<config::Source>,
+    args: &std::sync::Arc<Args>,
+    shipper: &ship::Shipper,
+    tel: &std::sync::Arc<telemetry::Telemetry>,
+    reload_gen: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    name: String,
+    path: std::path::PathBuf,
+) {
+    let mut synth = (**template).clone();
+    synth.name = name.clone();
+    synth.path = path.to_string_lossy().into_owned();
+    let synth = std::sync::Arc::new(synth);
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    running.insert(name.clone(), tx);
+    let (cfg, args, tel, reload_gen) = (cfg.clone(), args.clone(), tel.clone(), reload_gen.clone());
+    let shipper = shipper.clone();
+    set.spawn(async move {
+        let r = run_file_source(cfg, synth, false, args, shipper, tel, reload_gen, rx).await;
+        (name, r)
+    });
+}
+
+/// Remove the on-disk state of a departed container's tail (#64). Its file is
+/// gone — the symlink was removed and the kubelet gc's the real log — so the
+/// checkpoint offset points at a dead inode and is deleted. The queue is only
+/// removed if it drained: leftover segments are lines that never reached the
+/// server (it was down while the pod died), and dropping them here is the
+/// silent loss this agent exists to prevent, so they're kept and named instead.
+fn retire_stream_state(state_dir: &std::path::Path, name: &str) {
+    let cp = Checkpoint::path_for(state_dir, name);
+    if let Err(e) = std::fs::remove_file(&cp)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(stream = %name, error = %e, "could not remove a retired checkpoint");
+    }
+    let qdir = state_dir.join(format!("queue-{name}"));
+    let has_data = std::fs::read_dir(&qdir)
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .any(|e| e.path().extension().is_some_and(|x| x == "lp"))
+        })
+        .unwrap_or(false);
+    if has_data {
+        tracing::warn!(
+            stream = %name,
+            dir = %qdir.display(),
+            "retired a departed container whose queue still holds undelivered data — leaving it on disk rather than dropping it"
+        );
+    } else {
+        let _ = std::fs::remove_dir_all(&qdir);
+    }
 }
 
 /// Build a shipper from the output config: resolve the data-plane token (SEC-4,
