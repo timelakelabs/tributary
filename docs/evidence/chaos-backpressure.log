@@ -1,0 +1,26 @@
+### CHAOS: backpressure — a blocked sink fills the 2097152-byte queue (N=80000) ###
+  under the block: queue_full=1 queue_bytes=2100535 read=28400 (of 80000)
+  [PASS] backpressure engaged (queue_full=1) (1)
+  [PASS] the queue stayed bounded (soft cap + in-flight margin, no unbounded growth) (yes)
+  [PASS] reading stalled under backpressure (read < N, not dropping) (yes)
+  [PASS] agent alive and holding under backpressure (yes)
+  sink recovered; draining and resuming the stalled read…
+  after recovery: distinct=80000 read=80000 shipped=80000 queue_bytes=0
+{
+  "app": {
+    "expect": 80000,
+    "distinct": 80000,
+    "total_delivered": 80000,
+    "min": 0,
+    "max": 79999,
+    "replayed": 0,
+    "exact": true
+  }
+}
+  [PASS] stream app: distinct 80000/80000, min 0, max 79999, replayed-then-deduped 0
+  [PASS] no loss: everything the block held is delivered once the sink returns (0)
+  [PASS] reading resumed to completion (read == N) (80000)
+  [PASS] queue drained after recovery (0)
+
+=== chaos 'backpressure': 7 passed, 0 failed ===
+=== PASS ===
