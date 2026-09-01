@@ -5,6 +5,8 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-01
+
 ### Added
 
 - **Live pod-label smoke test on kind** (#72). `deploy/k8s/kind-smoke.sh` stands
