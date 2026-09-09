@@ -7,6 +7,26 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Fixed
 
+- **`main` requires its checks, and a docs-only pull request still merges**
+  (timelakedb#169). Nothing stopped a red pull request from merging here
+  either; the repository went public and the "paywalled" excuse went with it.
+  A ruleset on `main` now requires `changes`, `fmt · clippy · tests` and
+  `catchment · conformance` to pass before a pull request merges or a commit
+  lands, with no bypass and no review requirement, and refuses force pushes
+  and deletion. A commit pushed straight to `main` is refused unless its sha
+  already has passing checks, so the release commit goes through a pull
+  request like everything else. The trap: required checks and `paths-ignore`
+  do not mix, because a path-filtered workflow never reports and its checks
+  sit "expected" forever; two docs-only pull requests merged here since
+  2026-08-13 with no run at all, and both would have been stuck. So a pull
+  request always gets a run, a `changes` job decides in seconds whether
+  anything the expensive jobs run for was touched (the same list the release
+  gate keeps), and those jobs condition on it. A skipped job reports success,
+  so a docs-only pull request is a green run in which nothing ran. `changes`
+  is itself required, since a job whose dependency failed also reports
+  success and an unrequired broken gate would wave everything through. Pushes
+  to `main` keep `paths-ignore`, so the release gate's docs-only rule is
+  unchanged.
 - **A tag is refused until its ci run has finished green** (timelakedb#168).
   `release.yml` never ran the test suite, by design; the tag was "expected to
   point at a commit whose ci run was green", and nothing checked. TimeLakeDB's

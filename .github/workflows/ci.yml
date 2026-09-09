@@ -7,8 +7,19 @@ name: ci
 # a live node is the drill in `bench/` rather than a CI job.
 # Markdown does not gate this workflow: the Rust jobs plus a conformance run
 # that pulls the fixture image are minutes-expensive, and no test here reads a
-# .md file. A docs-only commit therefore gets no run of its own — the last
-# green run still describes the last commit that could change behaviour.
+# .md file. A docs-only commit on main therefore gets no run of its own — the
+# last green run still describes the last commit that could change behaviour,
+# and release.yml's gate reads it the same way.
+#
+# A PULL REQUEST is different, and used to be filtered the same way. `main`
+# now requires these checks to pass (timelakedb#169), and a required check
+# that never reports is a pull request that never merges: GitHub leaves a
+# path-filtered workflow's checks "expected" forever. Two docs-only pull
+# requests merged here in the four weeks before this with no run at all, and
+# both would have been stuck. So a pull request always gets a run, a cheap
+# `changes` job says whether anything below cares, and the expensive jobs
+# condition on it. A job skipped by an `if` reports success; a docs-only
+# pull request is a green run in which nothing ran, and it merges.
 on:
   push:
     branches: [master, main]
@@ -16,9 +27,6 @@ on:
       - '**.md'
       - 'LICENSE'
   pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE'
 
 # A newer push replaces an in-progress run for a pull request, where only
 # the newest head can merge. Not on main: a commit there gets its run to
@@ -35,9 +43,44 @@ permissions:
   packages: write
 
 jobs:
+  # Did this change touch anything the jobs below run for? Seconds, no Rust.
+  # On a push to main the answer is always yes, because `paths-ignore`
+  # already filtered the event; on a pull request it is a diff against the
+  # base, judged by the same list release.yml's gate uses (one copy, checked
+  # against `paths-ignore` above by a test).
+  #
+  # This job is itself a required check, on purpose. A job whose dependency
+  # FAILED is skipped and reports success, so if this one broke and were not
+  # required, every job below would skip, every check would read green, and
+  # an untested pull request would merge. Required, a broken gate blocks.
+  changes:
+    name: changes · anything ci runs for
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.c.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - id: c
+        run: |
+          python .github/scripts/test_pr_touches_code.py
+          if [ '${{ github.event_name }}' = 'pull_request' ]; then
+            python .github/scripts/pr_touches_code.py \
+              --base '${{ github.event.pull_request.base.sha }}' --head HEAD
+          else
+            echo "code=true: a push to main is already path-filtered"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
+
   rust:
     name: fmt · clippy · tests
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -51,6 +94,8 @@ jobs:
   conformance:
     name: catchment · conformance (tier 1)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
 
