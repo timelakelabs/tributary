@@ -3,9 +3,12 @@
 # Triggered by a version tag, never by a push to a branch. `ci.yml` proves the
 # tree; this workflow's job is only to turn a proven tree into artifacts
 # somebody can install, so it deliberately does NOT re-run the test suite —
-# the tag is expected to point at a commit whose `ci.yml` run was green, and
-# duplicating billed private-repo minutes per tag would make cutting a release
-# something people avoid doing.
+# duplicating it per tag would make cutting a release something people avoid
+# doing. Instead the first job ASKS whether the tagged commit's `ci.yml` run
+# finished green, and nothing else here runs until it has. This header used
+# to say the tag was "expected" to point at a green commit; TimeLakeDB's
+# 0.4.0 was published six minutes before its own ci run finished
+# (timelakedb#168), and this file had the same header and the same hole.
 #
 # What it produces, attached to the GitHub Release:
 #   tributary_<version>_amd64.deb      apt / dpkg
@@ -44,9 +47,47 @@ permissions:
   contents: write
 
 jobs:
+  # Did `ci.yml` finish green on this commit? Not "was it expected to".
+  # TimeLakeDB's 0.4.0 release run started ten seconds after the ci run for
+  # the same commit and finished first, on a commit whose parent's run had
+  # been cancelled mid-flight and never got a verdict. Nothing checked, so
+  # nothing noticed. Same file here, same hole.
+  #
+  # No Rust build: one API call and a git walk, so it answers in seconds. A
+  # refused tag does not need to move — re-run this workflow from the
+  # Actions page once ci is green; the event is kept, so a re-run still
+  # publishes. The script explains the docs-only case (ci.yml skips a
+  # markdown-only push on purpose, so the verdict is the parent's).
+  gate:
+    name: gate · ci was green
+    runs-on: ubuntu-latest
+    # A workflow_dispatch builds a package off a branch for inspection and
+    # publishes nothing, so there the gate reports and does not block. On a
+    # tag it blocks.
+    continue-on-error: ${{ github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The gate walks first-parents for a docs-only tag, so it needs
+          # more than the default shallow clone.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: The tagged commit's ci run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .github/scripts/test_release_gate.py
+          python .github/scripts/release_gate.py
+
   packages:
     name: build · deb + rpm
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
         with:

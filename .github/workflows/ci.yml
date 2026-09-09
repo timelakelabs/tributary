@@ -20,9 +20,15 @@ on:
       - '**.md'
       - 'LICENSE'
 
+# A newer push replaces an in-progress run for a pull request, where only
+# the newest head can merge. Not on main: a commit there gets its run to
+# the end, because a cancelled run is a commit with no verdict, and
+# release.yml's gate (timelakedb#168) has nothing to read for it. That is
+# how TimeLakeDB's CI restructure went out under 0.4.0 untested. The cost
+# is one queued build per push that lands during a build.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

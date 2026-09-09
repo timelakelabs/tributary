@@ -5,6 +5,27 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **A tag is refused until its ci run has finished green** (timelakedb#168).
+  `release.yml` never ran the test suite, by design; the tag was "expected to
+  point at a commit whose ci run was green", and nothing checked. TimeLakeDB's
+  0.4.0 was published six minutes before its own ci run finished, on a commit
+  whose parent had been cancelled mid-run and never got a verdict, and this
+  repo's `release.yml` had the same header and the same hole. A first job,
+  `gate · ci was green`, now looks up the tagged commit's newest `ci.yml` run
+  and refuses the release unless it is `completed` + `success`, printing the
+  run URL either way; the package build depends on it. A refused tag does
+  not move: re-run the workflow from the Actions page once ci is green, and
+  the re-run still publishes. A docs-only commit has no ci run on purpose
+  (`ci.yml` skips markdown and LICENSE) and takes its first parent's verdict;
+  a commit that touches code and has no run was never tested and is refused
+  as such. The gate's list of what ci ignores is checked against `ci.yml`'s
+  own `paths-ignore` by a test. The other half: `ci.yml` no longer cancels an
+  in-progress run on `main` when the next commit lands, which is what gave a
+  commit no verdict in the first place. A pull request still replaces its
+  older run.
+
 ## [0.4.0] — 2026-09-01
 
 ### Added
