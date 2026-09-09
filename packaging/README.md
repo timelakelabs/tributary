@@ -131,5 +131,14 @@ installs and smoke-tests the packages with `verify.sh`, and attaches both plus
 as a pre-release.
 
 It deliberately does not re-run the test suite: `ci.yml` proves the tree, and
-duplicating the billed private-repo minutes per tag makes cutting a release
-something people avoid doing. Tag a commit whose CI was green.
+duplicating it per tag makes cutting a release something people avoid doing.
+Instead its first job, `gate · ci was green`, looks up the tagged commit's
+`ci.yml` run and refuses the release unless that run finished `success`,
+printing the run URL either way (`.github/scripts/release_gate.py`). Tag
+right after a merge and the gate will most likely find the run still going
+and refuse; that is the mistake being caught, not a bug. Wait for ci, then
+re-run the release workflow from the Actions page. The tag stays where it is.
+
+A commit that changes only markdown gets no ci run of its own, because
+`ci.yml` does not run for one; the gate takes the parent's verdict instead.
+A commit that changes code and has no run was never tested, and is refused.
