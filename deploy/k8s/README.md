@@ -6,17 +6,45 @@ the pod, namespace, container and node it came from.
 
 ## Apply
 
+Every Release carries this manifest stamped with the release's image tag; that
+is the copy to apply (#77):
+
 ```sh
 # Point the ConfigMap's output.url at your TimeLakeDB service first.
-kubectl apply -f deploy/k8s/daemonset.yaml
+curl -sSLO https://github.com/timelakelabs/tributary/releases/download/v0.5.0/daemonset.yaml
+kubectl apply -f daemonset.yaml
 ```
 
+The file in this tree pins `ghcr.io/timelakelabs/tributary:<the crate version
+of this tree>`, which exists as an image only once that version is tagged — so
+applying it from `main` between releases pulls nothing, on purpose. It used to
+pin `:latest`, which was whatever `main` last built, and a node that rebooted
+pulled a different agent than its neighbours; a fleet running three versions of
+the agent reads as a product bug. A cargo test holds the manifest's tag equal to
+the crate version, so the release commit that bumps `Cargo.toml` has to bump it
+too. To run the tree's own build on a cluster, `kind-smoke.sh` shows the one
+override that takes: the `image:` line.
+
 `validate.py` structurally checks the manifest without a cluster (an equivalent
-to `kubectl apply --dry-run=client`, which needs a cluster's schema):
+to `kubectl apply --dry-run=client`, which needs a cluster's schema), including
+the pinned tag, the telemetry listener and the probe:
 
 ```sh
 python3 deploy/k8s/validate.py deploy/k8s/daemonset.yaml
 ```
+
+## Liveness, and why there is no readiness
+
+The ConfigMap serves `[telemetry]` on `0.0.0.0:9109`, and the container's
+`livenessProbe` asks `GET /healthz` there. `/healthz` is 503 only when the main
+loop has stopped ticking for 60 s — a wedged agent, the one condition a restart
+fixes. It stays 200 through a TimeLakeDB outage, deliberately: a probe that
+restarts the agent then discards the in-memory and in-flight batches, which is
+the one moment the durable queue exists to protect (`server.rs` says the same at
+length). There is no `readinessProbe`, also deliberately. A DaemonSet serves no
+traffic, so "not ready" gains nothing, and the body's `shipping` field is false
+for the whole of every outage. Watch the outage on `/metrics` instead:
+`tributary_queue_bytes` climbing while `tributary_lines_shipped_total` is flat.
 
 ## How it works
 
@@ -85,8 +113,10 @@ API server through the ServiceAccount + read-only `pods` ClusterRole. It applies
 the real manifest (only the image, pull policy and output URL are overridden),
 runs a labelled workload, and asserts `app` lands as a tag while the
 API-injected `pod-template-hash` does not — end to end, including the CRI parser
-on genuine containerd logs. Needs `docker`, `kind` and `kubectl`, and a host
-that can nest containers.
+on genuine containerd logs. Since #77 it also asserts the liveness wiring: the
+DaemonSet's probe asks `/healthz` and nothing asks readiness, `/healthz` on the
+pod IP answers 200 with `live: true`, and the kubelet has restarted nothing.
+Needs `docker`, `kind` and `kubectl`, and a host that can nest containers.
 
 ```sh
 deploy/k8s/kind-smoke.sh            # creates + tears down the cluster

@@ -76,6 +76,14 @@ data:
     # without it when the server's data auth is off).
     # token_file = "/var/run/secrets/tributary/token"
 
+    # /metrics and /healthz on the pod IP (#77). The liveness probe below
+    # asks /healthz, which is 200 unless the main loop has stopped ticking
+    # for 60 s — and deliberately NOT 503 on a database outage, because a
+    # probe that restarts the agent then discards the batches the queue
+    # exists to protect. There is no readiness probe, on purpose.
+    [telemetry]
+    addr = "0.0.0.0:9109"
+
     [[source]]
     name = "k8s"
     # The glob is what makes this a DaemonSet source: one supervisor tails
@@ -140,7 +148,15 @@ spec:
         - operator: Exists
       containers:
         - name: tributary
-          image: ghcr.io/timelakelabs/tributary:latest
+          # Pinned to the version of the tree this file is in, never a
+          # floating tag: `:latest` here meant "whatever main last built",
+          # so a node that rebooted pulled a different agent than its
+          # neighbours (#77). A test holds this tag equal to the crate
+          # version, so the release commit that bumps Cargo.toml has to bump
+          # it too. The image for a version exists once that version is
+          # tagged; the Release also carries this file stamped, which is the
+          # copy to apply.
+          image: ghcr.io/timelakelabs/tributary:0.4.0
           args:
             - "--config"
             - "/etc/tributary/tributary.toml"
@@ -161,6 +177,24 @@ spec:
                   name: tributary-token
                   key: token
                   optional: true
+          ports:
+            - name: telemetry
+              containerPort: 9109
+          # Liveness ONLY (#77). /healthz is 503 when the main loop has not
+          # ticked for 60 s — a wedged agent, the one condition a restart
+          # fixes — and 200 through a database outage, when a restart would
+          # throw away the in-memory and in-flight batches the queue exists
+          # to protect. Do not add a readiness probe on the body's `shipping`
+          # field either: a DaemonSet serves no traffic, so "not ready" gains
+          # nothing and the field is red for the whole of every outage.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: telemetry
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: 50m

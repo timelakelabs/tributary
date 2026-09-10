@@ -113,7 +113,7 @@ say "the REAL DaemonSet manifest, overridden only for this cluster"
 # the pull policy (use the loaded image), the output URL (the mock) and gzip off
 # so the mock can read plain line protocol. The RBAC, SA, securityContext,
 # Downward API and the cri/kubernetes source are applied verbatim.
-sed -e "s#ghcr.io/timelakelabs/tributary:latest#$IMAGE#" \
+sed -e "s#image: ghcr.io/timelakelabs/tributary:.*#image: $IMAGE#" \
     -e "s#http://timelakedb.timelakedb.svc:1963#http://mock.tributary.svc.cluster.local:8899#" \
     -e "s#gzip = true#gzip = false#" \
     -e "s#image: $IMAGE#image: $IMAGE\n          imagePullPolicy: IfNotPresent#" \
@@ -174,6 +174,49 @@ check "container=chatter enriched from the CRI path" \
   "$(printf '%s\n' "$LINES" | grep -qE '(^|,)container=chatter(,| )' && echo yes || echo no)" "yes"
 check "stream=stdout from the cri parser" \
   "$(printf '%s\n' "$LINES" | grep -qE '(^|,)stream=stdout(,| )' && echo yes || echo no)" "yes"
+
+echo
+say "LIVENESS (#77): the probe is wired to /healthz and only /healthz, the pod"
+say "     passes it, and a database OUTAGE does not make it fail"
+DS_PROBE=$($KC -n tributary get daemonset tributary -o jsonpath='{.spec.template.spec.containers[0].livenessProbe.httpGet.path}')
+check "livenessProbe asks /healthz" "$DS_PROBE" "/healthz"
+check "there is NO readinessProbe (a restart must never follow a database outage)" \
+  "$($KC -n tributary get daemonset tributary -o jsonpath='{.spec.template.spec.containers[0].readinessProbe}')" ""
+AGENT=$($KC -n tributary get pod -l app.kubernetes.io/name=tributary -o jsonpath='{.items[0].metadata.name}')
+AGENT_IP=$($KC -n tributary get pod "$AGENT" -o jsonpath='{.status.podIP}')
+# Asked from the workload pod (busybox has wget) on the pod network; the agent
+# image has no shell to exec into. wget prints the body on 200 and an error
+# on anything else, so a JSON body IS the 200.
+healthz() { $KC -n smoke-app exec deploy/labeltest -- wget -qO- -T 5 "http://$AGENT_IP:9109/healthz" 2>/dev/null || echo '{"status":"unreachable"}'; }
+HZ=$(healthz)
+check "/healthz on the pod IP answers 200 with live=true" \
+  "$(echo "$HZ" | grep -q '"live":true' && echo yes || echo no)" "yes"
+echo "  healthz: $HZ"
+restarts() { $KC -n tributary get pod "$AGENT" -o jsonpath='{.status.containerStatuses[0].restartCount}'; }
+# The probe has had time to fire (initialDelay 10 s, period 20 s) by now; a
+# probe that failed would show as restarts.
+check "the kubelet's probe has not restarted the agent" "$(restarts)" "0"
+
+# The trap, made into evidence: take the sink away. The agent's shipping fails,
+# the queue grows, /healthz says degraded — and stays 200, so through more
+# than a full probe period nothing restarts and the queue keeps what it holds.
+say "     ... now with the sink scaled to zero (an outage)"
+$KC -n tributary scale deploy/mock --replicas=0 >/dev/null
+i=0
+# The first failed send waits out the 30 s request timeout on a connection
+# that hangs (a ClusterIP with no endpoints), so the spool shows ~40 s in.
+until healthz | grep -q '"shipping":false'; do
+  i=$((i+1)); [ $i -gt 60 ] && { echo "  timed out waiting for the outage to show"; break; }
+  sleep 2
+done
+HZ=$(healthz)
+echo "  healthz during the outage: $HZ"
+check "during the outage /healthz reports degraded, not wedged" \
+  "$(echo "$HZ" | grep -q '"status":"degraded"' && echo yes || echo no)" "yes"
+check "and is still 200 with live=true (an outage is not a liveness failure)" \
+  "$(echo "$HZ" | grep -q '"live":true' && echo yes || echo no)" "yes"
+sleep 25   # more than one probe period, so a failing probe would have counted
+check "after a full probe period in the outage, the agent was NOT restarted" "$(restarts)" "0"
 
 echo
 echo "  sample delivered line:"

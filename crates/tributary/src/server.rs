@@ -120,6 +120,11 @@ async fn handle(
 /// Liveness, plus enough state to be useful. See the module docs for why
 /// an unreachable database does not make this fail.
 pub fn health(tel: &Telemetry) -> (StatusCode, String) {
+    // The queue and readiness-shaped fields below are sums over the
+    // per-source snapshots. Sum them HERE, not only in the Prometheus
+    // render: a probe-only deployment never scrapes /metrics, and without
+    // this it read `shipping:true` straight through an outage (#77).
+    tel.aggregate();
     let stalled_secs = tel.since_tick_ms() / 1000;
     let live = stalled_secs < WEDGED_AFTER_SECS;
 
@@ -212,8 +217,11 @@ mod tests {
     #[test]
     fn a_database_outage_is_degraded_but_still_live() {
         let t = tel();
-        t.queue_bytes.store(64 * 1024 * 1024, Ordering::Relaxed);
-        t.queue_full.store(true, Ordering::Relaxed);
+        // On the source's snapshot, the way a real pipeline reports it —
+        // not on the aggregate, which health has to derive (#77).
+        let s = t.register_source();
+        s.queue_bytes.store(64 * 1024 * 1024, Ordering::Relaxed);
+        s.queue_full.store(true, Ordering::Relaxed);
 
         let (code, body) = health(&t);
         assert_eq!(
@@ -247,6 +255,25 @@ mod tests {
         assert!(body.contains("\"credential_healthy\":false"));
     }
 
+    /// Found by the kind smoke for #77: with the sink scaled away, the agent
+    /// spooled to its queue within 40 s and `/healthz` went on saying
+    /// `shipping:true` for as long as nothing scraped `/metrics`, because the
+    /// per-source snapshots were summed only at the top of the Prometheus
+    /// render. A DaemonSet with a probe and no scraper would never have read
+    /// `degraded`. Health has to derive the totals itself.
+    #[test]
+    fn health_sees_a_sources_queue_without_a_metrics_scrape_first() {
+        let t = tel();
+        let s = t.register_source();
+        s.queue_bytes.store(4096, Ordering::Relaxed);
+        // Deliberately NO render_prometheus() between the store and the read.
+        let (code, body) = health(&t);
+        assert_eq!(code, StatusCode::OK);
+        assert!(body.contains("\"queue_bytes\":4096"), "{body}");
+        assert!(body.contains("\"shipping\":false"), "{body}");
+        assert!(body.contains("\"status\":\"degraded\""), "{body}");
+    }
+
     #[test]
     fn a_wedged_loop_is_the_one_thing_that_fails() {
         let t = tel();
@@ -263,7 +290,7 @@ mod tests {
     #[test]
     fn the_health_body_is_valid_json() {
         let t = tel();
-        t.queue_bytes.store(17, Ordering::Relaxed);
+        t.register_source().queue_bytes.store(17, Ordering::Relaxed);
         let (_, body) = health(&t);
         let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(v["queue_bytes"], 17);

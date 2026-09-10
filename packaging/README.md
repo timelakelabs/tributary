@@ -128,7 +128,11 @@ glibc.
 `.github/workflows/release.yml` runs on a `v*` tag: it calls `build.sh`,
 installs and smoke-tests the packages with `verify.sh`, and attaches both plus
 `SHA256SUMS` to the Release. A tag containing `-` (`v0.1.0-alpha`) is marked
-as a pre-release.
+as a pre-release. It also publishes `ghcr.io/timelakelabs/tributary:<version>`
+for `linux/amd64` and `linux/arm64` (plus `:latest` for a non-prerelease tag,
+which `ci.yml` no longer writes), and attaches `deploy/k8s/daemonset.yaml`
+stamped with that tag, written only after the image it names exists (#77). One
+version string names the `.deb`, the `.rpm`, the image and the manifest.
 
 It deliberately does not re-run the test suite: `ci.yml` proves the tree, and
 duplicating it per tag makes cutting a release something people avoid doing.

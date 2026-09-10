@@ -201,9 +201,13 @@ jobs:
         with:
           context: .
           push: true
+          # `:main` and `:<sha>` only. `:latest` used to be pushed here too,
+          # which made it "whatever main last built" — and the DaemonSet
+          # manifest pinned it, so every node that rebooted pulled a
+          # different agent than its neighbours (#77). `:latest` now means the
+          # latest RELEASE and is written by release.yml on a tag.
           tags: |
             ghcr.io/${{ github.repository_owner }}/tributary:main
-            ghcr.io/${{ github.repository_owner }}/tributary:latest
             ghcr.io/${{ github.repository_owner }}/tributary:${{ github.sha }}
           cache-from: type=gha,scope=tributary
           cache-to: type=gha,scope=tributary,mode=max

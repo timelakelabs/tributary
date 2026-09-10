@@ -8,7 +8,11 @@ FROM rust:1-slim AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p tributary
+# --locked: a RELEASE image has to be the tree that CI proved. Without it
+# cargo re-resolves at build time, so an image tagged 0.5.0 could carry
+# dependency versions nothing ever tested (TimeLakeDB #167 found its own
+# Dockerfile doing exactly that).
+RUN cargo build --release --locked -p tributary
 
 # trixie matches the glibc of the rust:1-slim builder. TimeLakeDB's image
 # learned this the expensive way — a bookworm runtime stage started failing
