@@ -56,6 +56,9 @@ AFTER_IMAGE=tributary:otlp-after
 echo "  building $AFTER_IMAGE from the working tree ($(git rev-parse --short HEAD))"
 docker build -q -t "$AFTER_IMAGE" . >/dev/null
 echo "  collector: $COLLECTOR"
+# Pulled up front and quietly, so a first run's transcript is the drill and
+# not thirty lines of layer downloads.
+for img in "$COLLECTOR" alpine:3.20 curlimages/curl:8.10.1; do docker pull -q "$img" >/dev/null; done
 
 echo "-- rig --"
 cleanup
@@ -128,7 +131,7 @@ chk "$(curl_ -o /dev/null -w '%{http_code}' http://trib-75-before:9109/healthz)"
 run_collector trib-75-before
 write_lines before
 sleep 12
-docker logs trib-75-collector 2>&1 | grep -i "error" | head -3 | cut -c1-220 | sed 's/^/  collector: /'
+docker logs trib-75-collector 2>&1 | grep -i "error" | head -2 | cut -c1-600 | sed 's/^/  collector: /'
 # The bug, asserted as what it is: the Collector at its defaults is refused,
 # and the agent that refused it counted nothing.
 chk_ge "$(docker logs trib-75-collector 2>&1 | grep -c '400')" 1 "the Collector logs a 400 from the old agent (the bug)"
