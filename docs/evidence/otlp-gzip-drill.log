@@ -1,0 +1,30 @@
+#75 drill: the OpenTelemetry Collector at its defaults (gzip) against the OTLP receiver
+2026-09-10 · fixed agent built from 5a05ddc, old agent built from main (67735b9) · otel/opentelemetry-collector-contrib:0.116.1
+drill: bench/otlp_gzip_drill.sh
+================================================================================
+== #75: the OTel Collector at its defaults (gzip) against the OTLP receiver ==
+-- images --
+  building tributary:otlp-before from main (67735b9)
+  building tributary:otlp-after from the working tree (5a05ddc)
+  collector: otel/opentelemetry-collector-contrib:0.116.1
+-- rig --
+-- before: tributary:otlp-before --
+  PASS  old agent healthy
+  collector: 2026-09-10T01:08:29.850Z	warn	fileconsumer/file.go:49	finding files	{"kind": "receiver", "name": "filelog", "data_type": "logs", "component": "fileconsumer", "error": "no files match the configured criteria"}
+  collector: 2026-09-10T01:08:30.153Z	error	internal/queue_sender.go:103	Exporting failed. Dropping data. Try enabling retry_on_failure config option to retry on retryable errors.	{"kind": "exporter", "data_type": "logs", "name": "otlphttp", "error": "Permanent error: rpc error: code = InvalidArgument desc = error exporting items, request to http://trib-75-before:4318/v1/logs responded with HTTP Status Code 400", "dropped_items": 1}
+  PASS  the Collector logs a 400 from the old agent (the bug) (5 >= 1)
+  PASS  and the old agent counted NO records while refusing every batch (the invisibility)
+-- after: tributary:otlp-after --
+  PASS  new agent healthy
+  PASS  the Collector, gzip by default, delivered every line to the fixed agent (10 >= 10)
+  PASS  no request was refused
+  PASS  and the Collector saw no 400
+-- refusals over the wire, against the fixed agent --
+  PASS  Content-Encoding: zstd -> 415
+  PASS  Content-Encoding: gzip on a body that is not gzip -> 400
+  PASS  a body that is not a protobuf request -> 400
+  PASS  all three counted on tributary_otlp_requests_rejected_total
+  PASS  and none on the per-record counter, which is the point
+
+== 12 passed, 0 failed ==
+drill exit=0

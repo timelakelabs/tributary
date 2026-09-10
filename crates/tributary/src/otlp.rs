@@ -19,6 +19,7 @@
 //! The messages are hand-written prost (a stable subset of the OTLP protos, so
 //! no `protoc`); OTLP metrics/traces are the same shape later.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -364,6 +365,12 @@ async fn handle(
             "not found; POST OTLP logs to /v1/logs\n",
         ));
     }
+    // Read before the body is consumed: `into_body` takes the request.
+    let encoding = req
+        .headers()
+        .get(hyper::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_lowercase());
     let body = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => {
@@ -373,7 +380,69 @@ async fn handle(
             ));
         }
     };
-    Ok(ingest(&recv, body.as_ref()))
+    let body = match decode_body(&recv, encoding.as_deref(), body.as_ref(), MAX_DECOMPRESSED) {
+        Ok(b) => b,
+        Err((code, msg)) => return Ok(text(code, &msg)),
+    };
+    Ok(ingest(&recv, &body))
+}
+
+/// Inflated bytes the receiver will accept from one request. A Collector
+/// batch is kilobytes to low megabytes; a kilobyte of gzip can be a gigabyte
+/// of zeros on the way to `decode`, and the ingest path holds the whole body.
+const MAX_DECOMPRESSED: u64 = 64 << 20;
+
+/// Undo the request's `Content-Encoding`, or refuse it (#75).
+///
+/// The OpenTelemetry Collector's `otlphttp` exporter gzips by default, and
+/// for three releases this receiver decoded the raw bytes as protobuf and
+/// answered 400 to every batch — invisibly, because the per-record counters
+/// only move after a successful decode. `gzip` (and the legacy `x-gzip`) are
+/// inflated with the crate the shipper already uses to compress; anything
+/// else is 415, which is what the exporter's error log should say rather
+/// than "bad request". Every refusal counts on
+/// `tributary_otlp_requests_rejected_total`.
+///
+/// `max` is a parameter so a test can use a small bomb.
+fn decode_body<'a>(
+    recv: &Recv,
+    encoding: Option<&str>,
+    raw: &'a [u8],
+    max: u64,
+) -> Result<Cow<'a, [u8]>, (StatusCode, String)> {
+    let refuse = |code: StatusCode, msg: String| {
+        recv.tel
+            .otlp_requests_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        Err((code, msg))
+    };
+    match encoding {
+        None | Some("") | Some("identity") => Ok(Cow::Borrowed(raw)),
+        Some("gzip") | Some("x-gzip") => {
+            use std::io::Read;
+            let mut out = Vec::new();
+            // `take` bounds what is ever inflated: the decoder produces
+            // bytes on demand, so a bomb costs `max` bytes, not its claim.
+            let mut dec = flate2::read::MultiGzDecoder::new(raw).take(max + 1);
+            if let Err(e) = dec.read_to_end(&mut out) {
+                return refuse(
+                    StatusCode::BAD_REQUEST,
+                    format!("Content-Encoding: gzip, but the body is not valid gzip: {e}\n"),
+                );
+            }
+            if out.len() as u64 > max {
+                return refuse(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("inflated body exceeds {max} bytes; send smaller batches\n"),
+                );
+            }
+            Ok(Cow::Owned(out))
+        }
+        Some(other) => refuse(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("Content-Encoding {other:?} is not supported; send gzip or no encoding\n"),
+        ),
+    }
 }
 
 /// Decode one request body, map + stamp + encode its records, and enqueue
@@ -383,6 +452,11 @@ fn ingest(recv: &Recv, body: &[u8]) -> Response<Full<Bytes>> {
     let request = match <ExportLogsServiceRequest as ::prost::Message>::decode(body) {
         Ok(r) => r,
         Err(e) => {
+            // Request-level, not per-record: nothing was decoded, so the
+            // record counters cannot show this (#75).
+            recv.tel
+                .otlp_requests_rejected
+                .fetch_add(1, Ordering::Relaxed);
             return text(
                 StatusCode::BAD_REQUEST,
                 &format!("not a valid OTLP ExportLogsServiceRequest: {e}\n"),
@@ -633,6 +707,80 @@ mod tests {
             queue.lock().unwrap().is_empty(),
             "nothing is queued from a bad body"
         );
+        // Visible on /metrics even though no record was decoded (#75).
+        assert_eq!(recv.tel.otlp_requests_rejected.load(Ordering::Relaxed), 1);
+        assert_eq!(recv.tel.otlp_rejected.load(Ordering::Relaxed), 0);
+    }
+
+    fn gz(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn a_gzipped_body_is_inflated_the_collectors_default() {
+        // The Collector's otlphttp exporter gzips unless told not to; for
+        // three releases that was a 400 per batch (#75).
+        let (recv, queue, _dir) = recv_for_test();
+        let bytes = ::prost::Message::encode_to_vec(&request());
+        let gzipped = gz(&bytes);
+        let body =
+            decode_body(&recv, Some("gzip"), &gzipped, MAX_DECOMPRESSED).expect("gzip inflates");
+        assert_eq!(ingest(&recv, &body).status(), StatusCode::OK);
+        assert!(!queue.lock().unwrap().is_empty(), "the batch was queued");
+        // The legacy spelling some exporters still send, and the two
+        // spellings of "not encoded".
+        assert!(
+            decode_body(&recv, Some("x-gzip"), &gzipped, MAX_DECOMPRESSED).is_ok(),
+            "x-gzip"
+        );
+        for enc in [None, Some(""), Some("identity")] {
+            assert!(
+                decode_body(&recv, enc, &bytes, MAX_DECOMPRESSED).is_ok(),
+                "{enc:?}"
+            );
+        }
+        assert_eq!(recv.tel.otlp_requests_rejected.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn an_encoding_the_receiver_does_not_speak_is_415_and_counted() {
+        let (recv, _q, _dir) = recv_for_test();
+        let (code, _) =
+            decode_body(&recv, Some("zstd"), b"whatever", MAX_DECOMPRESSED).expect_err("refused");
+        assert_eq!(code, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(recv.tel.otlp_requests_rejected.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_body_that_claims_gzip_and_is_not_is_400_and_counted() {
+        let (recv, _q, _dir) = recv_for_test();
+        let bytes = ::prost::Message::encode_to_vec(&request());
+        let (code, _) =
+            decode_body(&recv, Some("gzip"), &bytes, MAX_DECOMPRESSED).expect_err("refused");
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(recv.tel.otlp_requests_rejected.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_gzip_bomb_is_413_and_inflates_only_to_the_cap() {
+        let (recv, _q, _dir) = recv_for_test();
+        let cap = 1u64 << 20;
+        // Four times the cap of zeros: a few KiB on the wire.
+        let bomb = gz(&vec![0u8; (cap as usize) * 4]);
+        assert!(
+            bomb.len() < 16 << 10,
+            "the point is the ratio: {}",
+            bomb.len()
+        );
+        let (code, _) = decode_body(&recv, Some("gzip"), &bomb, cap).expect_err("refused");
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(recv.tel.otlp_requests_rejected.load(Ordering::Relaxed), 1);
+        // And exactly at the cap it is accepted: the bound is on what is
+        // inflated, not a guess at the wire size.
+        assert!(decode_body(&recv, Some("gzip"), &gz(&vec![0u8; cap as usize]), cap).is_ok());
     }
 
     #[test]

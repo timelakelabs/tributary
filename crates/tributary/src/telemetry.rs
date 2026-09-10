@@ -98,6 +98,14 @@ pub struct Telemetry {
     /// (un-coercible field, or a stamper that refused the timestamp).
     pub otlp_received: AtomicU64,
     pub otlp_rejected: AtomicU64,
+    /// Whole requests refused before any record was decoded (#75): a body
+    /// that is not a protobuf request, not valid gzip, too large once
+    /// inflated, or in an encoding the receiver does not speak. Counted
+    /// apart from the per-record counter above, because a 400 on every
+    /// batch decodes zero records and would otherwise be invisible here
+    /// while the Collector's retry queue grows against an agent that
+    /// reports healthy.
+    pub otlp_requests_rejected: AtomicU64,
     pub read_ns: AtomicU64,
 
     /// L4 client certificate. `expiry` is seconds from now; `-1` means no
@@ -146,6 +154,7 @@ impl Telemetry {
             records_dropped_sample: AtomicU64::new(0),
             otlp_received: AtomicU64::new(0),
             otlp_rejected: AtomicU64::new(0),
+            otlp_requests_rejected: AtomicU64::new(0),
             read_ns: AtomicU64::new(0),
             cert_expires_in_secs: AtomicI64::new(-1),
             cert_healthy: AtomicBool::new(true),
@@ -415,6 +424,12 @@ impl Telemetry {
             "counter",
             "OTLP log records dropped before the queue: an undeclared/un-coercible field, or a timestamp the stamper refused.",
             g(&self.otlp_rejected).to_string(),
+        );
+        m(
+            "tributary_otlp_requests_rejected_total",
+            "counter",
+            "OTLP requests refused whole, before any record was decoded: not a protobuf request, not valid gzip, too large inflated, or an unsupported Content-Encoding. A Collector retrying against this is invisible in the record counters.",
+            g(&self.otlp_requests_rejected).to_string(),
         );
 
         // -- L4 credential ---------------------------------------------

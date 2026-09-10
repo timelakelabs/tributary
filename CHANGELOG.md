@@ -7,6 +7,22 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Fixed
 
+- **The OTLP receiver inflates gzip bodies, the Collector's default** (#75).
+  The receiver decoded the raw body as protobuf without looking at
+  `Content-Encoding`, so an OpenTelemetry Collector `otlphttp` exporter at
+  its defaults (`compression: gzip`) got a 400 on every batch, and the
+  README's "point the OTel Collector at it" was a promise that did not
+  survive a default config. Worse, it was invisible: the record counters
+  only move after a successful decode, so an agent refusing everything read
+  as healthy while the Collector's retry queue grew. `gzip` and the legacy
+  `x-gzip` are now inflated with the `flate2` the shipper already uses to
+  compress; any other encoding is 415; and an inflated body is capped at
+  64 MiB, refused with 413, so a kilobyte of gzip cannot become a gigabyte
+  in the ingest path. A new `tributary_otlp_requests_rejected_total` counts
+  every request refused whole (bad protobuf, bad gzip, too large,
+  unsupported encoding), apart from the per-record counter. Drilled with a
+  real Collector at its defaults: `bench/otlp_gzip_drill.sh`,
+  `docs/evidence/otlp-gzip-drill.log`.
 - **`main` requires its checks, and a docs-only pull request still merges**
   (timelakedb#169). Nothing stopped a red pull request from merging here
   either; the repository went public and the "paywalled" excuse went with it.
