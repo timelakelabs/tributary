@@ -9,11 +9,24 @@ OpenTelemetry (OTLP) logs pushed to it — and writes them into
 TimeLakeDB over line protocol — the same wire Telegraf already uses for
 metrics, so one host ships both through one endpoint and one data model.
 
-**Status: phases L0–L4 shipped, plus data-plane authentication and self-telemetry.** Tailing,
+**Status: L0–L4 shipped, and L5's deployment half with them.** Tailing,
 rotation and crash-resume, the durable queue with poison isolation and
 observed watermarks, throughput, presenting a bearer token to TimeLakeDB
 without ever logging it, and — since L4 — presenting a **client
-certificate** that rotates under load without dropping a line. The queue's
+certificate** that rotates under load without dropping a line. Since then:
+multiple sources in one agent, edge transforms (filter, sample, redact), a
+host-metrics collector, journald and Windows event log sources, an OTLP
+receiver, live config reload, and **Kubernetes** — a DaemonSet with CRI
+path enrichment and an allowlisted pod-label lookup, drilled on a real
+kind cluster rather than a fixture (#8).
+
+What is left of the phase list: L5's *discovery* half (an `EndpointSource`
+seam and a Consul backend, specified in `ROADMAP.md` §L5, unstarted), and
+L6, the Flight `DoPut` wire — which is gated on a measurement rather than
+on effort, and #78 is that measurement. This line said "L0–L4 shipped"
+until 2026-09-10, eleven days after the DaemonSet landed.
+
+The queue's
 **RPO is measured rather than asserted** (P1-7): zero for a restart on a
 surviving disk, and a bounded, configurable window when the node itself is
 lost. Every phase is gated by a recorded run rather than by unit tests
@@ -29,12 +42,15 @@ alone — see `bench/results/`:
 | L4 | mTLS: presents a client certificate; both certificates rotate under load; a rejected renewal keeps the last-good pair; anonymous callers still served | `bench/results/l4-mtls-rotation.log` |
 | P1-7 | The queue's RPO, measured: 0 on a surviving disk, `batch_lines × (1 + max_inflight)` on node loss | `bench/results/p17-queue-rpo.log` |
 | T-1 | `/metrics` and `/healthz`: 26 series, and a database outage leaves liveness green so nothing restarts the agent out from under its queue | `bench/results/t1-self-telemetry.log` |
+| L5 (deployment) | One pod per node reads every container log through the CRI format; an allowlisted pod label becomes a tag and the API-injected `pod-template-hash` never does; 100 files across 50 restarts collapse to 2 series | `docs/evidence/k8s-kind-smoke.log`, `k8s-cardinality-drill.log`, `k8s-cri-drill.log` |
 
-Next is L5 (discovery and cloud metadata) and L6 (the Flight `DoPut`
-wire, gated on TimeLakeDB growing it) — see
-[`ROADMAP.md`](ROADMAP.md). [`DESIGN.md`](DESIGN.md) remains the
-specification, and its §1 explains why this is a purpose-built agent
-rather than a Vector configuration.
+Next is the rest of L5 — discovery, an `EndpointSource` seam with a Consul
+backend — and L6, the Flight `DoPut` wire. L6 is gated on a measurement,
+not on TimeLakeDB, which grew `DoPut` in timelakedb#79: the ship path's
+time breakdown has to say line-protocol encoding is actually the
+bottleneck first, and #78 is that step. See [`ROADMAP.md`](ROADMAP.md).
+[`DESIGN.md`](DESIGN.md) remains the specification, and its §1 explains
+why this is a purpose-built agent rather than a Vector configuration.
 
 ## Install (Linux packages)
 
