@@ -108,5 +108,31 @@ check("config stamps the node from the environment (node = \"${NODE_NAME}\")",
 check("config declares a pod-label allowlist (#66)",
       "labels = [" in toml)
 
+# #77: a pinned image, a telemetry listener, and liveness on it — and NOT
+# readiness. The image tag is held equal to the crate version by a cargo test
+# too (crates/tributary/tests/manifest_pins_the_crate_version.rs); this is the
+# same check for someone running the validator by hand.
+image = c.get("image", "")
+tag = image.rsplit(":", 1)[-1] if ":" in image else ""
+check("the image is pinned to a version, not a floating tag",
+      image.startswith("ghcr.io/timelakelabs/tributary:")
+      and tag not in ("", "latest", "main") and tag[0].isdigit())
+import re, os  # noqa: E401
+root = os.path.join(os.path.dirname(os.path.abspath(PATH)), "..", "..")
+with open(os.path.join(root, "Cargo.toml"), encoding="utf-8") as f:
+    m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.MULTILINE)
+crate_version = m.group(1) if m else "?"
+check(f"the image tag equals the workspace version ({crate_version})", tag == crate_version)
+check("config serves [telemetry] on 0.0.0.0:9109 (what the probe asks)",
+      "[telemetry]" in toml and 'addr = "0.0.0.0:9109"' in toml)
+ports = {p.get("name"): p for p in c.get("ports", [])}
+check("the container declares the telemetry port 9109",
+      ports.get("telemetry", {}).get("containerPort") == 9109)
+lp = c.get("livenessProbe", {}).get("httpGet", {})
+check("livenessProbe asks GET /healthz on the telemetry port",
+      lp.get("path") == "/healthz" and lp.get("port") in ("telemetry", 9109))
+check("there is NO readinessProbe (server.rs: a restart on an outage discards the queue's reason to exist)",
+      "readinessProbe" not in c)
+
 print("ALL PASS" if fail == 0 else "FAILURES")
 sys.exit(fail)

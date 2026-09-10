@@ -5,8 +5,45 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **A versioned, multi-arch image, a stamped DaemonSet manifest, and a
+  liveness probe** (#77). The only container image was whatever `main` last
+  built, `release.yml` had no docker step at all, and the DaemonSet manifest
+  pinned `:latest` — so every node that rebooted or joined pulled a different
+  agent than its neighbours, the compose rigs' stale-image lesson at cluster
+  scale. A `v*` tag now publishes `ghcr.io/timelakelabs/tributary:<version>`
+  for `linux/amd64` and `linux/arm64`, checked to be multi-arch rather than
+  assumed, plus `:latest` for a non-prerelease tag; `ci.yml` stops writing
+  `:latest`, so it means the latest release and nothing else. The manifest in
+  the tree pins the crate version of the tree it is in, held there by a cargo
+  test so the release commit that bumps `Cargo.toml` has to bump it too, and
+  each Release carries the manifest stamped with its tag, written only after
+  the image it names exists. The image is built `--locked`, for the reason
+  TimeLakeDB's was (#167 there). The ConfigMap now serves `[telemetry]` on
+  `0.0.0.0:9109` and the container has a `livenessProbe` on `GET /healthz`,
+  which is 503 only for a wedged main loop and 200 through a database outage;
+  there is deliberately no readiness probe, because a restart during an outage
+  discards the batches the queue exists to protect (`server.rs` has the
+  argument). `kind-smoke.sh` asserts the probe wiring live and
+  `deploy/k8s/validate.py` checks it offline.
+
 ### Fixed
 
+- **`/healthz` reported `shipping:true` straight through an outage unless
+  something scraped `/metrics`** (#77). Since the multi-source split (#49)
+  the queue and readiness-shaped fields on the health body are sums over
+  per-source snapshots, and the sum was computed only at the top of the
+  Prometheus render. `/healthz` read the stale aggregate: on a DaemonSet
+  with a liveness probe and no scraper, the body would never have said
+  `degraded`. Found by the kind smoke for #77, which scaled the sink to
+  zero, watched the agent spool 56 KB to its queue within 40 s, and watched
+  `/healthz` say `shipping:true` for the next 90 s. Health sums the
+  snapshots itself now; the health tests report through a source snapshot
+  the way a real pipeline does, and one asserts the outage is visible with
+  no render in between. Liveness was never wrong (`live` reads the tick,
+  not the sums), so no probe restarted anything it should not have; the
+  operator-facing body was.
 - **The OTLP receiver inflates gzip bodies, the Collector's default** (#75).
   The receiver decoded the raw body as protobuf without looking at
   `Content-Encoding`, so an OpenTelemetry Collector `otlphttp` exporter at

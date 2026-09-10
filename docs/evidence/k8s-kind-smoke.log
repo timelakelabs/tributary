@@ -1,7 +1,10 @@
+#77 kind smoke: the REAL deploy/k8s/daemonset.yaml on a throwaway kind cluster, now with the liveness probe
+2026-09-10 · kind v0.29.0 go1.24.2 windows/amd64 · working tree on 3422858 · agent image built from the tree with --provenance=false
+================================================================================
 == cluster
 Creating cluster "trib-smoke" ...
- • Ensuring node image (kindest/node:v1.31.0) 🖼  ...
- ✓ Ensuring node image (kindest/node:v1.31.0) 🖼
+ • Ensuring node image (kindest/node:v1.33.1) 🖼  ...
+ ✓ Ensuring node image (kindest/node:v1.33.1) 🖼
  • Preparing nodes 📦   ...
  ✓ Preparing nodes 📦 
  • Writing configuration 📜  ...
@@ -14,28 +17,422 @@ Creating cluster "trib-smoke" ...
  ✓ Installing StorageClass 💾
  • Waiting ≤ 2m0s for control-plane = Ready ⏳  ...
  ✓ Waiting ≤ 2m0s for control-plane = Ready ⏳
- • Ready after 16s 💚
+ • Ready after 15s 💚
 Set kubectl context to "kind-trib-smoke"
 You can now use your cluster with:
+
 kubectl cluster-info --context kind-trib-smoke
+
 Thanks for using kind! 😊
 == build + load the agent image
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 DONE 0.0s
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 2.42kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/debian:trixie-slim
+#2 DONE 0.1s
+
+#3 [internal] load metadata for docker.io/library/rust:1-slim
+#3 DONE 0.1s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 280B done
+#4 DONE 0.0s
+
+#5 [build 1/5] FROM docker.io/library/rust:1-slim@sha256:3b2879047d42784ca9403ad20c51ed3df361a50f1df96f5777d39b4e33aa65cd
+#5 resolve docker.io/library/rust:1-slim@sha256:3b2879047d42784ca9403ad20c51ed3df361a50f1df96f5777d39b4e33aa65cd 0.0s done
+#5 DONE 0.1s
+
+#6 [stage-1 1/4] FROM docker.io/library/debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+#6 resolve docker.io/library/debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 0.0s done
+#6 DONE 0.1s
+
+#7 [internal] load build context
+#7 transferring context: 43.05kB done
+#7 DONE 0.0s
+
+#8 [build 2/5] WORKDIR /src
+#8 CACHED
+
+#9 [build 3/5] COPY Cargo.toml Cargo.lock ./
+#9 CACHED
+
+#10 [build 4/5] COPY crates ./crates
+#10 DONE 0.2s
+
+#11 [build 5/5] RUN cargo build --release --locked -p tributary
+#11 0.314     Updating crates.io index
+#11 2.366  Downloading crates ...
+#11 2.530   Downloaded asn1-rs-impl v0.2.0
+#11 2.569   Downloaded getrandom v0.4.3
+#11 2.581   Downloaded cpufeatures v0.3.0
+#11 2.595   Downloaded cfg_aliases v0.2.2
+#11 2.601   Downloaded atomic-waker v1.1.2
+#11 2.602   Downloaded cfg-if v1.0.4
+#11 2.614   Downloaded base64 v0.22.1
+#11 2.621   Downloaded tinyvec_macros v0.1.1
+#11 2.621   Downloaded tower-service v0.3.3
+#11 2.623   Downloaded rustc-hash v2.1.3
+#11 2.624   Downloaded http-body v1.1.0
+#11 2.625   Downloaded percent-encoding v2.3.2
+#11 2.628   Downloaded rusticata-macros v4.1.0
+#11 2.630   Downloaded errno v0.3.14
+#11 2.633   Downloaded thread_local v1.1.10
+#11 2.637   Downloaded httpdate v1.0.3
+#11 2.639   Downloaded equivalent v1.0.2
+#11 2.644   Downloaded itoa v1.0.18
+#11 2.645   Downloaded adler2 v2.0.1
+#11 2.646   Downloaded lazy_static v1.5.0
+#11 2.650   Downloaded asn1-rs-derive v0.6.0
+#11 2.651   Downloaded rand_pcg v0.10.2
+#11 2.656   Downloaded shlex v2.0.1
+#11 2.657   Downloaded serde_derive v1.0.229
+#11 2.660   Downloaded lru-slab v0.1.2
+#11 2.661   Downloaded futures-core v0.3.34
+#11 2.677   Downloaded futures-task v0.3.34
+#11 2.682   Downloaded quote v1.0.47
+#11 2.684   Downloaded autocfg v1.5.1
+#11 2.686   Downloaded crossbeam-deque v0.8.7
+#11 2.690   Downloaded flate2 v1.1.9
+#11 2.694   Downloaded matchers v0.2.0
+#11 2.695   Downloaded time-macros v0.2.32
+#11 2.697   Downloaded form_urlencoded v1.2.2
+#11 2.698   Downloaded idna_adapter v1.2.2
+#11 2.705   Downloaded num-conv v0.2.2
+#11 2.708   Downloaded potential_utf v0.1.6
+#11 2.713   Downloaded powerfmt v0.2.0
+#11 2.714   Downloaded rand_core v0.10.1
+#11 2.715   Downloaded prost-derive v0.14.4
+#11 2.723   Downloaded sync_wrapper v1.0.2
+#11 2.729   Downloaded yoke-derive v0.8.2
+#11 2.730   Downloaded deranged v0.5.8
+#11 2.733   Downloaded tokio-macros v2.7.2
+#11 2.734   Downloaded either v1.18.0
+#11 2.736   Downloaded pin-project-lite v0.2.17
+#11 2.740   Downloaded oid-registry v0.8.1
+#11 2.741   Downloaded find-msvc-tools v0.1.11
+#11 2.743   Downloaded quinn-udp v0.5.15
+#11 2.744   Downloaded subtle v2.6.1
+#11 2.753   Downloaded http-body-util v0.1.5
+#11 2.757   Downloaded tower-layer v0.3.3
+#11 2.767   Downloaded nu-ansi-term v0.50.3
+#11 2.774   Downloaded stable_deref_trait v1.2.1
+#11 2.775   Downloaded data-encoding v2.11.1
+#11 2.776   Downloaded crossbeam-epoch v0.9.20
+#11 2.780   Downloaded want v0.3.1
+#11 2.787   Downloaded serde_spanned v0.6.9
+#11 2.788   Downloaded synstructure v0.13.2
+#11 2.789   Downloaded anyhow v1.0.104
+#11 2.792   Downloaded tinystr v0.8.4
+#11 2.796   Downloaded getrandom v0.2.17
+#11 2.803   Downloaded ipnet v2.12.1
+#11 2.806   Downloaded displaydoc v0.2.7
+#11 2.808   Downloaded num-integer v0.1.47
+#11 2.809   Downloaded hyper-rustls v0.27.9
+#11 2.810   Downloaded chacha20 v0.10.1
+#11 2.812   Downloaded prost v0.14.4
+#11 2.818   Downloaded slab v0.4.12
+#11 2.819   Downloaded tracing-log v0.2.0
+#11 2.820   Downloaded simd-adler32 v0.3.10
+#11 2.822   Downloaded zerovec-derive v0.11.6
+#11 2.823   Downloaded rustls-pemfile v2.2.0
+#11 2.825   Downloaded thiserror v2.0.20
+#11 2.829   Downloaded rustversion v1.0.23
+#11 2.831   Downloaded try-lock v0.2.5
+#11 2.832   Downloaded zerofrom-derive v0.1.7
+#11 2.833   Downloaded toml_write v0.1.2
+#11 2.848   Downloaded serde_urlencoded v0.7.1
+#11 2.850   Downloaded toml v0.8.23
+#11 2.852   Downloaded futures-channel v0.3.34
+#11 2.854   Downloaded once_cell v1.21.4
+#11 2.856   Downloaded rustls-pki-types v1.15.1
+#11 2.858   Downloaded untrusted v0.9.0
+#11 2.862   Downloaded httparse v1.10.1
+#11 2.881   Downloaded zmij v1.0.23
+#11 2.885   Downloaded sharded-slab v0.1.7
+#11 2.888   Downloaded zeroize v1.9.0
+#11 2.890   Downloaded writeable v0.6.4
+#11 2.891   Downloaded litemap v0.8.3
+#11 2.894   Downloaded tokio-rustls v0.26.4
+#11 2.899   Downloaded toml_edit v0.22.27
+#11 2.918   Downloaded proc-macro2 v1.0.107
+#11 2.924   Downloaded log v0.4.34
+#11 2.931   Downloaded smallvec v1.15.2
+#11 2.932   Downloaded tracing-attributes v0.1.31
+#11 2.934   Downloaded yoke v0.8.3
+#11 2.936   Downloaded socket2 v0.6.5
+#11 2.937   Downloaded unicode-ident v1.0.24
+#11 2.942   Downloaded serde_core v1.0.229
+#11 2.947   Downloaded ryu v1.0.23
+#11 2.950   Downloaded tinyvec v1.12.0
+#11 2.962   Downloaded crossbeam-utils v0.8.22
+#11 2.965   Downloaded rayon-core v1.13.0
+#11 2.968   Downloaded num-traits v0.2.19
+#11 2.969   Downloaded bitflags v2.13.1
+#11 2.972   Downloaded crc32fast v1.5.1
+#11 2.974   Downloaded arc-swap v1.9.2
+#11 2.977   Downloaded bytes v1.12.1
+#11 2.980   Downloaded url v2.5.8
+#11 2.982   Downloaded serde v1.0.229
+#11 2.985   Downloaded tower v0.5.3
+#11 2.994   Downloaded zerotrie v0.2.5
+#11 2.997   Downloaded icu_normalizer_data v2.3.0
+#11 3.019   Downloaded zerovec v0.11.8
+#11 3.027   Downloaded icu_provider v2.3.1
+#11 3.035   Downloaded icu_locale_core v2.3.0
+#11 3.042   Downloaded miniz_oxide v0.8.9
+#11 3.055   Downloaded quinn v0.11.11
+#11 3.078   Downloaded der-parser v10.0.0
+#11 3.092   Downloaded time-core v0.1.9
+#11 3.093   Downloaded utf8_iter v1.0.4
+#11 3.095   Downloaded icu_collections v2.3.0
+#11 3.100   Downloaded asn1-rs v0.7.2
+#11 3.122   Downloaded zerofrom v0.1.8
+#11 3.133   Downloaded toml_datetime v0.6.11
+#11 3.137   Downloaded signal-hook-registry v1.4.8
+#11 3.138   Downloaded thiserror-impl v2.0.20
+#11 3.141   Downloaded sysinfo v0.33.1
+#11 3.148   Downloaded webpki-roots v1.0.9
+#11 3.154   Downloaded memchr v2.8.3
+#11 3.159   Downloaded minimal-lexical v0.2.1
+#11 3.162   Downloaded cc v1.4.4
+#11 3.165   Downloaded http v1.5.0
+#11 3.168   Downloaded mio v1.2.2
+#11 3.173   Downloaded indexmap v2.14.0
+#11 3.177   Downloaded hyper-util v0.1.20
+#11 3.183   Downloaded num-bigint v0.4.8
+#11 3.187   Downloaded tracing-core v0.1.36
+#11 3.203   Downloaded nom v7.1.3
+#11 3.212   Downloaded rand v0.10.2
+#11 3.217   Downloaded rustls v0.23.43
+#11 3.232   Downloaded rustls-webpki v0.103.15
+#11 3.234   Downloaded icu_properties v2.3.0
+#11 3.262   Downloaded idna v1.1.0
+#11 3.268   Downloaded time v0.3.55
+#11 3.279   Downloaded reqwest v0.12.28
+#11 3.284   Downloaded x509-parser v0.17.0
+#11 3.291   Downloaded aho-corasick v1.1.5
+#11 3.301   Downloaded hashbrown v0.17.1
+#11 3.307   Downloaded serde_json v1.0.151
+#11 3.313   Downloaded itertools v0.14.0
+#11 3.318   Downloaded icu_properties_data v2.3.0
+#11 3.326   Downloaded futures-util v0.3.34
+#11 3.335   Downloaded regex v1.13.1
+#11 3.339   Downloaded hyper v1.11.0
+#11 3.345   Downloaded syn v3.0.4
+#11 3.353   Downloaded tower-http v0.6.11
+#11 3.361   Downloaded winnow v0.7.15
+#11 3.369   Downloaded rayon v1.12.0
+#11 3.375   Downloaded tracing-subscriber v0.3.23
+#11 3.382   Downloaded tracing v0.1.44
+#11 3.398   Downloaded syn v2.0.119
+#11 3.406   Downloaded quinn-proto v0.11.17
+#11 3.454   Downloaded tokio v1.53.1
+#11 3.491   Downloaded regex-syntax v0.8.11
+#11 3.524   Downloaded icu_normalizer v2.3.0
+#11 3.541   Downloaded regex-automata v0.4.18
+#11 3.571   Downloaded libc v0.2.189
+#11 3.627   Downloaded ring v0.17.14
+#11 3.714    Compiling proc-macro2 v1.0.107
+#11 3.714    Compiling quote v1.0.47
+#11 3.714    Compiling unicode-ident v1.0.24
+#11 3.714    Compiling libc v0.2.189
+#11 3.715    Compiling stable_deref_trait v1.2.1
+#11 3.716    Compiling memchr v2.8.3
+#11 3.717    Compiling bytes v1.12.1
+#11 3.721    Compiling pin-project-lite v0.2.17
+#11 3.722    Compiling cfg-if v1.0.4
+#11 3.722    Compiling futures-core v0.3.34
+#11 3.723    Compiling itoa v1.0.18
+#11 3.723    Compiling find-msvc-tools v0.1.11
+#11 3.725    Compiling serde_core v1.0.229
+#11 3.726    Compiling shlex v2.0.1
+#11 3.727    Compiling smallvec v1.15.2
+#11 3.727    Compiling once_cell v1.21.4
+#11 3.728    Compiling autocfg v1.5.1
+#11 3.730    Compiling writeable v0.6.4
+#11 3.731    Compiling litemap v0.8.3
+#11 3.731    Compiling icu_properties_data v2.3.0
+#11 3.732    Compiling utf8_iter v1.0.4
+#11 3.734    Compiling serde v1.0.229
+#11 3.734    Compiling icu_normalizer_data v2.3.0
+#11 3.734    Compiling zeroize v1.9.0
+#11 3.744    Compiling crossbeam-utils v0.8.22
+#11 3.748    Compiling percent-encoding v2.3.2
+#11 3.756    Compiling futures-task v0.3.34
+#11 3.772    Compiling time-core v0.1.9
+#11 3.815    Compiling minimal-lexical v0.2.1
+#11 3.833    Compiling cc v1.4.4
+#11 3.887    Compiling tracing-core v0.1.36
+#11 3.895    Compiling rustls-pki-types v1.15.1
+#11 3.904    Compiling thiserror v2.0.20
+#11 3.904    Compiling crossbeam-epoch v0.9.20
+#11 3.908    Compiling num-conv v0.2.2
+#11 3.913    Compiling slab v0.4.12
+#11 3.916    Compiling anyhow v1.0.104
+#11 3.925    Compiling untrusted v0.9.0
+#11 3.939    Compiling httparse v1.10.1
+#11 3.953    Compiling powerfmt v0.2.0
+#11 3.969    Compiling crossbeam-deque v0.8.7
+#11 3.986    Compiling rustls v0.23.43
+#11 4.001    Compiling try-lock v0.2.5
+#11 4.010    Compiling tower-service v0.3.3
+#11 4.011    Compiling time-macros v0.2.32
+#11 4.051    Compiling futures-util v0.3.34
+#11 4.061    Compiling deranged v0.5.8
+#11 4.062    Compiling want v0.3.1
+#11 4.070    Compiling form_urlencoded v1.2.2
+#11 4.074    Compiling num-traits v0.2.19
+#11 4.079    Compiling futures-channel v0.3.34
+#11 4.083    Compiling subtle v2.6.1
+#11 4.085    Compiling httpdate v1.0.3
+#11 4.093    Compiling rayon-core v1.13.0
+#11 4.117    Compiling regex-syntax v0.8.11
+#11 4.136    Compiling atomic-waker v1.1.2
+#11 4.167    Compiling sync_wrapper v1.0.2
+#11 4.188    Compiling ipnet v2.12.1
+#11 4.188    Compiling crc32fast v1.5.1
+#11 4.188    Compiling rustversion v1.0.23
+#11 4.203    Compiling tower-layer v0.3.3
+#11 4.228    Compiling nom v7.1.3
+#11 4.234    Compiling aho-corasick v1.1.5
+#11 4.273    Compiling lazy_static v1.5.0
+#11 4.277    Compiling oid-registry v0.8.1
+#11 4.347    Compiling http v1.5.0
+#11 4.352    Compiling base64 v0.22.1
+#11 4.379    Compiling log v0.4.34
+#11 4.521    Compiling either v1.18.0
+#11 4.612    Compiling syn v3.0.4
+#11 4.615    Compiling syn v2.0.119
+#11 4.639    Compiling equivalent v1.0.2
+#11 4.650    Compiling hashbrown v0.17.1
+#11 4.651    Compiling zmij v1.0.23
+#11 4.685    Compiling webpki-roots v1.0.9
+#11 4.700    Compiling itertools v0.14.0
+#11 4.754    Compiling serde_json v1.0.151
+#11 4.815    Compiling winnow v0.7.15
+#11 4.860    Compiling bitflags v2.13.1
+#11 4.864    Compiling toml_write v0.1.2
+#11 4.898    Compiling adler2 v2.0.1
+#11 4.927    Compiling ryu v1.0.23
+#11 4.983    Compiling simd-adler32 v0.3.10
+#11 4.998    Compiling num-integer v0.1.47
+#11 5.129    Compiling errno v0.3.14
+#11 5.135    Compiling socket2 v0.6.5
+#11 5.147    Compiling mio v1.2.2
+#11 5.199    Compiling signal-hook-registry v1.4.8
+#11 5.225    Compiling getrandom v0.2.17
+#11 5.243    Compiling num-bigint v0.4.8
+#11 5.303    Compiling http-body v1.1.0
+#11 5.310    Compiling ring v0.17.14
+#11 5.313    Compiling miniz_oxide v0.8.9
+#11 5.380    Compiling time v0.3.55
+#11 5.384    Compiling indexmap v2.14.0
+#11 5.395    Compiling rayon v1.12.0
+#11 5.411    Compiling http-body-util v0.1.5
+#11 5.450    Compiling tracing-log v0.2.0
+#11 5.532    Compiling sharded-slab v0.1.7
+#11 5.661    Compiling thread_local v1.1.10
+#11 5.661    Compiling nu-ansi-term v0.50.3
+#11 5.691    Compiling data-encoding v2.11.1
+#11 5.746    Compiling arc-swap v1.9.2
+#11 5.866    Compiling rusticata-macros v4.1.0
+#11 5.933    Compiling flate2 v1.1.9
+#11 5.971    Compiling regex-automata v0.4.18
+#11 5.972    Compiling rustls-pemfile v2.2.0
+#11 7.106    Compiling sysinfo v0.33.1
+#11 7.185    Compiling displaydoc v0.2.7
+#11 7.185    Compiling zerovec-derive v0.11.6
+#11 7.185    Compiling tokio-macros v2.7.2
+#11 7.185    Compiling serde_derive v1.0.229
+#11 7.188    Compiling thiserror-impl v2.0.20
+#11 7.292    Compiling synstructure v0.13.2
+#11 7.405    Compiling tokio v1.53.1
+#11 7.531    Compiling zerofrom-derive v0.1.7
+#11 7.532    Compiling yoke-derive v0.8.2
+#11 7.532    Compiling tracing-attributes v0.1.31
+#11 7.532    Compiling asn1-rs-impl v0.2.0
+#11 7.534    Compiling asn1-rs-derive v0.6.0
+#11 7.542    Compiling prost-derive v0.14.4
+#11 7.890    Compiling asn1-rs v0.7.2
+#11 7.976    Compiling zerofrom v0.1.8
+#11 8.019    Compiling yoke v0.8.3
+#11 8.080    Compiling tracing v0.1.44
+#11 8.098    Compiling zerovec v0.11.8
+#11 8.098    Compiling zerotrie v0.2.5
+#11 8.178    Compiling prost v0.14.4
+#11 8.287    Compiling matchers v0.2.0
+#11 8.287    Compiling regex v1.13.1
+#11 8.325    Compiling tracing-subscriber v0.3.23
+#11 8.376    Compiling tinystr v0.8.4
+#11 8.376    Compiling potential_utf v0.1.6
+#11 8.421    Compiling icu_collections v2.3.0
+#11 8.471    Compiling icu_locale_core v2.3.0
+#11 8.691    Compiling der-parser v10.0.0
+#11 8.848    Compiling toml_datetime v0.6.11
+#11 8.936    Compiling serde_spanned v0.6.9
+#11 9.007    Compiling toml_edit v0.22.27
+#11 9.060    Compiling serde_urlencoded v0.7.1
+#11 9.071    Compiling x509-parser v0.17.0
+#11 9.150    Compiling icu_provider v2.3.1
+#11 9.312    Compiling icu_properties v2.3.0
+#11 9.313    Compiling icu_normalizer v2.3.0
+#11 9.877    Compiling idna_adapter v1.2.2
+#11 9.912    Compiling idna v1.1.0
+#11 10.09    Compiling url v2.5.8
+#11 10.23    Compiling toml v0.8.23
+#11 10.53    Compiling hyper v1.11.0
+#11 10.53    Compiling tower v0.5.3
+#11 10.89    Compiling tower-http v0.6.11
+#11 11.20    Compiling rustls-webpki v0.103.15
+#11 11.24    Compiling hyper-util v0.1.20
+#11 12.99    Compiling tokio-rustls v0.26.4
+#11 13.09    Compiling hyper-rustls v0.27.9
+#11 13.17    Compiling reqwest v0.12.28
+#11 14.61    Compiling tributary v0.4.0 (/src/crates/tributary)
+#11 18.04     Finished `release` profile [optimized] target(s) in 17.75s
+#11 DONE 18.6s
+
+#12 [stage-1 2/4] RUN apt-get update     && apt-get install -y --no-install-recommends ca-certificates     && rm -rf /var/lib/apt/lists/*
+#12 CACHED
+
+#13 [stage-1 3/4] COPY --from=build /src/target/release/tributary /usr/local/bin/tributary
+#13 DONE 0.0s
+
+#14 [stage-1 4/4] RUN groupadd --system --gid 1000 tributary     && useradd --system --uid 1000 --gid 1000 --home-dir /var/lib/tributary tributary     && mkdir -p /var/lib/tributary/state /var/log/tributary     && chown -R tributary:tributary /var/lib/tributary /var/log/tributary
+#14 0.281 useradd warning: tributary's uid 1000 is greater than SYS_UID_MAX 999
+#14 DONE 0.3s
+
+#15 exporting to image
+#15 exporting layers
+#15 exporting layers 0.3s done
+#15 exporting manifest sha256:34551f93107bf8c40752afdf3a6315a3ebfc32a43f4a7ddd8e4134fb3f9b9669 0.0s done
+#15 exporting config sha256:88ddeea9d3a8f9ebccf1609a4aa1fa7aee941acd8335ddbdba5797bdb9f9204f 0.0s done
+#15 naming to docker.io/library/tributary:smoke done
+#15 unpacking to docker.io/library/tributary:smoke 0.1s done
+#15 DONE 0.4s
+
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/x1tr1tfuwcd9csux9bptn10rr
+Image: "tributary:smoke" with ID "sha256:34551f93107bf8c40752afdf3a6315a3ebfc32a43f4a7ddd8e4134fb3f9b9669" not yet present on node "trib-smoke-control-plane", loading...
 == mock write sink (records bodies to a file, so its own stdout is NOT tailed
 ==      back into itself — a stdout recorder would feed the DaemonSet a loop)
-Waiting for deployment "mock" rollout to finish: 0 out of 1 new replicas have been updated...
 Waiting for deployment "mock" rollout to finish: 0 of 1 updated replicas are available...
 deployment "mock" successfully rolled out
 == the REAL DaemonSet manifest, overridden only for this cluster
-Waiting for daemon set spec update to be observed...
 Waiting for daemon set "tributary" rollout to finish: 0 of 1 updated pods are available...
 daemon set "tributary" successfully rolled out
 == a labelled workload: app=labeltest (allowlisted), and the pod-template-hash
 ==      kubernetes adds itself (NOT allowlisted, the cardinality bomb)
-Waiting for deployment "labeltest" rollout to finish: 0 out of 1 new replicas have been updated...
 Waiting for deployment "labeltest" rollout to finish: 0 of 1 updated replicas are available...
 deployment "labeltest" successfully rolled out
 == wait for the workload's LABELLED lines to reach the mock (label resolution
 ==      happens once at child startup, a beat after the line first ships)
+
 == ASSERTIONS (on the delivered line protocol for the workload)
   [PASS] the workload's lines were delivered at all (yes)
   [PASS] allowlisted label app=labeltest is a tag (yes)
@@ -43,6 +440,22 @@ deployment "labeltest" successfully rolled out
   [PASS] namespace=smoke-app enriched from the CRI path (yes)
   [PASS] container=chatter enriched from the CRI path (yes)
   [PASS] stream=stdout from the cri parser (yes)
+
+== LIVENESS (#77): the probe is wired to /healthz and only /healthz, the pod
+==      passes it, and a database OUTAGE does not make it fail
+  [PASS] livenessProbe asks /healthz (/healthz)
+  [PASS] there is NO readinessProbe (a restart must never follow a database outage) ()
+  [PASS] /healthz on the pod IP answers 200 with live=true (yes)
+  healthz: {"status":"ok","live":true,"shipping":true,"uptime_seconds":7,"last_tick_age_seconds":0,"queue_bytes":0,"queue_full":false,"at_risk_lines":0,"unauthorized_total":0,"credential_healthy":true,"credential_expiry_seconds":-1}
+  [PASS] the kubelet's probe has not restarted the agent (0)
+==      ... now with the sink scaled to zero (an outage)
+  healthz during the outage: {"status":"degraded","live":true,"shipping":false,"uptime_seconds":40,"last_tick_age_seconds":0,"queue_bytes":1958,"queue_full":false,"at_risk_lines":2,"unauthorized_total":0,"credential_healthy":true,"credential_expiry_seconds":-1}
+  [PASS] during the outage /healthz reports degraded, not wedged (yes)
+  [PASS] and is still 200 with live=true (an outage is not a liveness failure) (yes)
+  [PASS] after a full probe period in the outage, the agent was NOT restarted (0)
+
   sample delivered line:
-    kube_logs,app=labeltest,container=chatter,namespace=smoke-app,node=trib-smoke-control-plane,pod=labeltest-844f69bcf8-8gmts,stream=stdout log="SMOKELINE-0" 1788128709454303146
+    kube_logs,app=labeltest,container=chatter,namespace=smoke-app,node=trib-smoke-control-plane,pod=labeltest-776b7dc9b6-5626x,stream=stdout log="SMOKELINE-0" 1789005193674855435
+
 == ALL PASS
+smoke exit=0

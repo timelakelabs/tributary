@@ -133,3 +133,129 @@ jobs:
             dist/*.rpm
             dist/SHA256SUMS
           retention-days: 14
+
+  # The image a DaemonSet actually pins (#77). `ci.yml` publishes `:main` and
+  # `:<sha>` for Catchment's conformance job to consume; neither is a
+  # release, and `:latest` — which ci.yml used to push too — meant "whatever
+  # main last built", so a node that rebooted pulled a different agent than
+  # its neighbours. `:latest` now means the latest release and is written
+  # here only.
+  #
+  # arm64 is built HERE and not in `ci.yml`, for the reason TimeLakeDB's
+  # release gives: under QEMU a Rust release build is roughly three times the
+  # pipeline, and paying that once per tag is reasonable where paying it on
+  # every push is how a build gate gets deleted.
+  image:
+    name: publish · multi-arch image
+    runs-on: ubuntu-latest
+    needs: [gate]
+    # Job-level permissions REPLACE the workflow's, they do not merge with
+    # them, so `contents: read` has to be spelled out next to `packages`.
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # v0.5.0 -> 0.5.0. The image tag carries no `v`, matching the packages
+      # and the manifest, so one version string names all three artifacts.
+      - name: Resolve the version
+        id: v
+        run: |
+          set -euo pipefail
+          raw='${{ inputs.version }}'
+          if [ -z "$raw" ]; then raw='${{ github.ref_name }}'; fi
+          version=${raw#v}
+          if [ -z "$version" ]; then
+            echo "no version: not a tag and no workflow_dispatch input" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          img=ghcr.io/${{ github.repository_owner }}/tributary
+          tags="$img:$version"
+          case "$version" in
+            *-*) : ;;                      # a pre-release never takes `latest`
+            *)   tags="$tags,$img:latest" ;;
+          esac
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "building $version" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' }}
+          # Attestations off: buildx otherwise adds `unknown/unknown` entries
+          # to the manifest list, and `kind load` chokes on them besides.
+          provenance: false
+          tags: ${{ steps.v.outputs.tags }}
+          cache-from: type=gha,scope=tributary
+
+      # The manifest list is the deliverable, so it is checked rather than
+      # assumed: a single-arch push succeeds and tags exactly the same way.
+      - name: The image really is multi-arch
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          ref=ghcr.io/${{ github.repository_owner }}/tributary:${{ steps.v.outputs.version }}
+          docker buildx imagetools inspect "$ref" | tee /tmp/manifest.txt
+          for want in linux/amd64 linux/arm64; do
+            grep -q "$want" /tmp/manifest.txt \
+              || { echo "$ref is missing $want" >&2; exit 1; }
+          done
+          { echo '### image'; echo '```'; cat /tmp/manifest.txt; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  # The DaemonSet manifest, stamped at the tag and attached to the Release.
+  # The file in the tree pins the crate version of the tree it is in (a
+  # cargo test holds the two equal), which is the released version only at
+  # a release commit; the ARTIFACT is what an operator applies, and it is
+  # written only after the image it names exists, so it can never point at
+  # a tag nobody pushed.
+  manifest:
+    name: publish · daemonset manifest
+    runs-on: ubuntu-latest
+    needs: [image, packages]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Stamp the manifest at the tag, and validate it
+        run: |
+          set -euo pipefail
+          v='${{ needs.image.outputs.version }}'
+          mkdir -p dist
+          sed "s#image: ghcr.io/timelakelabs/tributary:.*#image: ghcr.io/timelakelabs/tributary:$v#" \
+            deploy/k8s/daemonset.yaml > dist/daemonset.yaml
+          grep -n 'image: ' dist/daemonset.yaml >> "$GITHUB_STEP_SUMMARY"
+          # validate.py compares the tag with Cargo.toml, which at a release
+          # commit is the same number; a mismatch here means the tag was cut
+          # on a commit that is not a release commit.
+          pip install -q pyyaml
+          python deploy/k8s/validate.py dist/daemonset.yaml
+      - name: Attach the manifest to the Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/daemonset.yaml
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: tributary-daemonset
+          path: dist/daemonset.yaml
+          retention-days: 14
