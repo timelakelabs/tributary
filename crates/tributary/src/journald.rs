@@ -172,6 +172,7 @@ pub async fn run_journald<R: JournalReader>(
                 None => (None, 0),
             };
             crate::checkpoint::Checkpoint {
+                format: crate::checkpoint::CHECKPOINT_FORMAT_VERSION,
                 files: Vec::new(),
                 last_tick_ns,
                 next_seq,

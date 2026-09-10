@@ -1086,7 +1086,7 @@ pub async fn run(
     let want = |c: Collector| collectors.contains(&c);
 
     let queue = Arc::new(Mutex::new(Queue::open(
-        &state_dir.join("metrics-queue"),
+        &crate::queue::Queue::metrics_dir(&state_dir),
         queue_max_bytes,
     )?));
     tokio::spawn(drain(Arc::clone(&queue), shipper));

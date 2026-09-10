@@ -274,7 +274,7 @@ pub async fn run(
         anyhow::anyhow!("[otlp].listen {:?} is not a host:port address", cfg.listen)
     })?;
     let queue = Arc::new(Mutex::new(Queue::open(
-        &state_dir.join("otlp-queue"),
+        &Queue::otlp_dir(&state_dir),
         queue_max_bytes,
     )?));
     // OTLP `time_unix_nano` is nanosecond; the stamper only disambiguates

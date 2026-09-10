@@ -21,8 +21,31 @@ pub struct FileMark {
     pub offset: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+/// The checkpoint's format version. Every field since the first was added
+/// with `#[serde(default)]`, which reads correctly forward and is silently
+/// wrong backward — TimeLakeDB's manifest log was built the same way and
+/// resurrected a dropped table on rollback (timelakedb#160). This number is
+/// what lets an OLDER agent refuse a checkpoint it would mis-read instead
+/// of guessing at it: bump it when a field carries an instruction an old
+/// reader must not ignore (a position, a retirement), and the compat gate
+/// (`.github/persisted-formats.txt`) will ask for a downgrade path.
+///
+/// 1 is the shape as of 0.5. A checkpoint with no `format` field predates
+/// the number and reads as 1: the rule that a version is only bumped for a
+/// change an older reader would MIS-apply means everything before it was,
+/// by that rule, still 1.
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+
+fn format_v1() -> u32 {
+    CHECKPOINT_FORMAT_VERSION
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Checkpoint {
+    /// See [`CHECKPOINT_FORMAT_VERSION`]. Serialised first so a human
+    /// reading the file sees it first.
+    #[serde(default = "format_v1")]
+    pub format: u32,
     /// Files still being drained, newest last. A rotation can leave the
     /// tail of the old file unread; forgetting it loses those bytes.
     pub files: Vec<FileMark>,
@@ -40,17 +63,51 @@ pub struct Checkpoint {
     pub cursor: Option<String>,
 }
 
+impl Default for Checkpoint {
+    /// By hand, not derived: a derived default would write `format: 0`,
+    /// which is not a version anything has ever had.
+    fn default() -> Self {
+        Checkpoint {
+            format: CHECKPOINT_FORMAT_VERSION,
+            files: Vec::new(),
+            last_tick_ns: None,
+            next_seq: 0,
+            lateness_ns: None,
+            cursor: None,
+        }
+    }
+}
+
 impl Checkpoint {
     pub fn path_for(dir: &Path, stream: &str) -> PathBuf {
         dir.join(format!("{stream}.checkpoint"))
     }
 
+    /// Load, and REFUSE a checkpoint from a newer agent rather than guess
+    /// at it. The alternative is what timelakedb#160 did for three
+    /// releases: read what you understand, drop what you do not, and
+    /// resume from a position the newer format meant differently. For a
+    /// checkpoint that is a replay or a gap, and both are silent. An
+    /// operator rolling back gets one line saying what to do instead.
     pub fn load(path: &Path) -> anyhow::Result<Option<Checkpoint>> {
-        match std::fs::read(path) {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let cp: Checkpoint = serde_json::from_slice(&bytes)?;
+        if cp.format > CHECKPOINT_FORMAT_VERSION {
+            anyhow::bail!(
+                "{} was written by a newer tributary (checkpoint format {} > {}); \
+                 refusing to guess at it. Run that version, or delete the file to \
+                 re-read every source from the start (lines are then duplicated, \
+                 not lost).",
+                path.display(),
+                cp.format,
+                CHECKPOINT_FORMAT_VERSION
+            );
         }
+        Ok(Some(cp))
     }
 
     /// Atomic publish. A half-written checkpoint that survived a crash
@@ -88,6 +145,7 @@ mod tests {
         assert_eq!(Checkpoint::load(&p).unwrap(), None);
 
         let cp = Checkpoint {
+            format: CHECKPOINT_FORMAT_VERSION,
             files: vec![
                 FileMark {
                     dev: 2049,
@@ -107,6 +165,47 @@ mod tests {
         };
         cp.save(&p).unwrap();
         assert_eq!(Checkpoint::load(&p).unwrap().unwrap(), cp);
+    }
+
+    /// Every checkpoint written before 0.5 has no `format` field. It reads
+    /// as 1, because 1 is defined as "the shape those files have".
+    #[test]
+    fn a_checkpoint_from_before_the_version_field_reads_as_format_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Checkpoint::path_for(dir.path(), "app");
+        std::fs::write(
+            &p,
+            r#"{"files":[{"dev":1,"ino":2,"offset":3}],"last_tick_ns":null,"next_seq":0}"#,
+        )
+        .unwrap();
+        let cp = Checkpoint::load(&p).unwrap().unwrap();
+        assert_eq!(cp.format, 1);
+        assert_eq!(cp.files[0].offset, 3);
+        // And it is written back WITH the field, so the next reader sees it.
+        cp.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.starts_with(r#"{"format":1,"#), "{text}");
+    }
+
+    /// The other direction is a refusal, not a guess: an operator rolling
+    /// back must not resume from a position a newer format meant
+    /// differently (timelakedb#160, in a checkpoint's clothes).
+    #[test]
+    fn a_checkpoint_from_a_newer_agent_is_refused_with_the_way_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Checkpoint::path_for(dir.path(), "app");
+        std::fs::write(
+            &p,
+            format!(
+                r#"{{"format":{},"files":[],"last_tick_ns":null,"next_seq":0}}"#,
+                CHECKPOINT_FORMAT_VERSION + 1
+            ),
+        )
+        .unwrap();
+        let err = Checkpoint::load(&p).unwrap_err().to_string();
+        assert!(err.contains("newer tributary"), "{err}");
+        assert!(err.contains("delete the file"), "{err}");
+        assert!(err.contains("duplicated, not lost"), "{err}");
     }
 
     #[test]

@@ -15,6 +15,44 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+/// The segment format's version. A segment is one batch of line protocol
+/// exactly as it would have gone over the wire, in a file named by a
+/// twelve-digit sequence with a `.lp` extension, adopted in name order by
+/// whichever agent opens the directory next. That is the whole format, and
+/// it has not changed since the queue existed. The number exists so a
+/// change that WOULD change it — a header, a compression, a different
+/// framing — has something to bump, which is what makes the compat gate
+/// (`.github/persisted-formats.txt`) able to ask for a downgrade path.
+pub const QUEUE_FORMAT_VERSION: u32 = 1;
+
+/// Where each pipeline's spool lives under the state dir. These names are
+/// a persisted format in their own right: an agent that looks for its
+/// queue under a new name strands the old one, which is precisely the loss
+/// the queue exists to prevent. They live here rather than at the call
+/// sites so one watched file owns the on-disk layout (timelakedb#173).
+impl Queue {
+    /// `queue-<source name>`, one per source since #49.
+    pub fn dir_for(state_dir: &Path, name: &str) -> PathBuf {
+        state_dir.join(format!("queue-{name}"))
+    }
+
+    /// The single-source layout before #49: `queue`, no name. Migrated to
+    /// [`Queue::dir_for`] on upgrade so spooled lines are not stranded.
+    pub fn legacy_dir(state_dir: &Path) -> PathBuf {
+        state_dir.join("queue")
+    }
+
+    /// The OTLP receiver's own spool (#12).
+    pub fn otlp_dir(state_dir: &Path) -> PathBuf {
+        state_dir.join("otlp-queue")
+    }
+
+    /// The host-metrics collector's own spool (#25).
+    pub fn metrics_dir(state_dir: &Path) -> PathBuf {
+        state_dir.join("metrics-queue")
+    }
+}
+
 pub struct Queue {
     dir: PathBuf,
     max_bytes: u64,
@@ -55,6 +93,7 @@ impl Queue {
             tracing::info!(
                 segments = segments.len(),
                 bytes,
+                format = QUEUE_FORMAT_VERSION,
                 "adopted queued batches from a previous run"
             );
         }
@@ -171,6 +210,19 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The directory names ARE the layout an upgrade has to find. Pinned
+    /// as strings, so a refactor that renames one shows up here and in the
+    /// compat gate, not as a stranded spool on somebody's node.
+    #[test]
+    fn the_spool_directory_names_are_the_ones_shipped_agents_wrote() {
+        let root = Path::new("/var/lib/tributary");
+        assert_eq!(Queue::dir_for(root, "k8s"), root.join("queue-k8s"));
+        assert_eq!(Queue::legacy_dir(root), root.join("queue"));
+        assert_eq!(Queue::otlp_dir(root), root.join("otlp-queue"));
+        assert_eq!(Queue::metrics_dir(root), root.join("metrics-queue"));
+        assert_eq!(QUEUE_FORMAT_VERSION, 1);
+    }
 
     #[test]
     fn fifo_round_trip() {

@@ -7,6 +7,26 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Added
 
+- **A change to the checkpoint or the spool has to answer for itself, and
+  the checkpoint states its format** (timelakedb#173). Every test writes and
+  reads with one agent, so "an older agent would mis-read this" is invisible
+  by construction; it is a review question, and nothing asked it. A pull
+  request touching a file in `.github/persisted-formats.txt` now declares
+  `Compat: none | additive | breaking` in its body and CI cross-checks the
+  claim against the diff, the same gate TimeLakeDB runs, copied: `breaking`
+  must move a `*_VERSION` constant and carry a `Downgrade:` line, and a
+  constant that moves must say `breaking`. The list is the checkpoint
+  (`checkpoint.rs`) and the spool (`queue.rs`), explicit rather than a
+  pattern, and it watches itself. The spool directory names moved into
+  `queue.rs` so one watched file owns the on-disk layout; the names are
+  unchanged byte for byte and a test pins them. The checkpoint now carries
+  `"format": 1` (a file without it reads as 1, since 1 is defined as the
+  shape those files have) and an agent refuses a checkpoint with a higher
+  number rather than resume from a position a newer format meant
+  differently, telling the operator to run that version or delete the file
+  and accept duplicates. `QUEUE_FORMAT_VERSION` exists for the same reason:
+  so a change that would alter a segment has something to bump. Pull
+  request and issue templates carry the question.
 - **A versioned, multi-arch image, a stamped DaemonSet manifest, and a
   liveness probe** (#77). The only container image was whatever `main` last
   built, `release.yml` had no docker step at all, and the DaemonSet manifest
