@@ -179,9 +179,12 @@ impl Telemetry {
     }
 
     /// Sum the per-source snapshots into the aggregate cache. Called at the top
-    /// of `render_prometheus`, so the exposition always reflects every source.
-    /// `queue_full` aggregates as "any source is full", not a sum.
-    fn aggregate(&self) {
+    /// of `render_prometheus` AND of `server::health`, so both reflect every
+    /// source. It was render-only until #77's kind smoke scaled the sink away
+    /// and watched `/healthz` say `shipping:true` for as long as nothing
+    /// scraped `/metrics`: a probe-only deployment would never have read
+    /// `degraded`. `queue_full` aggregates as "any source is full", not a sum.
+    pub(crate) fn aggregate(&self) {
         let st = Ordering::Relaxed;
         let snaps = self.sources.read().expect("sources lock");
         macro_rules! sum {
