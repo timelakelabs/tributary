@@ -75,7 +75,12 @@ Beyond tailing files, Tributary can be an OpenTelemetry logs **receiver**:
 point an OTLP/HTTP exporter (an SDK, or the OTel Collector) at it and each
 log record lands on the same durable queue → ship path a file tail uses,
 **acknowledged only once it is durably queued** — so a Collector never
-believes it delivered something a restart then dropped.
+believes it delivered something a restart then dropped. Bodies may be
+gzip-compressed (`Content-Encoding: gzip`, the Collector's default) or sent
+plain; any other encoding is refused with 415, and a request the receiver
+cannot decode at all counts on `tributary_otlp_requests_rejected_total`, so
+a Collector retrying against a misconfiguration is visible on `/metrics`
+rather than only in its own retry queue.
 
 ```toml
 [otlp]
