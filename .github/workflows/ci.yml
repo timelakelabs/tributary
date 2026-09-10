@@ -76,6 +76,38 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
           fi
 
+  # The one gate that catches a class of bug the test suite structurally
+  # cannot: a persisted format that an OLDER agent will read wrongly. Every
+  # test writes and reads with one binary, so "a rollback mis-reads this" is
+  # invisible by construction; it is a review question, and this makes the
+  # pull request answer it (timelakedb#173). A copy of TimeLakeDB's gate,
+  # watching this repo's checkpoint and spool (.github/persisted-formats.txt).
+  # No Rust build, so it answers in seconds.
+  compat:
+    name: compat · persisted formats
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The gate diffs this branch against the base commit, so it needs
+          # more than the default shallow clone.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compatibility declaration
+        env:
+          # Through the environment, never interpolated into the shell: a
+          # pull request body is arbitrary prose and will eventually contain
+          # a backtick.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python .github/scripts/test_compat_gate.py
+          python .github/scripts/compat_gate.py \
+            --base "${{ github.event.pull_request.base.sha }}" --head HEAD
+
   rust:
     name: fmt · clippy · tests
     runs-on: ubuntu-latest

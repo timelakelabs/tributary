@@ -195,6 +195,7 @@ pub async fn run_winlog<R: WinlogReader>(
                 None => (None, 0),
             };
             crate::checkpoint::Checkpoint {
+                format: crate::checkpoint::CHECKPOINT_FORMAT_VERSION,
                 files: Vec::new(),
                 last_tick_ns,
                 next_seq,
@@ -214,6 +215,7 @@ pub async fn run_winlog<R: WinlogReader>(
                     None => (None, 0),
                 };
                 crate::checkpoint::Checkpoint {
+                    format: crate::checkpoint::CHECKPOINT_FORMAT_VERSION,
                     files: Vec::new(),
                     last_tick_ns,
                     next_seq,

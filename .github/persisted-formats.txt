@@ -1,0 +1,32 @@
+# Files that own a format written to disk and read back by a LATER agent.
+#
+# Touching one of these makes a pull request answer a compatibility
+# question before it can merge (.github/scripts/compat_gate.py, a copy of
+# TimeLakeDB's; timelakedb#173). The list is deliberately explicit rather
+# than a pattern: "anything with a serde derive" would catch every config
+# struct and the gate would be noise inside a week.
+#
+# This file is itself on the list, by the entry below. Adding a new
+# persisted format therefore trips the gate on the commit that adds it,
+# which is the one commit where somebody still remembers how it is meant to
+# be read by the next version.
+#
+# What an agent upgrade has to survive: the checkpoint (where every source
+# was, and the stamper state that makes a replay reproduce identical
+# timestamps rather than collide) and the spool (batches read off a source
+# and not yet acknowledged by the database, which is the only copy of those
+# lines anywhere). The spool directory NAMES are a format too — an agent
+# that looks for its queue under a new name strands the old one, which is
+# exactly the loss the queue exists to prevent — so they live in queue.rs
+# rather than in main.rs, and queue.rs is watched.
+#
+# Deliberately not listed: dead-letter-<name>.lp (append-only; read by
+# people, never by the agent), the journald cursor and winlog bookmark (opaque
+# strings the OS defines, carried INSIDE the checkpoint), config.toml and a
+# label_file (operator-authored input, not agent output).
+#
+# Format = one line, a path, then optional whitespace and a comment.
+
+crates/tributary/src/checkpoint.rs   # <stream>.checkpoint JSON: file marks, stamper state, lateness, cursor; CHECKPOINT_FORMAT_VERSION
+crates/tributary/src/queue.rs        # queue-<name>/NNNNNNNNNNNN.lp segments (raw line protocol) and the spool directory names; QUEUE_FORMAT_VERSION
+.github/persisted-formats.txt

@@ -584,9 +584,9 @@ async fn run_file_source(
     // two sources cannot share one spool. Migrate a single-source deployment's
     // legacy `state_dir/queue` to the per-source name on upgrade so it does not
     // strand spooled lines; a multi-source config is new and has no legacy dir.
-    let queue_dir = args.state_dir.join(format!("queue-{state_key}"));
+    let queue_dir = queue::Queue::dir_for(&args.state_dir, &state_key);
     if self_reload && cfg.sources.len() == 1 {
-        let legacy = args.state_dir.join("queue");
+        let legacy = queue::Queue::legacy_dir(&args.state_dir);
         if legacy.exists()
             && !queue_dir.exists()
             && let Err(e) = std::fs::rename(&legacy, &queue_dir)
@@ -1240,7 +1240,7 @@ fn retire_stream_state(state_dir: &std::path::Path, name: &str) {
     {
         tracing::warn!(stream = %name, error = %e, "could not remove a retired checkpoint");
     }
-    let qdir = state_dir.join(format!("queue-{name}"));
+    let qdir = queue::Queue::dir_for(state_dir, name);
     let has_data = std::fs::read_dir(&qdir)
         .map(|d| {
             d.filter_map(|e| e.ok())
@@ -1571,6 +1571,7 @@ fn run_winlog_dump(raw: &[String]) -> anyhow::Result<()> {
             None => (None, 0),
         };
         Checkpoint {
+            format: crate::checkpoint::CHECKPOINT_FORMAT_VERSION,
             files: Vec::new(),
             last_tick_ns,
             next_seq,
@@ -2008,6 +2009,7 @@ fn save_checkpoint(
         None => (None, 0),
     };
     Checkpoint {
+        format: crate::checkpoint::CHECKPOINT_FORMAT_VERSION,
         files: tailer.marks(),
         last_tick_ns,
         next_seq,
