@@ -125,6 +125,10 @@ glibc.
 
 ## Releasing
 
+**The checklist is `../RELEASING.md`** — what to change, in what order,
+and which steps are automated so nobody does them by hand. What follows
+here is only the packaging half of it.
+
 `.github/workflows/release.yml` runs on a `v*` tag: it calls `build.sh`,
 installs and smoke-tests the packages with `verify.sh`, and attaches both plus
 `SHA256SUMS` to the Release. A tag containing `-` (`v0.1.0-alpha`) is marked
