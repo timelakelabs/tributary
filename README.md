@@ -78,12 +78,45 @@ until you point it at your server and your log files:
 sudoedit /etc/tributary/config.toml
 # 2. if TimeLakeDB runs with data-plane auth, set TRIBUTARY_TOKEN in:
 sudoedit /etc/tributary/tributary.env
-# 3. let the unprivileged agent read your logs, then start it
+# 3. check what you wrote before starting anything
+tributary --check-config --config /etc/tributary/config.toml
+# 4. let the unprivileged agent read your logs, then start it
 sudo usermod -aG adm tributary          # Debian/Ubuntu; grant read another way elsewhere
 sudo systemctl enable --now tributary
 ```
 
 Check it, if you kept `[telemetry]` on: `curl http://127.0.0.1:9109/healthz`.
+
+### Checking a config without starting the agent
+
+`--check-config` parses and validates exactly as startup does, opens no
+port and touches no state directory, and prints what the file actually
+configures:
+
+```
+$ tributary --check-config --config /etc/tributary/config.toml
+/etc/tributary/config.toml: ok
+  output      http://timelakedb:1963 -> database logs
+  source      app "/var/log/app/*.log" -> table logs (1 filter, 0 sample, 2 redact)
+  telemetry   127.0.0.1:9109
+```
+
+It exits 1 and names the offending key if the file is wrong. **A key the
+agent does not recognise is an error, not a shrug** (#76): `[source.multline]`
+one letter short used to disable stack-trace joining silently, and a
+misspelt `[[source.redact]]` shipped the secret it was added to remove.
+That applies to a `SIGHUP` reload too — a config carrying an unknown key is
+refused and the running one kept, counted in
+`tributary_config_reloads_refused_total`.
+
+Static tag values may reference the environment (`node = "${NODE_NAME}"`).
+Starting the agent with one unset is an error, because a blank tag is worse
+than a startup failure — but `--check-config` reports them instead, since it
+is usually run somewhere that is not the deployment:
+
+```
+  note        the deployment must set: NODE_NAME
+```
 
 ### Receiving OTLP logs (push)
 

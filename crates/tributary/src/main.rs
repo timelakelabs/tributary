@@ -94,12 +94,14 @@ struct Args {
     config: PathBuf,
     state_dir: PathBuf,
     once: bool,
+    check_config: bool,
 }
 
 fn parse_args() -> Args {
     let mut config = None;
     let mut state_dir = PathBuf::from("./state");
     let mut once = false;
+    let mut check_config = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -110,6 +112,7 @@ fn parse_args() -> Args {
                 }
             }
             "--once" => once = true,
+            "--check-config" => check_config = true,
             other => {
                 eprintln!("unknown argument {other:?}");
                 std::process::exit(2);
@@ -117,13 +120,77 @@ fn parse_args() -> Args {
         }
     }
     let Some(config) = config else {
-        eprintln!("usage: tributary --config <file.toml> [--state-dir <dir>] [--once]");
+        eprintln!(
+            "usage: tributary --config <file.toml> [--state-dir <dir>] [--once]\n\
+             \x20      tributary --check-config --config <file.toml>"
+        );
         std::process::exit(2);
     };
     Args {
         config,
         state_dir,
         once,
+        check_config,
+    }
+}
+
+/// Parse and validate the config, print what it says, and exit. Nothing is
+/// started, no port is opened, no state directory is touched (#76).
+///
+/// The point is a ConfigMap nobody restarts a pod to test. It prints what
+/// the file configures rather than just "ok", because a config that parses
+/// and tails nothing is the failure this is most likely to be run against,
+/// and "ok" would not show it.
+fn check_config(path: &std::path::Path) -> ! {
+    match config::Config::check(path) {
+        Err(e) => {
+            // The whole chain: serde names the offending key and its table,
+            // and the outer layers name the file.
+            eprintln!("{}: {e:#}", path.display());
+            std::process::exit(1);
+        }
+        Ok((cfg, unset)) => {
+            println!("{}: ok", path.display());
+            println!(
+                "  output      {} -> database {}",
+                cfg.output.url, cfg.output.database
+            );
+            for s in &cfg.sources {
+                println!(
+                    "  source      {} {:?} -> table {} ({} filter, {} sample, {} redact)",
+                    s.name,
+                    s.path,
+                    s.table,
+                    s.filter.len(),
+                    s.sample.len(),
+                    s.redact.len()
+                );
+            }
+            if let Some(o) = &cfg.otlp {
+                println!("  otlp        {} -> table {}", o.listen, o.table);
+            }
+            if let Some(m) = &cfg.metrics {
+                println!(
+                    "  metrics     every {} ({})",
+                    m.interval,
+                    m.collectors.join(",")
+                );
+            }
+            if let Some(t) = &cfg.telemetry {
+                println!("  telemetry   {}", t.addr);
+            }
+            if !unset.is_empty() {
+                // Not a failure: this is being run somewhere that is not the
+                // deployment, which is the whole point of a pre-flight check.
+                // It is still the thing most worth printing — these are what
+                // the deployment has to supply or the agent will not start.
+                println!(
+                    "  note        the deployment must set: {}",
+                    unset.join(", ")
+                );
+            }
+            std::process::exit(0);
+        }
     }
 }
 
@@ -180,6 +247,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let args = parse_args();
+
+    // Before the logger, the state directory, or anything that opens a
+    // file or a port: --check-config answers a question about the file and
+    // must have no side effects at all (#76). It does not return.
+    if args.check_config {
+        check_config(&args.config);
+    }
+
     let cfg = Config::load(&args.config)?;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -2137,6 +2212,37 @@ mod reload_tests {
             held.redacts.len(),
             1,
             "a refused reload keeps the last-good transforms"
+        );
+    }
+
+    /// #76's last bullet. A SIGHUP carrying a typo must be refused, not
+    /// applied with the misspelt key dropped — a live reload is the worst
+    /// place to silently revert a setting, because nobody is watching a
+    /// startup log at the time.
+    #[test]
+    fn a_reload_carrying_an_unknown_key_is_refused_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), V1);
+        let cfg = Config::load(&p).unwrap();
+        let source = cfg.sources.first().unwrap();
+        let mut held = Held::from(&cfg);
+        let tel = telemetry::Telemetry::new(std::sync::Arc::new(ship::Counters::default()));
+
+        // `pattern` with one letter missing: the rule that scrubs the secret,
+        // reloaded into nothing at all.
+        let typo = "[output]\nurl = \"http://localhost:1963\"\n\n\
+            [[source]]\nname = \"app\"\npath = \"/var/log/app.log\"\ntable = \"logs\"\n\n\
+            [[source.redact]]\nfield = \"msg\"\npatern = \"x\"\n";
+        write(dir.path(), typo);
+        reload_config(&p, source, &cfg, &mut held.reloadable(), &tel);
+
+        assert_eq!(tel.config_reloads_refused.load(Relaxed), 1);
+        assert_eq!(tel.config_reloads.load(Relaxed), 0, "nothing was applied");
+        assert!(!tel.config_last_reload_ok.load(Relaxed));
+        assert_eq!(
+            held.redacts.len(),
+            0,
+            "the running config is untouched by a refused reload"
         );
     }
 

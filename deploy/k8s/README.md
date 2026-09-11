@@ -33,6 +33,21 @@ the pinned tag, the telemetry listener and the probe:
 python3 deploy/k8s/validate.py deploy/k8s/daemonset.yaml
 ```
 
+It does not read the ConfigMap's TOML, which is the half a typo hides in. The
+agent does that, and will do it without a cluster or a pod:
+
+```sh
+# pull the embedded config out of the manifest and check it
+sed -n '/tributary.toml: |/,/^---/p' deploy/k8s/daemonset.yaml \
+  | sed '1d;$d;s/^    //' > /tmp/cm.toml
+tributary --check-config --config /tmp/cm.toml
+```
+
+A ConfigMap is the worst place for a silently-ignored key — nobody restarts a
+pod to test one — which is why an unrecognised key is an error (#76). Expect
+`the deployment must set: NODE_NAME` in the output: the Downward API supplies
+it in the cluster, and `--check-config` reports it rather than failing.
+
 ## Liveness, and why there is no readiness
 
 The ConfigMap serves `[telemetry]` on `0.0.0.0:9109`, and the container's

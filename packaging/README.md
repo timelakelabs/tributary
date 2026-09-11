@@ -106,6 +106,12 @@ read root-only logs by default: on Debian/Ubuntu you add it to `adm`, and the
 postinstall message says so where you will see it, rather than the package
 silently granting a service account read over every system log.
 
+`tributary --check-config --config /etc/tributary/config.toml` answers
+whether your edit will start, without starting it (#76). On the pristine
+shipped file it exits 1 with `nothing to do: configure at least one
+[[source]]`, which is the same refusal the agent gives and the same thing
+the postinstall message says.
+
 Uninstalling does not delete `/var/lib/tributary` or the `tributary` user —
 the queue can hold accepted-but-unshipped lines, and throwing those away on
 `apt remove` is the exact silent loss this agent exists to prevent. `apt
