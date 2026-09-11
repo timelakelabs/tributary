@@ -1,11 +1,30 @@
 //! Configuration. Every field here exists because of a property of
 //! TimeLakeDB's write contract (DESIGN.md §1), which is why the safe
 //! choices are the defaults and the dangerous ones must be spelled out.
+//!
+//! **Every struct here denies unknown fields**, and that follows from the
+//! same sentence. If the safe choice is the default, a key nobody
+//! recognises is a dangerous choice that did not get spelled out: the
+//! agent runs with the default and nothing says so. `[source.multline]`,
+//! one letter short, silently turns off stack-trace joining;
+//! `queue_max_byte` silently takes the 2 MiB default. The rule is worst
+//! for the one that matters most — a misspelt `[[source.redact]]` table
+//! ships the secret it was added to remove (#76).
+//!
+//! The cost is that adding a field to a config a fleet already runs is a
+//! breaking change for anyone who typed it early. That is the right way
+//! round: an agent that refuses to start names the line, and one that
+//! starts with your redaction rule quietly dropped does not.
+//!
+//! `tributary --check-config --config x.toml` runs exactly this parse
+//! without starting anything, which is the other half of #76: a ConfigMap
+//! nobody restarts a pod to test is a ConfigMap nobody has tested.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub output: Output,
     #[serde(rename = "source", default)]
@@ -28,6 +47,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Output {
     pub url: String,
     #[serde(default = "default_db")]
@@ -89,6 +109,7 @@ fn default_rpo_report_secs() -> u64 {
 ///
 /// This sink owns the file: do not also point logrotate at the same path.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Log {
     pub file: std::path::PathBuf,
     /// Rotate once the live file passes this. `"100MiB"`, `"512KB"`, or a
@@ -139,6 +160,7 @@ impl Log {
 /// behaves exactly as it did before the endpoint existed, and no port is
 /// opened that the operator did not ask for.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Telemetry {
     /// Where to serve `GET /metrics` and `GET /healthz`.
     ///
@@ -163,6 +185,7 @@ pub struct Telemetry {
 ///   configuration mistake worth refusing at startup rather than
 ///   discovering as a handshake failure.
 #[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Tls {
     /// PEM CA bundle used to verify the server. A bundle, not one
     /// certificate: dual-CA overlap is how the server rotates its trust
@@ -241,6 +264,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Source {
     /// Stream identity. Becomes the `stream` tag, and scopes the
     /// timestamp sequence (DESIGN.md §3.1).
@@ -311,6 +335,7 @@ pub struct Source {
 /// by default — a label the operator did not name never becomes a tag, because
 /// labels like `pod-template-hash` are unbounded and would blow up cardinality.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Kubernetes {
     /// The pod-label ALLOWLIST. A label becomes a tag only if it is named here;
     /// everything else is dropped. Empty (the default) means no label
@@ -331,6 +356,7 @@ pub struct Kubernetes {
 /// subset can be sampled while the rest passes); without them it applies to
 /// the whole source. `rate` keeps 1-in-`rate` of the records it applies to.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Sample {
     #[serde(default)]
     pub field: Option<String>,
@@ -345,6 +371,7 @@ pub struct Sample {
 /// "(password=)\\S+"` with `replacement = "$1***"` keeps the key and scrubs
 /// the value. The regex is compiled and validated at load.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Redact {
     pub field: String,
     pub pattern: String,
@@ -362,6 +389,7 @@ fn default_redaction() -> String {
 /// (only records matching some allow rule survive). Equality only — a regex is
 /// redaction (#44), an expression is the mini-VRL #7 forbids.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Filter {
     pub field: String,
     pub equals: String,
@@ -370,6 +398,7 @@ pub struct Filter {
 }
 
 #[derive(Debug, Deserialize, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Multiline {
     /// A line matching this begins a record; anything else continues the
     /// one above it.
@@ -429,6 +458,7 @@ pub enum FieldType {
 }
 
 #[derive(Debug, Deserialize, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Timestamp {
     /// Parsed key holding the timestamp. Absent means "stamp on read".
     #[serde(default)]
@@ -463,7 +493,22 @@ impl Default for Timestamp {
 /// merely contains a dollar sign is not mangled. An unset variable is an error
 /// that names it, so a misconfigured DaemonSet fails loudly at startup rather
 /// than shipping a blank tag.
-fn expand_env(s: &str) -> anyhow::Result<String> {
+/// What an unset `${VAR}` means to the caller.
+///
+/// `Require` is the agent starting up: a blank `node` tag is worse than a
+/// startup failure, so an unset variable is an error (#65). `Note` is
+/// `--check-config`, which answers "is this file well-formed" from a
+/// laptop that has no Downward API and no `NODE_NAME`. Failing there would
+/// fail for the wrong reason and teach people to skip the check; instead
+/// the variable is collected and reported, so the run also prints the
+/// environment contract the deployment has to satisfy.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Env {
+    Require,
+    Note,
+}
+
+fn expand_env_into(s: &str, env: Env, unset: &mut Vec<String>) -> anyhow::Result<String> {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(i) = rest.find("${") {
@@ -473,12 +518,23 @@ fn expand_env(s: &str) -> anyhow::Result<String> {
             .find('}')
             .ok_or_else(|| anyhow::anyhow!("unterminated ${{...}} in a tag value: {s:?}"))?;
         let var = &after[..end];
-        let val = std::env::var(var).map_err(|_| {
-            anyhow::anyhow!(
+        match std::env::var(var) {
+            Ok(val) => out.push_str(&val),
+            Err(_) if env == Env::Note => {
+                // Left literal rather than blanked: the check is not
+                // claiming to know the value, and a reader of the output
+                // should see exactly what the file says.
+                if !unset.iter().any(|u| u == var) {
+                    unset.push(var.to_string());
+                }
+                out.push_str("${");
+                out.push_str(var);
+                out.push('}');
+            }
+            Err(_) => anyhow::bail!(
                 "tag value references ${{{var}}} but that environment variable is not set"
-            )
-        })?;
-        out.push_str(&val);
+            ),
+        }
         rest = &after[end + 1..];
     }
     out.push_str(rest);
@@ -487,8 +543,22 @@ fn expand_env(s: &str) -> anyhow::Result<String> {
 
 impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Config> {
+        Config::read(path, Env::Require).map(|(cfg, _)| cfg)
+    }
+
+    /// Parse and validate exactly as startup does, without starting
+    /// anything and without needing the deployment's environment to exist
+    /// here (#76). Returns the config and the `${VAR}`s it references that
+    /// are not set — not an error, a contract: those are what the
+    /// deployment has to supply.
+    pub fn check(path: &std::path::Path) -> anyhow::Result<(Config, Vec<String>)> {
+        Config::read(path, Env::Note)
+    }
+
+    fn read(path: &std::path::Path, env: Env) -> anyhow::Result<(Config, Vec<String>)> {
         let text = std::fs::read_to_string(path)?;
         let mut cfg: Config = toml::from_str(&text)?;
+        let mut unset: Vec<String> = Vec::new();
         // #65: static tag VALUES may reference the environment (`${VAR}`), so a
         // Kubernetes DaemonSet can stamp the node name from the Downward API —
         // `node = "${NODE_NAME}"`. Scoped to tag values on purpose: expanding
@@ -497,7 +567,7 @@ impl Config {
         // blank `node` tag is worse than a startup failure.
         for src in &mut cfg.sources {
             for v in src.tags_static.values_mut() {
-                *v = expand_env(v)?;
+                *v = expand_env_into(v, env, &mut unset)?;
             }
         }
         if cfg.sources.is_empty() && cfg.otlp.is_none() && cfg.metrics.is_none() {
@@ -637,7 +707,7 @@ impl Config {
                 }
             }
         }
-        Ok(cfg)
+        Ok((cfg, unset))
     }
 }
 
@@ -656,6 +726,7 @@ impl Source {
 /// is the whole cardinality defence (FR-2): a resource attribute becomes a
 /// tag only if named here, never by arriving.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Otlp {
     /// host:port to receive OTLP/HTTP on (the OTLP default is 4318).
     pub listen: String,
@@ -727,6 +798,7 @@ pub enum FieldValue {
 /// InfluxDB + Telegraf. `global_tags`/`static_fields` are the "add your own
 /// fields" half — stamped on every point (mirrors [`Source::tags_static`]).
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Metrics {
     #[serde(default = "default_metrics_interval")]
     pub interval: String,
@@ -749,6 +821,7 @@ pub struct Metrics {
 /// like any other metric (#32). `command` is argv — NOT a shell string — so
 /// there is no shell-injection surface. It runs with the AGENT's privileges.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Exec {
     pub command: Vec<String>,
     /// Run interval; absent = the `[metrics]` interval.
@@ -858,22 +931,125 @@ mod tests {
         Config::load(&path)
     }
 
+    fn check_str(toml: &str) -> anyhow::Result<(Config, Vec<String>)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.toml");
+        std::fs::write(&path, toml).unwrap();
+        Config::check(&path)
+    }
+
+    const MINIMAL: &str = "[output]\nurl = \"http://localhost:1963\"\n\n\
+                           [[source]]\nname = \"a\"\npath = \"/var/log/a.log\"\ntable = \"logs\"\n";
+
+    /// #76. Each of these is one character or one word away from a key that
+    /// exists, which is the whole failure: the agent took the default and
+    /// said nothing.
+    #[test]
+    fn a_key_nobody_recognises_is_refused_and_named() {
+        for (toml, bad) in [
+            // The ticket's own example: stack-trace joining silently off.
+            (
+                format!("{MINIMAL}\n[source.multline]\nstarts_with = \"2026-\"\n"),
+                "multline",
+            ),
+            // Singular. Takes the 2 MiB default instead of what you asked for.
+            (
+                "[output]\nurl = \"http://x:1963\"\nqueue_max_byte = 999\n\n\
+                 [[source]]\nname = \"a\"\npath = \"/a.log\"\ntable = \"t\"\n"
+                    .to_string(),
+                "queue_max_byte",
+            ),
+            // The one that matters: a redact rule that never runs.
+            (
+                format!("{MINIMAL}\n[[source.redact]]\nfield = \"msg\"\npatern = \"x\"\n"),
+                "patern",
+            ),
+            // A whole table nobody reads.
+            (
+                format!("{MINIMAL}\n[telemetrics]\naddr = \"127.0.0.1:9109\"\n"),
+                "telemetrics",
+            ),
+        ] {
+            let err = load_str(&toml)
+                .expect_err(&format!("{bad} is not a key; it must not be ignored"))
+                .to_string();
+            assert!(
+                err.contains(bad),
+                "the error must NAME the offending key so it can be found in a \
+                 ConfigMap; got: {err}"
+            );
+        }
+    }
+
+    /// The trap in #76: `--check-config` runs where the deployment's
+    /// environment does not exist. Failing there would fail for the wrong
+    /// reason and teach people to skip the check.
+    #[test]
+    fn check_reports_unset_variables_instead_of_failing_on_them() {
+        let toml =
+            format!("{MINIMAL}\n[source.tags_static]\nnode = \"${{TRIBUTARY_TEST_UNSET_NODE}}\"\n");
+        // Startup still refuses: a blank `node` tag is worse than not starting.
+        assert!(
+            load_str(&toml).is_err(),
+            "the agent must not start with a tag it cannot fill"
+        );
+        // The pre-flight check does not, and says what the deployment owes.
+        let (cfg, unset) = check_str(&toml).expect("a checkable config");
+        assert_eq!(unset, vec!["TRIBUTARY_TEST_UNSET_NODE"]);
+        assert_eq!(
+            cfg.sources[0].tags_static.get("node").map(String::as_str),
+            Some("${TRIBUTARY_TEST_UNSET_NODE}"),
+            "left literal: the check is not claiming to know the value"
+        );
+    }
+
+    /// `check` is the same parse as `load`, not a laxer one. The only thing
+    /// it relaxes is the environment.
+    #[test]
+    fn check_is_not_a_weaker_parse_than_load() {
+        let toml = format!("{MINIMAL}\n[source.multline]\nstarts_with = \"x\"\n");
+        assert!(load_str(&toml).is_err());
+        assert!(
+            check_str(&toml).is_err(),
+            "a config --check-config calls fine must be one the agent will start on"
+        );
+    }
+
     #[test]
     fn expand_env_replaces_braced_vars_and_errors_on_unset() {
-        assert_eq!(expand_env("plain").unwrap(), "plain");
+        assert_eq!(
+            expand_env_into("plain", Env::Require, &mut Vec::new()).unwrap(),
+            "plain"
+        );
         // A bare `$` is left alone — only `${...}` is a reference.
-        assert_eq!(expand_env("keep$1this").unwrap(), "keep$1this");
+        assert_eq!(
+            expand_env_into("keep$1this", Env::Require, &mut Vec::new()).unwrap(),
+            "keep$1this"
+        );
         assert!(
-            expand_env("${TRIBUTARY_TEST_DEFINITELY_UNSET_XYZ}").is_err(),
+            expand_env_into(
+                "${TRIBUTARY_TEST_DEFINITELY_UNSET_XYZ}",
+                Env::Require,
+                &mut Vec::new()
+            )
+            .is_err(),
             "an unset variable must fail loudly, not blank the tag"
         );
         // SAFETY: single-threaded test, a uniquely-named var not read elsewhere.
         unsafe {
             std::env::set_var("TRIBUTARY_TEST_NODE", "node-7");
         }
-        assert_eq!(expand_env("${TRIBUTARY_TEST_NODE}").unwrap(), "node-7");
         assert_eq!(
-            expand_env("k8s-${TRIBUTARY_TEST_NODE}-x").unwrap(),
+            expand_env_into("${TRIBUTARY_TEST_NODE}", Env::Require, &mut Vec::new()).unwrap(),
+            "node-7"
+        );
+        assert_eq!(
+            expand_env_into(
+                "k8s-${TRIBUTARY_TEST_NODE}-x",
+                Env::Require,
+                &mut Vec::new()
+            )
+            .unwrap(),
             "k8s-node-7-x"
         );
     }

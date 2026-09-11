@@ -7,6 +7,30 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Added
 
+- **An unrecognised config key is an error, and `--check-config` answers
+  without starting anything** (#76). A misspelt key used to be dropped in
+  silence and the default used instead: `[source.multline]`, one letter
+  short, turned off stack-trace joining; `queue_max_byte` took the 2 MiB
+  default; and worst, a misspelt `[[source.redact]]` shipped the secret it
+  was added to remove. Every config struct now denies unknown fields, so
+  the agent refuses to start and names the key and its table. The same
+  parse runs on `SIGHUP`, so a reload carrying a typo is refused and the
+  running config kept, counted in `tributary_config_reloads_refused_total`
+  — a live reload being the worst moment to silently revert a setting,
+  because nobody is reading a startup log at the time.
+
+  The cost is real and deliberate: adding a field is now a breaking change
+  for anyone who typed it early. An agent that refuses to start names the
+  line; one that starts with your redaction rule quietly dropped does not.
+
+  `tributary --check-config --config x.toml` runs exactly that parse, opens
+  no port and touches no state directory, prints what the file configures
+  rather than just "ok", and exits 1 naming the offending key otherwise. It
+  is meant for a ConfigMap nobody restarts a pod to test. Unset `${VAR}`
+  references are reported rather than fatal there — starting with a blank
+  tag is still an error, but a pre-flight check run on a laptop with no
+  Downward API should not fail for the wrong reason, so it prints the
+  environment contract instead: `the deployment must set: NODE_NAME`.
 - **A change to the checkpoint or the spool has to answer for itself, and
   the checkpoint states its format** (timelakedb#173). Every test writes and
   reads with one agent, so "an older agent would mis-read this" is invisible
