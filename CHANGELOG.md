@@ -5,6 +5,47 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **A full state disk pauses and alarms instead of killing the agent** (#80).
+  A full *queue* has always paused and alarmed — that is the cap this agent
+  chose. ENOSPC is the filesystem saying no mid-write, and it went through a
+  `?` on `File::create`, out through "a source failed — stopping the agent",
+  and into `Restart=on-failure` / `RestartSec=5s`. A long outage is exactly
+  when the state disk fills, so the design's answer to an outage ("the queue
+  buys time") turned into a crash-loop that re-shipped the queue every five
+  seconds, with `/healthz` gone and `tributary_queue_full` never set. The
+  failure mode was correct — nothing was lost, because the checkpoint never
+  advanced — and it looked like a broken agent.
+
+  A full disk now takes the same path as a full queue: pause reading, set
+  `tributary_queue_full`, say `STATE DISK FULL` once, and carry on. Every
+  other I/O error still aborts, because a state directory that vanished or
+  that this user cannot write is a deployment fault rather than a condition
+  to wait out.
+
+  Two places needed more than that. The **forced** spool — a batch that
+  failed to ship *after* its lines were read off the source — cannot refuse,
+  or the path that exists to prevent loss becomes the one that causes it. It
+  now returns whether the bytes landed, and the pipeline holds what the disk
+  refused in memory (bounded by `max_inflight`, since reading is already
+  paused), ships it straight from memory or writes it down as soon as either
+  the disk or the database comes back, and **pins the checkpoint while it
+  holds anything** — recording progress past bytes that exist only in this
+  process would turn a crash from "replays and duplicates" into "skips and
+  loses". The **checkpoint** itself lives on the same disk, so a full one
+  used to kill the agent through that door instead; ENOSPC there is now
+  reported and outlived, since not advancing is safe on its own terms.
+
+  `Queue::open` also sweeps `*.tmp` now. A segment only becomes real at the
+  rename, so a `.tmp` is a spool that died mid-write — which is what ENOSPC
+  produces — and the scan only looked at `.lp`, leaving each one to hold down
+  space on the disk whose filling produced it.
+
+  Drilled on a real 4 MB tmpfs: `bench/chaos_drill.sh enospc`, 8/8. It
+  refuses to run without a size-limited filesystem rather than passing
+  against a disk that never fills.
+
 ### Added
 
 - **An unrecognised config key is an error, and `--check-config` answers

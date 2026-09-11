@@ -219,6 +219,12 @@ struct Pipeline {
     dropped_filter: u64,
     /// Records dropped by the transform sampler (#43), same accounting.
     dropped_sample: u64,
+    /// Batches the STATE DISK refused (#80). These lines were already read
+    /// off the source and the queue could not take them, so this is the
+    /// only copy anywhere and `save_checkpoint` must not advance past them
+    /// — see the guard there. Bounded by `max_inflight`: reading is paused
+    /// the moment the queue reports full, so nothing new joins the set.
+    held: std::collections::VecDeque<String>,
 }
 
 impl Pipeline {
@@ -682,6 +688,7 @@ async fn run_file_source(
         quarantined: 0,
         dropped_filter: 0,
         dropped_sample: 0,
+        held: std::collections::VecDeque::new(),
     };
 
     let mut framer = match source.parser {
@@ -1991,13 +1998,29 @@ async fn reap_one(pipe: &mut Pipeline) -> anyhow::Result<()> {
                 // in-flight set. The old code only logged and let the batch
                 // fall out of scope — the #61 backpressure chaos drill caught
                 // it losing ~376 lines when the queue filled under an outage.
-                pipe.queue.push_forced(&body)?;
-                tracing::warn!(
-                    error = %err,
-                    bytes = body.len(),
-                    "over the queue soft cap; force-spooled a failed in-flight batch \
-                     rather than dropping it — reads stay paused until it drains"
-                );
+                if pipe.queue.push_forced(&body)? {
+                    tracing::warn!(
+                        error = %err,
+                        bytes = body.len(),
+                        "over the queue soft cap; force-spooled a failed in-flight batch \
+                         rather than dropping it — reads stay paused until it drains"
+                    );
+                } else {
+                    // The disk is full AND the database is unreachable, and
+                    // these bytes are past the source's read position (#80).
+                    // Memory is the only place left; dropping them here would
+                    // make the forced path the losing one. The checkpoint is
+                    // pinned while this is non-empty, so a crash replays from
+                    // the source rather than skipping them.
+                    pipe.held.push_back(body);
+                    tracing::error!(
+                        error = %err,
+                        held_batches = pipe.held.len(),
+                        "STATE DISK FULL and the database is unreachable: holding an \
+                         already-read batch in memory. The checkpoint will not advance \
+                         until it lands — free space, or expect a replay on restart."
+                    );
+                }
             }
         }
         Err(join) => return Err(anyhow::anyhow!("ship task panicked: {join}")),
@@ -2021,6 +2044,39 @@ async fn drain_queue(
     stamper: &stamp::Stamper,
 ) -> anyhow::Result<()> {
     let mut drained = false;
+
+    // Held batches first (#80): they are the only copy anywhere, and the
+    // checkpoint is pinned until they land. Two ways out, tried in that
+    // order — put them on disk if space came back, else ship them straight
+    // from memory, which is what they were trying to do anyway. If both are
+    // still shut, keep holding: that is the state the guard in
+    // `save_checkpoint` is there to make safe.
+    while let Some(body) = pipe.held.front().cloned() {
+        if pipe.queue.push_forced(&body)? {
+            pipe.held.pop_front();
+            tracing::info!(
+                held_batches = pipe.held.len(),
+                "space came back; a held batch is on disk"
+            );
+            continue;
+        }
+        let lines: Vec<String> = body.split_inclusive('\n').map(str::to_string).collect();
+        match pipe.shipper.send_lines(&lines).await {
+            Ok(poison) => {
+                quarantine(pipe, &poison)?;
+                pipe.held.pop_front();
+                drained = true;
+                tracing::info!(
+                    held_batches = pipe.held.len(),
+                    "disk still full; shipped a held batch straight from memory"
+                );
+            }
+            // Disk full and the database still down. Nothing to do but keep
+            // them and try again next tick.
+            Err(_) => return Ok(()),
+        }
+    }
+
     while let Some(path) = pipe.queue.front() {
         let body = queue::Queue::read(&path)?;
         let lines: Vec<String> = body.split_inclusive('\n').map(str::to_string).collect();
@@ -2079,19 +2135,54 @@ fn save_checkpoint(
     tailer: &tail::Tailer,
     stamper: &stamp::Stamper,
 ) -> anyhow::Result<()> {
+    // The one rule this whole file exists to keep: never record progress
+    // past bytes that are not durable somewhere. `held` is batches the full
+    // disk refused (#80) — already read off the source, present only in
+    // this process's memory. Writing the checkpoint now would turn a crash
+    // from "replays and duplicates" into "skips and loses", which is the
+    // trade this agent is not allowed to make. Holding the checkpoint back
+    // costs duplicates on a restart; that is the correct side to err on,
+    // and it resolves itself the moment `drain_queue` lands them.
+    if !pipe.held.is_empty() {
+        tracing::warn!(
+            held_batches = pipe.held.len(),
+            "checkpoint NOT advanced: batches are held in memory because the state \
+             disk is full. A restart now replays them from the source."
+        );
+        return Ok(());
+    }
     let (last_tick_ns, next_seq) = match stamper.checkpoint() {
         Some((t, s)) => (Some(t), s),
         None => (None, 0),
     };
-    Checkpoint {
+    let cp = Checkpoint {
         format: crate::checkpoint::CHECKPOINT_FORMAT_VERSION,
         files: tailer.marks(),
         last_tick_ns,
         next_seq,
         lateness_ns: Some(pipe.watermark.lateness_ns()),
         cursor: None,
+    };
+    match cp.save(&pipe.cp_path) {
+        Ok(()) => Ok(()),
+        // The checkpoint lives on the same disk as the queue, so a full one
+        // takes both (#80). Failing here would kill the agent through the
+        // other door after the queue learned to survive it. Not advancing is
+        // safe on its own terms — the bytes are on the queue or in the
+        // source, and a restart replays — so this is a condition to report
+        // and outlive, not to die of.
+        Err(e) => match e.downcast_ref::<std::io::Error>() {
+            Some(io) if crate::queue::out_of_space(io) => {
+                tracing::error!(
+                    path = %pipe.cp_path.display(),
+                    "STATE DISK FULL — checkpoint not written. Progress will replay \
+                     from the last one on restart; free space to stop that growing."
+                );
+                Ok(())
+            }
+            _ => Err(e),
+        },
     }
-    .save(&pipe.cp_path)
 }
 
 /// The watermark as ordinary rows. Best-effort: failing to publish a

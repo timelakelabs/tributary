@@ -89,6 +89,32 @@ impl Queue {
             .map(|n| n + 1)
             .unwrap_or(0);
 
+        // Sweep half-written segments. A `.tmp` is a spool that died between
+        // `create` and `rename` — a kill, or a disk that filled mid-write —
+        // and it is unreferenced by definition, because a segment only
+        // becomes real at the rename. The scan above filters on `.lp`, so
+        // before #80 these accumulated forever, each one holding down space
+        // on the disk whose filling produced it.
+        let mut swept = 0u64;
+        let mut swept_bytes = 0u64;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for p in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+                if p.extension().is_some_and(|x| x == "tmp") {
+                    swept_bytes += std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                    if std::fs::remove_file(&p).is_ok() {
+                        swept += 1;
+                    }
+                }
+            }
+        }
+        if swept > 0 {
+            tracing::info!(
+                files = swept,
+                bytes = swept_bytes,
+                "swept half-written queue segments left by a previous run"
+            );
+        }
+
         if !segments.is_empty() {
             tracing::info!(
                 segments = segments.len(),
@@ -128,7 +154,26 @@ impl Queue {
             self.full = true;
             return Ok(false);
         }
-        self.spool(body)
+        if !self.spool(body)? {
+            // The same answer as the soft cap, for the same reason: these
+            // bytes are still in the source file, so refusing them loses
+            // nothing and pausing the read loop is the correct response.
+            // Before #80 this was an `?` on `File::create`, which killed
+            // the process — and systemd restarted it every five seconds
+            // into the same full disk, re-shipping the queue each time.
+            if !self.full {
+                tracing::error!(
+                    dir = %self.dir.display(),
+                    bytes = self.bytes,
+                    "STATE DISK FULL — reading paused, same as a full queue. \
+                     Nothing is lost while the source file holds these bytes; \
+                     free space or the source will rotate away from under us."
+                );
+            }
+            self.full = true;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Spool a batch that MUST be kept even though the queue is over its soft
@@ -137,25 +182,45 @@ impl Queue {
     /// backpressure — the read loop is already paused while `full`, so the
     /// overshoot is bounded to the in-flight set (`max_inflight` batches). The
     /// cap bounds READING; it must never license losing bytes already taken.
-    pub fn push_forced(&mut self, body: &str) -> anyhow::Result<()> {
-        self.spool(body)?;
-        // Stay full: reads remain paused until this genuinely drains below the
-        // resume mark (see `pop`'s hysteresis).
+    /// `Ok(false)` means the disk is full and the caller **must keep these
+    /// bytes itself** — they are not on disk and they are not in the source
+    /// file any more. Returning `Ok(false)` from the forced path would make
+    /// it the losing path, which is the exact inversion #80 warns about, so
+    /// the signature makes ignoring the answer impossible rather than
+    /// merely unwise.
+    pub fn push_forced(&mut self, body: &str) -> anyhow::Result<bool> {
+        let wrote = self.spool(body)?;
+        // Stay full either way: reads remain paused until this genuinely
+        // drains below the resume mark (see `pop`'s hysteresis).
         self.full = true;
-        Ok(())
+        Ok(wrote)
     }
 
+    /// `Ok(false)` means the filesystem is out of space. Every other I/O
+    /// failure is still an error: a full disk is an operational condition
+    /// this agent is supposed to survive, and a permissions problem or a
+    /// vanished state directory is not.
     fn spool(&mut self, body: &str) -> anyhow::Result<bool> {
         let len = body.len() as u64;
         let path = self.dir.join(format!("{:012}.lp", self.next_seq));
         let tmp = path.with_extension("tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(body.as_bytes())?;
-            // Durable before the checkpoint may advance past these bytes.
-            f.sync_data()?;
+        if let Err(e) = write_segment(&tmp, body) {
+            // Our own partial file, and it is occupying the space we just
+            // ran out of. Leaving it would make the next attempt fail
+            // sooner and leave litter a restart never collects.
+            let _ = std::fs::remove_file(&tmp);
+            if out_of_space(&e) {
+                return Ok(false);
+            }
+            return Err(e.into());
         }
-        std::fs::rename(&tmp, &path)?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            if out_of_space(&e) {
+                return Ok(false);
+            }
+            return Err(e.into());
+        }
 
         self.next_seq += 1;
         self.bytes += len;
@@ -163,7 +228,38 @@ impl Queue {
         self.spilled_total += 1;
         Ok(true)
     }
+}
 
+fn write_segment(tmp: &Path, body: &str) -> std::io::Result<()> {
+    let mut f = std::fs::File::create(tmp)?;
+    f.write_all(body.as_bytes())?;
+    // Durable before the checkpoint may advance past these bytes.
+    f.sync_data()
+}
+
+/// ENOSPC, or a quota that amounts to the same thing.
+///
+/// `ErrorKind::StorageFull` covers it on a current toolchain, but the raw
+/// code is checked too: this is the branch that decides between "pause and
+/// alarm" and "abort the process", and getting it wrong in the quiet
+/// direction turns a full disk back into the crash-loop this exists to
+/// stop (#80). The numbers are split by platform because `raw_os_error`
+/// means errno on unix and a Win32 code on Windows, and 28 is ENOSPC on
+/// one and something else entirely on the other.
+#[cfg(unix)]
+pub(crate) const OUT_OF_SPACE_CODES: &[i32] = &[28]; // ENOSPC
+#[cfg(windows)]
+pub(crate) const OUT_OF_SPACE_CODES: &[i32] = &[39, 112]; // ERROR_HANDLE_DISK_FULL, ERROR_DISK_FULL
+#[cfg(not(any(unix, windows)))]
+pub(crate) const OUT_OF_SPACE_CODES: &[i32] = &[];
+
+pub(crate) fn out_of_space(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::StorageFull
+        || e.raw_os_error()
+            .is_some_and(|c| OUT_OF_SPACE_CODES.contains(&c))
+}
+
+impl Queue {
     /// The oldest queued batch, if any. FIFO: order is not required for
     /// correctness (every line already carries its own timestamp) but it
     /// keeps recovery legible.
@@ -316,5 +412,61 @@ mod tests {
             .filter(|n| n.contains("tmp"))
             .collect();
         assert!(stray.is_empty(), "left {stray:?}");
+    }
+
+    /// #80. A `.tmp` is a spool that died between `create` and `rename` —
+    /// a kill, or the disk filling mid-write. The segment scan only looks
+    /// at `.lp`, so these used to sit there forever holding down space on
+    /// the disk whose filling produced them.
+    #[test]
+    fn a_half_written_segment_from_a_previous_run_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut q = Queue::open(dir.path(), 1 << 20).unwrap();
+            q.push("real\n").unwrap();
+        }
+        // What a kill mid-spool leaves behind.
+        std::fs::write(dir.path().join("000000000009.tmp"), "half a batch").unwrap();
+
+        let q = Queue::open(dir.path(), 1 << 20).unwrap();
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with(".tmp")),
+            "the half-written segment survived: {names:?}"
+        );
+        assert_eq!(
+            q.segments.len(),
+            1,
+            "and the real segment is still adopted: {names:?}"
+        );
+    }
+
+    /// The branch that decides between "pause and alarm" and "abort the
+    /// process". Getting it wrong in the quiet direction puts the
+    /// crash-loop back (#80), so it is pinned rather than trusted.
+    #[test]
+    fn out_of_space_recognises_a_full_disk_and_nothing_else() {
+        use std::io::{Error, ErrorKind};
+        assert!(out_of_space(&Error::from(ErrorKind::StorageFull)));
+        for code in OUT_OF_SPACE_CODES {
+            assert!(
+                out_of_space(&Error::from_raw_os_error(*code)),
+                "raw code {code} is a full disk on this platform"
+            );
+        }
+        // The ones that must still abort: a state directory that vanished
+        // or that this user cannot write is a deployment fault, not an
+        // operational condition to sit and wait out.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotFound,
+            ErrorKind::InvalidInput,
+        ] {
+            assert!(!out_of_space(&Error::from(kind)), "{kind:?}");
+        }
     }
 }

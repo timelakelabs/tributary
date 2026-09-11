@@ -2,6 +2,7 @@
 # Chaos engineering drills for tributary (#61) — adversarial fault injection.
 #
 #   chaos_drill.sh flaky     a misbehaving sink: reset / 5xx / latency / ambiguous-ack
+#   chaos_drill.sh enospc    a FULL STATE DISK (needs a small tmpfs; see enospc())
 #   (multisource | fuzz | backpressure land in later phases of #61)
 #
 # Every existing drill injects a clean, scripted fault (the L2 outage is a 60 s
@@ -334,14 +335,123 @@ TOML
   kill -9 "$AGENT" "$SINK" 2>/dev/null
 }
 
+# A full STATE DISK, which is not the same fault as a full queue: the queue's
+# cap is a number this agent chose and can reason about, and ENOSPC is the
+# filesystem saying no in the middle of a write. Before #80 that killed the
+# process — `?` on File::create — and systemd restarted it into the same full
+# disk every five seconds, re-shipping the queue each cycle.
+#
+# This one needs a genuinely small filesystem and REFUSES to run without one,
+# rather than passing against a disk that never fills. Give it one:
+#
+#   docker run --rm -v "$PWD:/w" -w /w --tmpfs /state:size=4m #     -v rk-cargo-registry:/usr/local/cargo/registry -v rk-rustup:/usr/local/rustup #     rust:1-slim bash -c 'apt-get update -qq && apt-get install -y -qq python3 curl #       >/dev/null; cargo build -p tributary --bin tributary && #       BIN=target/debug/tributary STATE_DIR=/state bench/chaos_drill.sh enospc'
+enospc() {
+  local N=${N:-40000} STATE=${STATE_DIR:-}
+  echo "### CHAOS: enospc — the state disk fills while the sink is down (N=$N) ###"
+
+  if [ -z "$STATE" ]; then
+    echo "  enospc needs a size-limited filesystem for --state-dir." >&2
+    echo "  Run with --tmpfs /state:size=4m and STATE_DIR=/state (see the comment above)." >&2
+    echo "  Refusing to run against an ordinary disk: it would never fill, and a" >&2
+    echo "  green result would mean nothing." >&2
+    exit 2
+  fi
+  local kb
+  kb=$(df -k "$STATE" | awk 'NR==2{print $2}')
+  if [ "${kb:-0}" -gt 65536 ]; then
+    echo "  $STATE is on a ${kb}KB filesystem — too big to fill on purpose." >&2
+    echo "  Mount a small tmpfs there; see the comment above this function." >&2
+    exit 2
+  fi
+  echo "  state dir $STATE on a ${kb}KB filesystem"
+  rm -rf "${STATE:?}"/* 2>/dev/null
+
+  RECV="$WORK/recv.lp"
+  : > "$RECV"
+  # The sink refuses everything, so nothing drains and the queue must grow.
+  CHAOS_5XX=1 CHAOS_RESET=0 CHAOS_LATENCY=0 CHAOS_AMBIGUOUS=0     python3 bench/chaos_sink.py "$RECV" 127.0.0.1:8899 &
+  local SINK=$!
+  sleep 0.5
+  python3 bench/gen.py --out "$WORK/app.log" --lines "$N" --rate 10000 >/dev/null
+
+  # Ballast: occupy the filesystem so the queue meets ENOSPC long before it
+  # meets its own soft cap. The cap is set high on purpose — the point is to
+  # reach the disk limit first, which is the fault the queue never handled.
+  local free_kb
+  free_kb=$(df -k "$STATE" | awk 'NR==2{print $4}')
+  dd if=/dev/zero of="$STATE/ballast" bs=1024 count=$(( free_kb > 700 ? free_kb - 700 : 1 ))      >/dev/null 2>&1
+  echo "  ballast laid: $(df -k "$STATE" | awk 'NR==2{print $4}')KB free"
+
+  cat > "$WORK/c.toml" <<TOML
+[output]
+url = "http://127.0.0.1:8899"
+batch_lines = 400
+gzip = false
+queue_max_bytes = 1073741824
+
+[telemetry]
+addr = "127.0.0.1:9899"
+
+[[source]]
+name = "app"
+path = "$WORK/app.log"
+table = "chaos"
+parser = "json"
+timestamp = { field = "ts", format = "unix_ms", resolution = "ms" }
+
+[source.fields]
+idx = "integer"
+message = "string"
+TOML
+  "$BIN" --config "$WORK/c.toml" --state-dir "$STATE" > "$WORK/agent.log" 2>&1 &
+  local AGENT=$!
+
+  local qf=0
+  for _ in $(seq 1 60); do
+    qf=$(metric tributary_queue_full)
+    [ "${qf:-0}" = "1" ] && break
+    sleep 0.5
+  done
+  local readd
+  readd=$(metric tributary_lines_read_total)
+  echo "  under ENOSPC: queue_full=$qf read=$readd (of $N) free=$(df -k "$STATE" | awk 'NR==2{print $4}')KB"
+  chk "${qf:-0}" "1" "a full disk engages backpressure (queue_full=1), same as a full queue"
+  chk "$([ "${readd:-0}" -lt "$N" ] && echo yes || echo no)" "yes" "reading stalled rather than spinning"
+  chk "$(kill -0 "$AGENT" 2>/dev/null && echo yes || echo no)" "yes"     "THE POINT: the agent is alive on a full disk (it used to panic and crash-loop)"
+  local said
+  said=$(grep -c "STATE DISK FULL" "$WORK/agent.log")
+  chk "$([ "${said:-0}" -ge 1 ] && echo yes || echo no)" "yes"     "and it said so in the log ($said line(s)) rather than dying quietly"
+  chk "$([ "$(grep -c "panicked" "$WORK/agent.log")" -eq 0 ] && echo yes || echo no)" "yes" "no panic"
+
+  # Recover both: space back, sink back.
+  rm -f "$STATE/ballast"
+  kill -9 "$SINK" 2>/dev/null
+  wait "$SINK" 2>/dev/null
+  CHAOS_5XX=0 CHAOS_RESET=0 CHAOS_LATENCY=0 CHAOS_AMBIGUOUS=0     python3 bench/chaos_sink.py "$RECV" 127.0.0.1:8899 &
+  SINK=$!
+  echo "  space freed and sink recovered; draining…"
+  for _ in $(seq 1 240); do
+    [ "$(distinct app)" -ge "$N" ] && [ "$(metric tributary_queue_bytes)" = "0" ] && break
+    sleep 1
+  done
+  echo "  after recovery: distinct=$(distinct app) read=$(metric tributary_lines_read_total) queue_bytes=$(metric tributary_queue_bytes)"
+  local BEFORE=$fail
+  python3 bench/multi_source_assert.py "$RECV" "app:$N" || fail=1
+  chk "$fail" "$BEFORE" "exact count: nothing the full disk refused was lost"
+  chk "$(metric tributary_lines_read_total)" "$N" "reading resumed to completion once space returned"
+  chk "$(find "$STATE/queue-app" -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ')" "0"     "no half-written segments left behind by the writes ENOSPC interrupted"
+  kill -9 "$AGENT" "$SINK" 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 case "${1:-}" in
   flaky) flaky ;;
   multisource) multisource ;;
   fuzz) fuzz ;;
   backpressure) backpressure ;;
+  enospc) enospc ;;
   *)
-    echo "usage: chaos_drill.sh flaky|multisource|fuzz|backpressure" >&2
+    echo "usage: chaos_drill.sh flaky|multisource|fuzz|backpressure|enospc" >&2
     rm -rf "$WORK"
     exit 2
     ;;

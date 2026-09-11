@@ -346,6 +346,33 @@ tunable, and never silent"). The real risk in this state is a file
 rotating away before Tributary catches up, which is why
 `tributary_checkpoint_lag_bytes` is the metric to alert on.
 
+**A full state disk is the same decision** (#80). `max_bytes` is a cap this
+agent chose and can reason about; ENOSPC is the filesystem saying no in the
+middle of a write, and until 0.5 it went out through a `?` and killed the
+process — which systemd then restarted into the same full disk every five
+seconds. It now pauses and alarms exactly as the cap does. Every other I/O
+error still aborts: a state directory that vanished or that this user cannot
+write is a deployment fault, not a condition to sit and wait out.
+
+Two cases in that state need more than pausing, and both come back to the
+same rule — *never record progress past bytes that are not durable
+somewhere*.
+
+- A batch that failed to ship **after** its lines were read off the source
+  cannot simply be refused; the source no longer holds them. If the disk
+  will not take it either, the pipeline keeps it in memory — bounded by
+  `max_inflight`, because reading is already paused — and **the checkpoint
+  does not advance while it holds anything**. A crash there replays and
+  duplicates, which a primary-key store collapses; advancing would skip and
+  lose, which nothing recovers.
+- The checkpoint file lives on that same disk, so a full one would kill the
+  agent through that door instead. ENOSPC writing it is reported and
+  outlived: not advancing is exactly the safe direction.
+
+`bench/chaos_drill.sh enospc` drills it on a real size-limited tmpfs, and
+refuses to run without one — a disk that never fills would make the result
+meaningless.
+
 ### 4.6 Host metrics (Telegraf compatibility)
 
 A `[metrics]` collector (#25) makes Tributary a Telegraf replacement for the
