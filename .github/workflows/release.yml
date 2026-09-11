@@ -216,6 +216,43 @@ jobs:
           { echo '### image'; echo '```'; cat /tmp/manifest.txt; echo '```'; } \
             >> "$GITHUB_STEP_SUMMARY"
 
+      # ...and somebody who is NOT us can fetch it. The step above runs as
+      # the pushing identity, so it proves the image is multi-arch and says
+      # nothing about whether it is reachable — a package stays private
+      # until someone makes it public, and a repository going public does
+      # not take its packages with it. Neither product's did: both repos
+      # were public for weeks while an anonymous pull of `:0.4.0` answered
+      # 403, which is an ImagePullBackOff for every operator applying the
+      # DaemonSet manifest this workflow attaches (timelakedb#187).
+      #
+      # Anonymous means anonymous: a fresh registry token with no
+      # credentials, rather than `docker logout`, which would wreck the
+      # daemon's auth for anything later in the job. No `-f` and a sed
+      # parse that cannot throw, because for a private package the token
+      # endpoint itself answers 401 with a non-JSON body and a strict fetch
+      # would die before reaching the message that says what to do.
+      - name: Anyone can pull it
+        if: github.event_name == 'push' && !github.event.repository.private
+        run: |
+          set -euo pipefail
+          repo=${{ github.repository_owner }}/tributary
+          ver=${{ steps.v.outputs.version }}
+          tok=$(curl -s "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" \
+                | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" \
+                   -H 'Accept: application/vnd.oci.image.index.v1+json' \
+                   -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+                   "https://ghcr.io/v2/$repo/manifests/$ver")
+          echo "anonymous GET manifests/$ver -> HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::$repo:$ver was published but is not publicly pullable \
+          (HTTP $code). This repository is public, so its package should be too: \
+          Packages -> tributary -> Package settings -> Change visibility -> Public. \
+          Granting individual repositories read access instead fixes CI and leaves \
+          every operator applying the DaemonSet in ImagePullBackOff (timelakedb#187)."
+            exit 1
+          fi
+
   # The DaemonSet manifest, stamped at the tag and attached to the Release.
   # The file in the tree pins the crate version of the tree it is in (a
   # cargo test holds the two equal), which is the released version only at
