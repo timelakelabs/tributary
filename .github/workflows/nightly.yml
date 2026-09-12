@@ -135,13 +135,24 @@ jobs:
           SCENARIO: ${{ matrix.scenario }}
           # Read only by `enospc`; empty for the rest, which run anywhere.
           STATE_DIR: ${{ matrix.scenario == 'enospc' && '/mnt/state' || '' }}
-        # `pipefail` is load-bearing and is not on by default in a `run:`
-        # block. Piping into `tee` without it hands the step `tee`'s exit
-        # status, which is 0 forever, and throws away the drill's own
-        # verdict — a nightly structurally incapable of going red.
+        # Two things here are load-bearing and neither is obvious.
+        #
+        # `bash <script>` rather than `<script>`. This repository is authored
+        # on Windows, where the executable bit does not survive, and 20 of its
+        # 22 shell scripts are committed 100644. `chaos_drill.sh` happens to
+        # be one of the two that are not, which is the whole reason this leg
+        # worked on the first night and the kind smoke exited 126. Depending
+        # on a mode bit that never shows up in a diff is a trap that fires
+        # again the next time somebody wires a drill into CI; naming the
+        # interpreter cannot fire at all.
+        #
+        # `pipefail` is not on by default in a `run:` block. Piping into `tee`
+        # without it hands the step `tee`'s exit status, which is 0 forever,
+        # and throws away the drill's own verdict — a nightly structurally
+        # incapable of going red.
         run: |
           set -o pipefail
-          bench/chaos_drill.sh "$SCENARIO" 2>&1 | tee "chaos-$SCENARIO.log"
+          bash bench/chaos_drill.sh "$SCENARIO" 2>&1 | tee "chaos-$SCENARIO.log"
 
       - name: Upload the log
         if: always()
@@ -155,11 +166,14 @@ jobs:
     name: kind · pod-label smoke
     runs-on: ubuntu-latest
     if: github.event_name != 'workflow_dispatch' || inputs.kind
-    # Generous, and it needs to be: the script builds the release image cold
-    # (a plain `docker build` with no buildx cache — teaching it about one is
-    # a change to a script people run on laptops), creates a cluster, and
-    # then deliberately spends ~65 s waiting out an outage and a full
-    # liveness-probe period. Roughly 20 minutes of honest work.
+    # The script builds the release image cold (a plain `docker build` with
+    # no buildx cache — teaching it about one is a change to a script people
+    # run on laptops), creates a cluster, and then deliberately spends ~65 s
+    # waiting out an outage and a full liveness-probe period. I guessed
+    # twenty minutes for that and was wrong by most of it: the first green
+    # run took 3m24s end to end, of which the cold rustc was 57 s. The
+    # timeout stays generous anyway, because a drill that hangs should be
+    # killed and reported rather than left to burn six hours of runner.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -172,10 +186,13 @@ jobs:
           install_only: true
       - uses: azure/setup-kubectl@v4
 
+      # `bash <script>`, not `<script>`: this file is committed 100644 like
+      # almost every other script here, and calling it directly is how the
+      # first night exited 126 five seconds in. See the chaos step above.
       - name: Smoke
         run: |
           set -o pipefail
-          deploy/k8s/kind-smoke.sh 2>&1 | tee k8s-kind-smoke.log
+          bash deploy/k8s/kind-smoke.sh 2>&1 | tee k8s-kind-smoke.log
 
       - name: Upload the log
         if: always()
@@ -226,18 +243,58 @@ jobs:
       # here, so it would have failed in the most embarrassing way
       # available.
       actions: read
+    # This job does not check out, because it has nothing to read from the
+    # tree. `gh issue` does not care about that reasoning: with no `.git` it
+    # goes looking for a remote, finds no repository, and exits 1. The first
+    # night went red and filed nothing because of exactly that — the alert
+    # job being the one thing that failed to alert. `gh api` below survived
+    # only because it names the repository in the path. Catchment's
+    # equivalent never hit it: its steps run inside a checkout.
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      # Which legs went red, not just "the run did". `needs.*.result` for a
-      # matrix job is the aggregate — it says `failure`, not which of the
-      # five — so ask the API for the job list instead. This job is itself
-      # still running, so its conclusion is null and it cannot report on
-      # itself. `cancelled` and `timed_out` count as red: a scenario that ran
-      # out of its 30 minutes is a scenario that did not pass.
-      - name: Collect the verdict
+      # Red or not, decided from `needs` alone: no API, no token, no network,
+      # nothing that can fail. Everything after this is then allowed to go
+      # wrong without the alert going missing, which is the lesson from the
+      # first night — the verdict came out of a `gh` call, the `gh` call died,
+      # and the steps that file and close the issue were skipped as a
+      # consequence.
+      #
+      # Anything that is not `success` is red, `skipped` included: the only
+      # way a needed job is skipped here is that something upstream of it
+      # broke, and a build that failed is not a quiet night.
+      - name: Red or not
+        id: v
         env:
-          GH_TOKEN: ${{ github.token }}
+          CHAOS: ${{ needs.chaos.result }}
+          KIND: ${{ needs.kind.result }}
         run: |
-          # shellcheck disable=SC2016  # the \( \) below is jq, not the shell
+          echo "chaos=$CHAOS kind=$KIND"
+          if [ "$CHAOS" = success ] && [ "$KIND" = success ]; then
+            echo "red=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "red=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      # WHICH legs went red — an enrichment, not the verdict. `needs.*.result`
+      # for a matrix job is the aggregate and only ever says `failure`, never
+      # which of the five, and that detail is most of what makes the alert
+      # worth reading. Worth an API call; not worth the alert.
+      #
+      # `continue-on-error` at STEP level, which is not the job-level flag
+      # catchment warns about — that one keeps a job's conclusion green while
+      # its suite is not. This one keeps a failed decoration from cancelling
+      # the thing it was decorating.
+      #
+      # This job is itself still running, so its own conclusion is null and it
+      # cannot report on itself. `cancelled` and `timed_out` count as red: a
+      # scenario that ran out of its 30 minutes did not pass.
+      - name: Name the legs
+        if: steps.v.outputs.red == '1'
+        continue-on-error: true
+        run: |
+          # shellcheck disable=SC2016  # the backslash-parens below are jq
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate \
             --jq '.jobs[]
                   | select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped")
@@ -247,16 +304,19 @@ jobs:
           cat "$RUNNER_TEMP/failed.md"
 
       - name: Open or update the alert
+        if: steps.v.outputs.red == '1'
         env:
-          GH_TOKEN: ${{ github.token }}
           TITLE: Nightly drills are red
         run: |
-          [ -s "$RUNNER_TEMP/failed.md" ] || { echo "all green — nothing to file"; exit 0; }
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           {
             echo "Nightly run on \`${GITHUB_SHA:0:12}\` — [run]($run_url)."
             echo
-            cat "$RUNNER_TEMP/failed.md"
+            if [ -s "$RUNNER_TEMP/failed.md" ]; then
+              cat "$RUNNER_TEMP/failed.md"
+            else
+              echo "- could not read the job list for this run; open it to see which leg"
+            fi
             echo
             echo "Each leg uploads its drill log as an artifact on that run. The log has the"
             echo "per-assertion PASS/FAIL lines, which is the part worth reading first."
@@ -279,11 +339,10 @@ jobs:
       # the open/close pairs are the timeline. Silence is what is being
       # fixed here, not verbosity.
       - name: Resolve the alert
+        if: steps.v.outputs.red == '0'
         env:
-          GH_TOKEN: ${{ github.token }}
           TITLE: Nightly drills are red
         run: |
-          if [ -s "$RUNNER_TEMP/failed.md" ]; then echo "still red — leaving it open"; exit 0; fi
           open=$(gh issue list --state open --limit 100 --json number,title \
             --jq "map(select(.title | startswith(\"$TITLE\"))) | .[0].number // empty")
           if [ -n "$open" ]; then
