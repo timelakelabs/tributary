@@ -135,13 +135,24 @@ jobs:
           SCENARIO: ${{ matrix.scenario }}
           # Read only by `enospc`; empty for the rest, which run anywhere.
           STATE_DIR: ${{ matrix.scenario == 'enospc' && '/mnt/state' || '' }}
-        # `pipefail` is load-bearing and is not on by default in a `run:`
-        # block. Piping into `tee` without it hands the step `tee`'s exit
-        # status, which is 0 forever, and throws away the drill's own
-        # verdict — a nightly structurally incapable of going red.
+        # Two things here are load-bearing and neither is obvious.
+        #
+        # `bash <script>` rather than `<script>`. This repository is authored
+        # on Windows, where the executable bit does not survive, and 20 of its
+        # 22 shell scripts are committed 100644. `chaos_drill.sh` happens to
+        # be one of the two that are not, which is the whole reason this leg
+        # worked on the first night and the kind smoke exited 126. Depending
+        # on a mode bit that never shows up in a diff is a trap that fires
+        # again the next time somebody wires a drill into CI; naming the
+        # interpreter cannot fire at all.
+        #
+        # `pipefail` is not on by default in a `run:` block. Piping into `tee`
+        # without it hands the step `tee`'s exit status, which is 0 forever,
+        # and throws away the drill's own verdict — a nightly structurally
+        # incapable of going red.
         run: |
           set -o pipefail
-          bench/chaos_drill.sh "$SCENARIO" 2>&1 | tee "chaos-$SCENARIO.log"
+          bash bench/chaos_drill.sh "$SCENARIO" 2>&1 | tee "chaos-$SCENARIO.log"
 
       - name: Upload the log
         if: always()
@@ -172,10 +183,13 @@ jobs:
           install_only: true
       - uses: azure/setup-kubectl@v4
 
+      # `bash <script>`, not `<script>`: this file is committed 100644 like
+      # almost every other script here, and calling it directly is how the
+      # first night exited 126 five seconds in. See the chaos step above.
       - name: Smoke
         run: |
           set -o pipefail
-          deploy/k8s/kind-smoke.sh 2>&1 | tee k8s-kind-smoke.log
+          bash deploy/k8s/kind-smoke.sh 2>&1 | tee k8s-kind-smoke.log
 
       - name: Upload the log
         if: always()
@@ -226,6 +240,16 @@ jobs:
       # here, so it would have failed in the most embarrassing way
       # available.
       actions: read
+    # This job does not check out, because it has nothing to read from the
+    # tree. `gh issue` does not care about that reasoning: with no `.git` it
+    # goes looking for a remote, finds no repository, and exits 1. The first
+    # night went red and filed nothing because of exactly that — the alert
+    # job being the one thing that failed to alert. `gh api` below survived
+    # only because it names the repository in the path. Catchment's
+    # equivalent never hit it: its steps run inside a checkout.
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       # Which legs went red, not just "the run did". `needs.*.result` for a
       # matrix job is the aggregate — it says `failure`, not which of the
@@ -234,8 +258,6 @@ jobs:
       # itself. `cancelled` and `timed_out` count as red: a scenario that ran
       # out of its 30 minutes is a scenario that did not pass.
       - name: Collect the verdict
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           # shellcheck disable=SC2016  # the \( \) below is jq, not the shell
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate \
@@ -248,7 +270,6 @@ jobs:
 
       - name: Open or update the alert
         env:
-          GH_TOKEN: ${{ github.token }}
           TITLE: Nightly drills are red
         run: |
           [ -s "$RUNNER_TEMP/failed.md" ] || { echo "all green — nothing to file"; exit 0; }
@@ -280,7 +301,6 @@ jobs:
       # fixed here, not verbosity.
       - name: Resolve the alert
         env:
-          GH_TOKEN: ${{ github.token }}
           TITLE: Nightly drills are red
         run: |
           if [ -s "$RUNNER_TEMP/failed.md" ]; then echo "still red — leaving it open"; exit 0; fi
