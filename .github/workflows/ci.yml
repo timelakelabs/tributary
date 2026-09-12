@@ -4,7 +4,9 @@ name: ci
 # repo enforces: formatting, clippy with warnings denied, and the whole test
 # suite. Nothing here needs a service — the shipper's tests drive the tail,
 # queue, watermark and auth logic directly, and the end-to-end proof against
-# a live node is the drill in `bench/` rather than a CI job.
+# a live node is the drills in `bench/`. Those are a CI job now, just not
+# this one: `nightly.yml` runs them on a schedule (#79), because they are
+# minutes of wall-clock each and belong nowhere near a pull request gate.
 # Markdown does not gate this workflow: the Rust jobs plus a conformance run
 # that pulls the fixture image are minutes-expensive, and no test here reads a
 # .md file. A docs-only commit on main therefore gets no run of its own — the

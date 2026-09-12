@@ -61,6 +61,13 @@ yet. That is intended, and `deploy/k8s/README.md` says so: apply the copy
 attached to the Release, or override the one line the way
 `deploy/k8s/kind-smoke.sh` does.
 
+**Look at the last nightly** (Actions → nightly, #79). It is the only thing
+that runs the five chaos scenarios and the kind smoke, and `ci.yml` going
+green says nothing about any of them — the release gate cannot see it and
+will happily let you tag over a week of red nights. A red nightly is not an
+automatic stop; it is a thing to have read before you decide. If it has not
+run since whatever you are about to tag, dispatch it on `main` and wait.
+
 ## The order, and why it is this order
 
 **`main` refuses a direct push** (timelakedb#169: required checks, no
