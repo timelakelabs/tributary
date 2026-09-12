@@ -48,6 +48,32 @@ All notable changes to Tributary are recorded here. This project adheres to
 
 ### Added
 
+- **The chaos suite and the kind smoke run nightly** (#79). Five chaos
+  scenarios and the pod-label smoke were hand-run only, and the reason
+  recorded for that — Actions being billing-blocked — stopped being true on
+  2026-08-24. What it cost: the backpressure drill is the thing that caught
+  the 376-line loss behind #61, and its last recorded run predates every
+  line `queue.rs` and `main.rs` have gained since. A drill that runs when
+  somebody remembers is evidence about the day they remembered.
+
+  `.github/workflows/nightly.yml` runs `flaky`, `multisource`, `fuzz`,
+  `backpressure` and `enospc` as a matrix at 05:00 UTC, plus
+  `deploy/k8s/kind-smoke.sh`, and uploads every drill log as an artifact.
+  `enospc` gets a 4 MB tmpfs on the runner, because it refuses to run
+  against a disk that never fills. A red night keeps ONE tracking issue:
+  opened the first night, commented on every night it stays red, closed
+  when it goes green. Six issues carry no more information than one with
+  six comments, and the comment history is the record of how long it has
+  been broken.
+
+  Not folded into `ci.yml`, on purpose. Each scenario is minutes of real
+  wall-clock and the kind job builds the release image cold, so the pull
+  request gate would go from five minutes to twenty-five — and a gate
+  people resent is a gate that gets deleted. `workflow_dispatch` re-runs a
+  single scenario, which is the thing you actually want on a red morning.
+  (The 0.4.0 entry below still calls the kind smoke hand-run because CI was
+  billing-blocked. That was true when it was written.)
+
 - **An unrecognised config key is an error, and `--check-config` answers
   without starting anything** (#76). A misspelt key used to be dropped in
   silence and the default used instead: `[source.multline]`, one letter

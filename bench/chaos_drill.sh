@@ -1,9 +1,15 @@
 #!/bin/bash
 # Chaos engineering drills for tributary (#61) — adversarial fault injection.
 #
-#   chaos_drill.sh flaky     a misbehaving sink: reset / 5xx / latency / ambiguous-ack
-#   chaos_drill.sh enospc    a FULL STATE DISK (needs a small tmpfs; see enospc())
-#   (multisource | fuzz | backpressure land in later phases of #61)
+#   chaos_drill.sh flaky        a misbehaving sink: reset / 5xx / latency / ambiguous-ack
+#   chaos_drill.sh multisource  many tails, one sink, faults across all of them
+#   chaos_drill.sh fuzz         garbage on the wire and in the log
+#   chaos_drill.sh backpressure a sink slower than the source, until the queue caps
+#   chaos_drill.sh enospc       a FULL STATE DISK (needs a small tmpfs; see enospc())
+#
+# All five run nightly — .github/workflows/nightly.yml, which also re-runs a
+# single scenario on demand. Run them by hand while changing the queue or the
+# checkpoint; that is what they are for.
 #
 # Every existing drill injects a clean, scripted fault (the L2 outage is a 60 s
 # stop, on then off). These inject the nasty randomized failures a real database

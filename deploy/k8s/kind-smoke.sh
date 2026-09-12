@@ -19,11 +19,11 @@
 # kind uses containerd, so this is also the only place `parser = "cri"` meets
 # genuine runtime output rather than a synthesised corpus.
 #
-# CI note: this is a runnable script, not a gating CI job, because Actions is
-# billing-blocked here (a job would show red with steps=0). It belongs on the
-# self-hosted runners once those are live; until then, run it by hand on any box
-# with docker + kind + kubectl. It needs a runner that can nest containers
-# (kind runs the node as a privileged container).
+# CI note: `.github/workflows/nightly.yml` runs this on a schedule (#79). It is
+# still not a gating CI job — a cold image build plus a cluster plus ~65 s of
+# deliberate waiting is twenty minutes, and that does not belong on a pull
+# request. Runs by hand anywhere with docker + kind + kubectl; the box has to
+# be able to nest containers, since kind runs the node as a privileged one.
 #
 # Usage: deploy/k8s/kind-smoke.sh [--keep]     (--keep leaves the cluster up)
 set -euo pipefail

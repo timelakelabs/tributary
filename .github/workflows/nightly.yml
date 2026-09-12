@@ -1,0 +1,294 @@
+name: nightly
+
+# The drills that prove the shipper's promises under fault, run on a clock
+# instead of when somebody remembers.
+#
+# Before this, `bench/chaos_drill.sh` and `deploy/k8s/kind-smoke.sh` were
+# hand-run only, and the reason given for that — "Actions is billing-blocked
+# here" — stopped being true on 2026-08-24. The gap that opened is the point:
+# the backpressure drill is what caught the 376-line loss behind #61, and the
+# last recorded run of it predates every line `queue.rs` and `main.rs` gained
+# since. A drill that only runs when someone remembers is evidence about the
+# day they remembered, not about the code on main.
+#
+# Deliberately NOT part of ci.yml. Each chaos scenario is minutes of real
+# wall-clock — they dribble a corpus into a live tail and wait for faults to
+# land — and the kind job builds the release image cold and stands up a
+# cluster. Bolted onto the pull request gate, a 5-minute check becomes a
+# 25-minute one, and a gate people resent is a gate that gets deleted.
+#
+# `workflow_dispatch` takes a scenario, because the thing you want at 09:00
+# on a red morning is to re-run the one leg that failed without paying for
+# the other four.
+on:
+  schedule:
+    # 05:00 UTC. Catchment's nightly is 03:00 and Riverkeeper's is 04:00;
+    # these are staggered so the org is not bidding against itself for
+    # runners, and so a shared-infrastructure outage reads as three separate
+    # failures rather than one indistinguishable pile.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Chaos scenario to run"
+        type: choice
+        default: all
+        options: [all, flaky, multisource, fuzz, backpressure, enospc]
+      kind:
+        description: "Also run the kind pod-label smoke"
+        type: boolean
+        default: true
+
+# Keyed on the EVENT, not just the workflow. A manual re-run must not cancel
+# a scheduled one: a cancelled nightly still reaches the alert job, which
+# would then file "cancelled" against legs that were merely interrupted, and
+# a tracking issue full of that is a tracking issue nobody reads. Within an
+# event two runs still collapse, because there the older one is the stale
+# answer and the newer one is the question being asked.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Turns the dispatch input into the matrix. A `choice` input can only ever
+  # be one of the six strings above, which is why it is a choice and not a
+  # free-text field: this value reaches a shell, and a free-text one from a
+  # dispatch form is an injection waiting for the first person who types a
+  # backtick.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      scenarios: ${{ steps.p.outputs.scenarios }}
+    steps:
+      - id: p
+        env:
+          SCENARIO: ${{ inputs.scenario || 'all' }}
+        run: |
+          if [ "$SCENARIO" = all ]; then
+            list='["flaky","multisource","fuzz","backpressure","enospc"]'
+          else
+            list="[\"$SCENARIO\"]"
+          fi
+          echo "scenarios=$list" >> "$GITHUB_OUTPUT"
+          echo "::notice::chaos scenarios: $list"
+
+  # One build, five drills. The drills default to `docker run rust:1-slim`,
+  # which is a cold containerised build, and would have each matrix leg
+  # compiling the same binary from scratch — most of the nightly spent in
+  # rustc, five times over. They honour `BIN`, so build once here with the
+  # shared cache and hand the binary down.
+  build:
+    name: build · drill binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p tributary --bin tributary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drill-binary-${{ github.run_id }}
+          path: target/debug/tributary
+          retention-days: 1
+
+  chaos:
+    name: chaos · ${{ matrix.scenario }}
+    runs-on: ubuntu-latest
+    needs: [plan, build]
+    timeout-minutes: 30
+    strategy:
+      # A red scenario must not cancel the other four. The whole output of a
+      # nightly is *which* things are red; fail-fast throws that away and
+      # leaves you re-running the suite by hand to find out.
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(needs.plan.outputs.scenarios) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: drill-binary-${{ github.run_id }}
+          path: target/debug
+      # An artifact is a zip, and a zip does not carry the executable bit.
+      # Without this the drill dies with "Permission denied" on a binary that
+      # is sitting right there, which reads like a build failure and is not.
+      - run: chmod +x target/debug/tributary
+
+      # `enospc` refuses to run on an ordinary disk, on purpose — a filesystem
+      # that never fills would let it pass without testing anything. It wants
+      # 64 MB or less; 4 MB is what the scenario was written against (#80).
+      - name: A filesystem small enough to fill on purpose
+        if: matrix.scenario == 'enospc'
+        run: |
+          sudo mkdir -p /mnt/state
+          sudo mount -t tmpfs -o size=4m tmpfs /mnt/state
+          sudo chown "$(id -u):$(id -g)" /mnt/state
+          df -k /mnt/state
+
+      - name: Drill
+        env:
+          BIN: target/debug/tributary
+          SCENARIO: ${{ matrix.scenario }}
+          # Read only by `enospc`; empty for the rest, which run anywhere.
+          STATE_DIR: ${{ matrix.scenario == 'enospc' && '/mnt/state' || '' }}
+        # `pipefail` is load-bearing and is not on by default in a `run:`
+        # block. Piping into `tee` without it hands the step `tee`'s exit
+        # status, which is 0 forever, and throws away the drill's own
+        # verdict — a nightly structurally incapable of going red.
+        run: |
+          set -o pipefail
+          bench/chaos_drill.sh "$SCENARIO" 2>&1 | tee "chaos-$SCENARIO.log"
+
+      - name: Upload the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-${{ matrix.scenario }}-${{ github.run_id }}
+          path: chaos-${{ matrix.scenario }}.log
+          retention-days: 30
+
+  kind:
+    name: kind · pod-label smoke
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || inputs.kind
+    # Generous, and it needs to be: the script builds the release image cold
+    # (a plain `docker build` with no buildx cache — teaching it about one is
+    # a change to a script people run on laptops), creates a cluster, and
+    # then deliberately spends ~65 s waiting out an outage and a full
+    # liveness-probe period. Roughly 20 minutes of honest work.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # The script creates and deletes its own cluster, so this installs the
+      # binary only. Creating one here would leave the script's `kind create`
+      # to find it already there and silently reuse a cluster somebody else
+      # configured.
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - uses: azure/setup-kubectl@v4
+
+      - name: Smoke
+        run: |
+          set -o pipefail
+          deploy/k8s/kind-smoke.sh 2>&1 | tee k8s-kind-smoke.log
+
+      - name: Upload the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-kind-smoke-${{ github.run_id }}
+          path: k8s-kind-smoke.log
+          retention-days: 30
+
+      # The script tears its cluster down on EXIT, including on failure, so
+      # this has to run before that — it does, because a failing step runs
+      # its `if: failure()` successors only after the step's own shell has
+      # exited and the trap has fired. What survives is `docker ps -a`: the
+      # kind node is a container, and a node that died taking the API server
+      # with it is a different bug from an assertion that went red.
+      - name: What the box looked like on failure
+        if: failure()
+        run: |
+          docker ps -a
+          kubectl config get-contexts || true
+          kubectl --context kind-trib-smoke get pods -A -o wide || true
+          kubectl --context kind-trib-smoke logs -n tributary -l app=tributary \
+            --tail 200 --all-containers 2>&1 || true
+
+  # A red nightly that tells nobody is the same as no nightly, which is the
+  # half of this ticket that is not about cron. Catchment learned that one
+  # the expensive way: six consecutive red nights on one sha and an issue
+  # that sat a week (catchment#9). Same shape here, one difference — the
+  # scenarios are a matrix, so the alert cannot live inside the job that
+  # failed or a bad night would file five issues saying the same thing.
+  #
+  # ONE reused issue. Six issues carry no more information than one issue
+  # with six comments, and the comment history is itself the record of how
+  # long it has been red.
+  alert:
+    name: nightly alert
+    runs-on: ubuntu-latest
+    needs: [chaos, kind]
+    if: always() && github.event_name == 'schedule'
+    permissions:
+      contents: read
+      issues: write
+      # Listing this run's own jobs is the Actions API, and on a private
+      # repository that is a scope, not a freebie. Without it `gh api` gets
+      # a 403, the step dies, and the two steps after it — the ones that
+      # actually file and close the alert — never run at all. A nightly
+      # that goes red and says nothing is the exact failure being fixed
+      # here, so it would have failed in the most embarrassing way
+      # available.
+      actions: read
+    steps:
+      # Which legs went red, not just "the run did". `needs.*.result` for a
+      # matrix job is the aggregate — it says `failure`, not which of the
+      # five — so ask the API for the job list instead. This job is itself
+      # still running, so its conclusion is null and it cannot report on
+      # itself. `cancelled` and `timed_out` count as red: a scenario that ran
+      # out of its 30 minutes is a scenario that did not pass.
+      - name: Collect the verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # shellcheck disable=SC2016  # the \( \) below is jq, not the shell
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate \
+            --jq '.jobs[]
+                  | select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped")
+                  | "- `\(.name)` — \(.conclusion) ([log](\(.html_url)))"' \
+            > "$RUNNER_TEMP/failed.md"
+          echo "--- failed legs ---"
+          cat "$RUNNER_TEMP/failed.md"
+
+      - name: Open or update the alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: Nightly drills are red
+        run: |
+          [ -s "$RUNNER_TEMP/failed.md" ] || { echo "all green — nothing to file"; exit 0; }
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "Nightly run on \`${GITHUB_SHA:0:12}\` — [run]($run_url)."
+            echo
+            cat "$RUNNER_TEMP/failed.md"
+            echo
+            echo "Each leg uploads its drill log as an artifact on that run. The log has the"
+            echo "per-assertion PASS/FAIL lines, which is the part worth reading first."
+            echo
+            echo "To re-run one leg without paying for the other four: Actions -> nightly ->"
+            echo "Run workflow, and pick the scenario."
+          } > "$RUNNER_TEMP/alert.md"
+          open=$(gh issue list --state open --limit 100 --json number,title \
+            --jq "map(select(.title | startswith(\"$TITLE\"))) | .[0].number // empty")
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body-file "$RUNNER_TEMP/alert.md"
+            echo "::notice::still red — commented on #$open"
+          else
+            url=$(gh issue create --title "$TITLE" --body-file "$RUNNER_TEMP/alert.md" --label bug)
+            echo "::notice::went red — opened $url"
+          fi
+
+      # Closed on green, so the tracker does not carry a permanently open
+      # issue nobody reads. A flapping nightly still shows: it reopens, and
+      # the open/close pairs are the timeline. Silence is what is being
+      # fixed here, not verbosity.
+      - name: Resolve the alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: Nightly drills are red
+        run: |
+          if [ -s "$RUNNER_TEMP/failed.md" ]; then echo "still red — leaving it open"; exit 0; fi
+          open=$(gh issue list --state open --limit 100 --json number,title \
+            --jq "map(select(.title | startswith(\"$TITLE\"))) | .[0].number // empty")
+          if [ -n "$open" ]; then
+            run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            gh issue comment "$open" --body "Green again on \`${GITHUB_SHA:0:12}\` — [run]($run_url). Closing. A later red night opens a fresh one, so a flap reads as a new issue rather than as silence."
+            gh issue close "$open"
+            echo "::notice::recovered — closed #$open"
+          fi
