@@ -166,11 +166,14 @@ jobs:
     name: kind · pod-label smoke
     runs-on: ubuntu-latest
     if: github.event_name != 'workflow_dispatch' || inputs.kind
-    # Generous, and it needs to be: the script builds the release image cold
-    # (a plain `docker build` with no buildx cache — teaching it about one is
-    # a change to a script people run on laptops), creates a cluster, and
-    # then deliberately spends ~65 s waiting out an outage and a full
-    # liveness-probe period. Roughly 20 minutes of honest work.
+    # The script builds the release image cold (a plain `docker build` with
+    # no buildx cache — teaching it about one is a change to a script people
+    # run on laptops), creates a cluster, and then deliberately spends ~65 s
+    # waiting out an outage and a full liveness-probe period. I guessed
+    # twenty minutes for that and was wrong by most of it: the first green
+    # run took 3m24s end to end, of which the cold rustc was 57 s. The
+    # timeout stays generous anyway, because a drill that hangs should be
+    # killed and reported rather than left to burn six hours of runner.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
